@@ -584,32 +584,45 @@ public class MainActivity extends Activity implements TtsProgressListener.Callba
                 JSONObject m = arr.getJSONObject(i);
                 long ts = parseTimestamp(m);
                 String text = m.optString("text", "");
-                String audioUrl = m.optString("audioUrl", "");
+                // Nick 2026-10-18 v1.12: explicit JSON-null check. The server
+                // now sends "audioUrl": null for text-only speed-mode replies;
+                // optString on a JSON null returns the literal string "null"
+                // (not ""), which then fails the isEmpty() check and sends us
+                // into a doomed download of URL "null". isNull() handles it.
+                String audioUrl = m.isNull("audioUrl") ? "" : m.optString("audioUrl", "");
+                log("audio: audioUrl='" + audioUrl + "'");
                 if (ts > maxTs) maxTs = ts;
                 if (!text.isEmpty()) {
                     onSelenaMessage(text);
                 }
-                if (!audioUrl.isEmpty()) {
-                    // Nick 2026-10-18 v1.9: playback is strictly queue-only.
-                    // Only Selena's replies (with server-generated audioUrl
-                    // MP3s) are ever enqueued and played. Nick's own voice
-                    // inputs go to /api/selena-voice/input as text and are
-                    // never read aloud.
-                    String full = audioUrl.startsWith("http")
-                            ? audioUrl : BASE_URL + audioUrl;
-                    try {
-                        File f = downloadToCache(full);
-                        enqueueAudio(f);
-                    } catch (Exception e) {
-                        log("audio download failed: " + full + ": " + e);
-                    }
-                } else if (isPhoneVoiceMode()) {
-                    // Nick 2026-10-18 v1.11: SPEED MODE. The server sends
-                    // text-only replies; the phone speaks them locally with
-                    // on-device TTS (~5s round-trip) instead of waiting for
-                    // a server-generated Aria MP3 (~48s). No download at all.
+                if (isPhoneVoiceMode()) {
+                    // Nick 2026-10-18 v1.11/v1.12 SPEED MODE. Phone voice mode
+                    // speaks the text IMMEDIATELY with on-device TTS and
+                    // ignores audioUrl entirely — no download, no wait for a
+                    // server-generated Aria MP3. This is the fast path (~5s).
                     final String speakText = text;
                     runOnUiThread(() -> enqueueTts(speakText));
+                } else if (!audioUrl.isEmpty()) {
+                    // ARIA QUALITY MODE. Download and play the server's MP3.
+                    // Guard against junk URLs (e.g. literal "null") — don't
+                    // attempt a download that can't succeed.
+                    if (!audioUrl.startsWith("http")) {
+                        log("audio: skipping invalid URL: " + audioUrl);
+                    } else {
+                        // Nick 2026-10-18 v1.9: playback is strictly
+                        // queue-only. Only Selena's replies (with
+                        // server-generated audioUrl MP3s) are ever enqueued
+                        // and played. Nick's own voice inputs go to
+                        // /api/selena-voice/input as text and are never
+                        // read aloud.
+                        String full = audioUrl;
+                        try {
+                            File f = downloadToCache(full);
+                            enqueueAudio(f);
+                        } catch (Exception e) {
+                            log("audio download failed: " + full + ": " + e);
+                        }
+                    }
                 } else {
                     // Aria quality mode with no audioUrl yet — the Aria MP3
                     // will arrive as its own queue message. Don't speak the
