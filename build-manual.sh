@@ -10,7 +10,7 @@ BT=$ANDROID_HOME/build-tools/34.0.0
 PLATFORM=$ANDROID_HOME/platforms/android-34/android.jar
 export PATH=$JAVA_HOME/bin:$BT:$PATH
 
-OUT=build/v113
+OUT=build/v114
 rm -rf $OUT
 mkdir -p $OUT/gen $OUT/classes $OUT/dex
 
@@ -23,8 +23,8 @@ aapt2 link -o $OUT/base.apk \
   --manifest app/src/main/AndroidManifest.xml \
   --min-sdk-version 26 \
   --target-sdk-version 34 \
-  --version-code 14 \
-  --version-name 1.13 \
+  --version-code 15 \
+  --version-name 1.14 \
   --java $OUT/gen \
   $OUT/res.zip
 
@@ -56,14 +56,14 @@ KEY_PASS=$(grep keyPassword keystore.properties | cut -d= -f2 | tr -d ' ')
 export KS_PASS KEY_PASS
 apksigner sign \
   --ks selena-voice.keystore --ks-pass env:KS_PASS --ks-key-alias "$KEY_ALIAS" --key-pass env:KEY_PASS \
-  --out $OUT/selena-voice-v1.13.apk $OUT/aligned.apk
+  --out $OUT/selena-voice-v1.14.apk $OUT/aligned.apk
 
 echo "== verify =="
-apksigner verify --print-certs $OUT/selena-voice-v1.13.apk | head -3
-aapt2 dump badging $OUT/selena-voice-v1.13.apk | grep -E "sdkVersion|targetSdkVersion|versionCode|application-label" | head -5
-echo "BUILD DONE: $OUT/selena-voice-v1.13.apk"
+apksigner verify --print-certs $OUT/selena-voice-v1.14.apk | head -3
+aapt2 dump badging $OUT/selena-voice-v1.14.apk | grep -E "sdkVersion|targetSdkVersion|versionCode|application-label" | head -5
+echo "BUILD DONE: $OUT/selena-voice-v1.14.apk"
 # Nick 2026-10-18: also stage copies at the deliverable locations
 mkdir -p app/build
-cp $OUT/selena-voice-v1.13.apk app/build/selena-voice-v1.13.apk
-cp $OUT/selena-voice-v1.13.apk ~/workspace/your_files/selena-voice-v1.13.apk
-echo "COPIED: app/build/selena-voice-v1.13.apk, ~/workspace/your_files/selena-voice-v1.13.apk"
+cp $OUT/selena-voice-v1.14.apk app/build/selena-voice-v1.14.apk
+cp $OUT/selena-voice-v1.14.apk ~/workspace/your_files/selena-voice-v1.14.apk
+echo "COPIED: app/build/selena-voice-v1.14.apk, ~/workspace/your_files/selena-voice-v1.14.apk"

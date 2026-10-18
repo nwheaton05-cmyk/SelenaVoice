@@ -60,9 +60,15 @@ import java.util.Queue;
  * foreground and plays Selena's voice messages itself. The app must be
  * open for her messages to arrive — better than nothing working at all.
  */
-public class MainActivity extends Activity implements TtsProgressListener.Callback {
+public class MainActivity extends Activity
+        implements TtsProgressListener.Callback, RealtimeClient.Listener {
     private static final String TAG = "SelenaVoice";
     private static final String BASE_URL = "https://siteview-pi.vercel.app";
+    // Nick 2026-10-18 v1.14: Supabase Realtime push (LEG 1). The anon
+    // key is public by design; RLS limits it to SELECT on the voice
+    // queue only (Nick's voice inputs stay service-role-only).
+    private static final String SUPABASE_HOST = "pqkfqzioimkobuhcjwdk.supabase.co";
+    private static final String SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBxa2ZxemlvaW1rb2J1aGNqd2RrIiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTEzMjg2NTIsImV4cCI6MjEwNjkwNDY1Mn0.eNem2zAIA4_MPtWMI0tiErtu7tGNAtkLTnsCA5lSPVw";
     private static final long POLL_MS = 3000;
 
     // Nick 2026-10-18 v1.6: remote-visible log buffer. The app is Selena's
@@ -101,6 +107,7 @@ public class MainActivity extends Activity implements TtsProgressListener.Callba
     // v1.4: outbound polling + playback owned by the activity
     private final Handler pollHandler = new Handler(Looper.getMainLooper());
     private boolean polling = false;
+    private RealtimeClient realtimeClient; // v1.14 push, null when paused
 
     // v1.6: app-open heartbeat — tells the server the app is visible so the
     // fast responder only burns tokens while Nick can hear replies.
@@ -368,6 +375,7 @@ public class MainActivity extends Activity implements TtsProgressListener.Callba
         }
         startPolling();
         startHeartbeat();
+        startRealtime(); // v1.14 push, poll stays as fallback
         // Nick 2026-10-18 v1.8: if the activity was recreated while the
         // service was in manual-listen mode, pick up the real state.
         manualMicOn = VoiceService.isManualListening();
@@ -378,8 +386,73 @@ public class MainActivity extends Activity implements TtsProgressListener.Callba
     protected void onPause() {
         stopPolling();
         stopHeartbeat();
+        stopRealtime(); // v1.14
         super.onPause();
         try { unregisterReceiver(receiver); } catch (Exception ignored) {}
+    }
+
+    // ------------------------------------------------------------ v1.14 Realtime push (LEG 1)
+
+    /**
+     * Nick 2026-10-18 v1.14: called on the Realtime reader thread when
+     * Supabase pushes a new selena_voice_queue row. Maps the DB record
+     * (snake_case columns) onto the API message shape and runs the
+     * exact same handling as a poll result. The 3s poll stays as a
+     * fallback in case the push drops.
+     */
+    // RealtimeClient.Listener — fires on the Realtime reader thread.
+    @Override
+    public void onInsert(JSONObject record) {
+        onRealtimeInsert(record);
+    }
+
+    @Override
+    public void onStatus(String msg) {
+        log(msg);
+    }
+
+    private void onRealtimeInsert(JSONObject record) {
+        try {
+            log("rt: push received id=" + record.optString("id", "?"));
+            JSONObject m = new JSONObject();
+            m.put("text", record.optString("text", ""));
+            if (record.isNull("audio_url")) {
+                m.put("audioUrl", JSONObject.NULL);
+            } else {
+                m.put("audioUrl", record.optString("audio_url", ""));
+            }
+            // created_at is "YYYY-MM-DD HH:MM:SS.ffffff+00"; poll's
+            // last_ts advances on wall-clock so the fallback poll
+            // won't refetch this row (dedupe via spokenTexts covers
+            // any overlap anyway).
+            m.put("timestamp", System.currentTimeMillis());
+            handleQueueMessage(m, getLastTs());
+            setLastTs(System.currentTimeMillis());
+        } catch (Exception e) {
+            log("rt: push handling failed: " + e);
+        }
+    }
+
+    /** Start the Realtime push listener while the app is visible. */
+    private void startRealtime() {
+        if (realtimeClient != null) return;
+        // v1.14: MainActivity implements RealtimeClient.Listener directly.
+        // (Anonymous inner classes crash this project's d8/R8 build — the
+        // v1.11 TtsProgressListener lesson.)
+        realtimeClient = new RealtimeClient(
+                SUPABASE_HOST, SUPABASE_ANON_KEY,
+                "realtime:public:selena_voice_queue", "selena_voice_queue",
+                this);
+        realtimeClient.start();
+        Log.i(TAG, "realtime push started");
+    }
+
+    /** Stop the Realtime push listener when the app goes to background. */
+    private void stopRealtime() {
+        if (realtimeClient != null) {
+            realtimeClient.stop();
+            realtimeClient = null;
+        }
     }
 
     // ------------------------------------------------------------ v1.4 outbound polling
@@ -589,76 +662,7 @@ public class MainActivity extends Activity implements TtsProgressListener.Callba
             log("poll: " + count + " message(s)");
             long maxTs = since;
             for (int i = 0; i < count; i++) {
-                JSONObject m = arr.getJSONObject(i);
-                long ts = parseTimestamp(m);
-                String text = m.optString("text", "");
-                // Nick 2026-10-18 v1.12: explicit JSON-null check. The server
-                // now sends "audioUrl": null for text-only speed-mode replies;
-                // optString on a JSON null returns the literal string "null"
-                // (not ""), which then fails the isEmpty() check and sends us
-                // into a doomed download of URL "null". isNull() handles it.
-                String audioUrl = m.isNull("audioUrl") ? "" : m.optString("audioUrl", "");
-                log("audio: audioUrl='" + audioUrl + "'");
-                if (ts > maxTs) maxTs = ts;
-                // Nick 2026-10-18 v1.13: two-phase server delivery dedupe.
-                // The server queues TEXT immediately, then queues the SAME
-                // text with an MP3 audioUrl seconds later when TTS finishes.
-                // Without this, Phone mode would speak the reply twice and
-                // Aria mode would hold-then-play it twice. Texts are added
-                // to spokenTexts only when actually spoken/played — Aria
-                // mode holding a text-only message must NOT consume the
-                // entry the MP3 version still needs.
-                if (text.isEmpty()) {
-                    continue;
-                }
-                if (spokenTexts.contains(text)) {
-                    log("dedupe: skipping duplicate text '" +
-                            (text.length() > 30 ? text.substring(0, 30) + "…" : text) + "'");
-                    continue;
-                }
-                if (isPhoneVoiceMode()) {
-                    // Nick 2026-10-18 v1.11/v1.12 SPEED MODE. Phone voice mode
-                    // speaks the text IMMEDIATELY with on-device TTS and
-                    // ignores audioUrl entirely — no download, no wait for a
-                    // server-generated Aria MP3. This is the fast path.
-                    // v1.13: mark spoken FIRST so the second (MP3) phase
-                    // dedupes against it.
-                    markSpoken(text);
-                    onSelenaMessage(text);
-                    final String speakText = text;
-                    runOnUiThread(() -> enqueueTts(speakText));
-                } else if (!audioUrl.isEmpty()) {
-                    // ARIA QUALITY MODE. Download and play the server's MP3.
-                    // Guard against junk URLs (e.g. literal "null") — don't
-                    // attempt a download that can't succeed.
-                    if (!audioUrl.startsWith("http")) {
-                        log("audio: skipping invalid URL: " + audioUrl);
-                    } else {
-                        // Nick 2026-10-18 v1.9: playback is strictly
-                        // queue-only. Only Selena's replies (with
-                        // server-generated audioUrl MP3s) are ever enqueued
-                        // and played. Nick's own voice inputs go to
-                        // /api/selena-voice/input as text and are never
-                        // read aloud.
-                        markSpoken(text);
-                        onSelenaMessage(text);
-                        String full = audioUrl;
-                        try {
-                            File f = downloadToCache(full);
-                            enqueueAudio(f);
-                        } catch (Exception e) {
-                            log("audio download failed: " + full + ": " + e);
-                        }
-                    }
-                } else {
-                    // Aria quality mode with no audioUrl yet — the Aria MP3
-                    // will arrive as its own queue message. Don't speak the
-                    // text on-device; that would double up. v1.13: don't
-                    // markSpoken here; the MP3 phase will mark it when it
-                    // actually plays.
-                    onSelenaMessage(text);
-                    log("tts: text-only message held for Aria MP3 (quality mode)");
-                }
+                maxTs = handleQueueMessage(arr.getJSONObject(i), maxTs);
             }
             // Nick 2026-10-18 v1.7: ALWAYS advance last_ts PAST the newest
             // message processed (+1). The API returned a message whose
@@ -679,6 +683,86 @@ public class MainActivity extends Activity implements TtsProgressListener.Callba
             if (conn != null) conn.disconnect();
             scheduleNextPoll();
         }
+    }
+
+
+    /**
+     * Nick 2026-10-18 v1.14: per-message queue handling, extracted from
+     * doPollWork so the Realtime push path reuses the identical logic
+     * (v1.12 null-audioUrl fix, v1.13 two-phase dedupe, Phone/Aria
+     * routing). Runs on a worker thread. Returns the updated maxTs.
+     */
+    private long handleQueueMessage(JSONObject m, long maxTs) {
+        long ts = parseTimestamp(m);
+        String text = m.optString("text", "");
+        // Nick 2026-10-18 v1.12: explicit JSON-null check. The server
+        // now sends "audioUrl": null for text-only speed-mode replies;
+        // optString on a JSON null returns the literal string "null"
+        // (not ""), which then fails the isEmpty() check and sends us
+        // into a doomed download of URL "null". isNull() handles it.
+        String audioUrl = m.isNull("audioUrl") ? "" : m.optString("audioUrl", "");
+        log("audio: audioUrl='" + audioUrl + "'");
+        if (ts > maxTs) maxTs = ts;
+        // Nick 2026-10-18 v1.13: two-phase server delivery dedupe.
+        // The server queues TEXT immediately, then queues the SAME
+        // text with an MP3 audioUrl seconds later when TTS finishes.
+        // Without this, Phone mode would speak the reply twice and
+        // Aria mode would hold-then-play it twice. Texts are added
+        // to spokenTexts only when actually spoken/played — Aria
+        // mode holding a text-only message must NOT consume the
+        // entry the MP3 version still needs.
+        if (text.isEmpty()) {
+            return maxTs;
+        }
+        if (spokenTexts.contains(text)) {
+            log("dedupe: skipping duplicate text '" +
+                    (text.length() > 30 ? text.substring(0, 30) + "…" : text) + "'");
+            return maxTs;
+        }
+        if (isPhoneVoiceMode()) {
+            // Nick 2026-10-18 v1.11/v1.12 SPEED MODE. Phone voice mode
+            // speaks the text IMMEDIATELY with on-device TTS and
+            // ignores audioUrl entirely — no download, no wait for a
+            // server-generated Aria MP3. This is the fast path.
+            // v1.13: mark spoken FIRST so the second (MP3) phase
+            // dedupes against it.
+            markSpoken(text);
+            onSelenaMessage(text);
+            final String speakText = text;
+            runOnUiThread(() -> enqueueTts(speakText));
+        } else if (!audioUrl.isEmpty()) {
+            // ARIA QUALITY MODE. Download and play the server's MP3.
+            // Guard against junk URLs (e.g. literal "null") — don't
+            // attempt a download that can't succeed.
+            if (!audioUrl.startsWith("http")) {
+                log("audio: skipping invalid URL: " + audioUrl);
+            } else {
+                // Nick 2026-10-18 v1.9: playback is strictly
+                // queue-only. Only Selena's replies (with
+                // server-generated audioUrl MP3s) are ever enqueued
+                // and played. Nick's own voice inputs go to
+                // /api/selena-voice/input as text and are never
+                // read aloud.
+                markSpoken(text);
+                onSelenaMessage(text);
+                String full = audioUrl;
+                try {
+                    File f = downloadToCache(full);
+                    enqueueAudio(f);
+                } catch (Exception e) {
+                    log("audio download failed: " + full + ": " + e);
+                }
+            }
+        } else {
+            // Aria quality mode with no audioUrl yet — the Aria MP3
+            // will arrive as its own queue message. Don't speak the
+            // text on-device; that would double up. v1.13: don't
+            // markSpoken here; the MP3 phase will mark it when it
+            // actually plays.
+            onSelenaMessage(text);
+            log("tts: text-only message held for Aria MP3 (quality mode)");
+        }
+        return maxTs;
     }
 
     private void setPollStatus(String status) {
