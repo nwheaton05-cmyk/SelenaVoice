@@ -15,6 +15,8 @@ import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.text.Html;
+import android.text.TextUtils;
 import android.util.Log;
 import android.view.View;
 import android.widget.Button;
@@ -120,14 +122,23 @@ public class MainActivity extends Activity {
         receiver = new MessageReceiver(this);
     }
 
+    // Nick 2026-10-18 v1.9: the log shows the full conversation. Nick's own
+    // words appear as "You:" in muted purple; Selena's replies as "Selena:"
+    // in dark. Nick's inputs are NEVER spoken aloud — the audio queue only
+    // ever plays audioUrl MP3s from /api/selena-voice/queue (Selena's
+    // replies). His inputs go to /api/selena-voice/input as text only.
+    private static final String COLOR_SELENA = "#2D2A32"; // selena_dark
+    private static final String COLOR_NICK = "#6B4FA1";   // selena_purple
+
     /** Called by MessageReceiver when Selena has a new voice message. */
     public void onSelenaMessage(String text) {
-        appendLog("Selena: " + text);
+        appendLogHtml("Selena", text, COLOR_SELENA);
     }
 
-    /** Called by MessageReceiver when Nick's voice input was sent. */
+    /** Called by MessageReceiver when Nick's voice input was accepted. */
     public void onInputSent(String text) {
-        appendLog("You: " + text);
+        log("log: showing Nick's message");
+        appendLogHtml("You", text, COLOR_NICK);
         runOnUiThread(() ->
                 Toast.makeText(this, "Sent to Selena", Toast.LENGTH_SHORT).show());
     }
@@ -472,6 +483,11 @@ public class MainActivity extends Activity {
                     onSelenaMessage(text);
                 }
                 if (!audioUrl.isEmpty()) {
+                    // Nick 2026-10-18 v1.9: playback is strictly queue-only.
+                    // Only Selena's replies (with server-generated audioUrl
+                    // MP3s) are ever enqueued and played. Nick's own voice
+                    // inputs go to /api/selena-voice/input as text and are
+                    // never read aloud.
                     String full = audioUrl.startsWith("http")
                             ? audioUrl : BASE_URL + audioUrl;
                     try {
@@ -718,9 +734,13 @@ public class MainActivity extends Activity {
 
     // ------------------------------------------------------------ existing UI helpers
 
-    private void appendLog(String line) {
+    private void appendLogHtml(String who, String text, String color) {
+        final CharSequence html = Html.fromHtml(
+                "<font color=\"" + color + "\"><b>" + who + ":</b> "
+                        + TextUtils.htmlEncode(text) + "</font><br><br>",
+                Html.FROM_HTML_MODE_LEGACY);
         runOnUiThread(() -> {
-            logText.append(line + "\n\n");
+            logText.append(html);
             logScroll.post(() -> logScroll.fullScroll(View.FOCUS_DOWN));
         });
     }

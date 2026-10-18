@@ -559,6 +559,13 @@ public class VoiceService extends Service {
     }
 
     public void onVoiceInput(String text) {
+        // Nick 2026-10-18 v1.9: tell the UI BEFORE the network POST so
+        // Nick's words appear in the message log instantly, even if the
+        // POST later fails (offline, timeout). His inputs are never spoken
+        // aloud — playback only plays Selena's reply MP3s from the queue.
+        Intent sent = new Intent(ACTION_INPUT_SENT);
+        sent.putExtra(EXTRA_TEXT, text);
+        sendBroadcast(sent);
         new Thread(new InputPostTask(this, text)).start();
     }
 
@@ -585,9 +592,9 @@ public class VoiceService extends Service {
             }
             int code = conn.getResponseCode();
             Log.i(TAG, "input posted (" + code + "): " + text);
-            Intent i = new Intent(ACTION_INPUT_SENT);
-            i.putExtra(EXTRA_TEXT, text);
-            sendBroadcast(i);
+            // Nick 2026-10-18 v1.9: the INPUT_SENT broadcast now fires in
+            // onVoiceInput() before the POST, so the log is instant even
+            // when the network is down. Nothing to broadcast here anymore.
         } catch (Exception e) {
             Log.w(TAG, "postInput failed", e);
         } finally {
