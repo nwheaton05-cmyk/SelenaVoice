@@ -122,10 +122,10 @@ public class RealtimeClient {
                 + "Sec-WebSocket-Version: 13\r\n\r\n";
         out.write(req.getBytes(StandardCharsets.UTF_8));
         out.flush();
-        String statusLine = readHttpStatusLine(in);
-        if (!statusLine.contains("101")) {
-            throw new Exception("WS handshake failed: " + statusLine);
-        }
+        // Read the FULL header block. Stopping at the status line leaves
+        // the remaining headers in the stream, which then get parsed as
+        // WebSocket frames and desync everything (bug found 2026-10-18).
+        readHttpHeaders(in);
         listener.onStatus("rt: websocket connected");
 
         // --- Phoenix join ---
@@ -201,15 +201,27 @@ public class RealtimeClient {
 
     // ---------------------------------------------------------- WS framing
 
-    private static String readHttpStatusLine(InputStream in) throws Exception {
+    private static void readHttpHeaders(InputStream in) throws Exception {
         ByteArrayOutputStream bos = new ByteArrayOutputStream();
-        int prev = -1, cur;
+        int[] last4 = {-1, -1, -1, -1};
+        int cur;
         while ((cur = in.read()) != -1) {
             bos.write(cur);
-            if (prev == '\r' && cur == '\n') break;
-            prev = cur;
+            last4[0] = last4[1];
+            last4[1] = last4[2];
+            last4[2] = last4[3];
+            last4[3] = cur;
+            if (last4[0] == '\r' && last4[1] == '\n'
+                    && last4[2] == '\r' && last4[3] == '\n') {
+                break;
+            }
+            if (bos.size() > 16384) throw new Exception("header block too large");
         }
-        return new String(bos.toByteArray(), StandardCharsets.UTF_8);
+        String headers = new String(bos.toByteArray(), StandardCharsets.UTF_8);
+        String statusLine = headers.split("\r\n")[0];
+        if (!statusLine.contains("101")) {
+            throw new Exception("WS handshake failed: " + statusLine);
+        }
     }
 
     private static void sendText(OutputStream out, String text) throws Exception {
