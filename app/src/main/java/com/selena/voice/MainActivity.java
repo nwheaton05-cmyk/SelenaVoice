@@ -107,6 +107,10 @@ public class MainActivity extends Activity {
     private final Queue<File> audioQueue = new LinkedList<>();
     private boolean playing = false;
     private File currentAudioFile;
+    // Nick 2026-10-18 v1.7: remember the speakerphone state so we can put
+    // it back after playback — leaving it forced on would make Nick's next
+    // real phone call blast out of the speaker.
+    private boolean speakerWasOn = false;
 
     public MainActivity() {
         receiver = new MessageReceiver(this);
@@ -446,14 +450,15 @@ public class MainActivity extends Activity {
                     }
                 }
             }
-            // Nick 2026-10-18 v1.5: ALWAYS advance last_ts after a poll that
-            // returned messages. The old conditional (maxTs > since) never
-            // fired when a timestamp came back unparseable (parseTimestamp
-            // -> 0), leaving last_ts at 0 forever and re-fetching the same
-            // messages on every poll -> the 7x duplicate log Nick saw.
-            // Fallback to now() so we always make forward progress.
+            // Nick 2026-10-18 v1.7: ALWAYS advance last_ts PAST the newest
+            // message processed (+1). The API returned a message whose
+            // timestamp exactly equaled `since` (16:09:05 and 16:09:09 both
+            // fetched the same 249-byte reply), so a strict greater-than is
+            // needed on the next poll. Fallback to now() when no timestamp
+            // parsed (parseTimestamp -> 0) so we always make forward
+            // progress instead of re-fetching forever.
             if (count > 0) {
-                long newTs = maxTs > since ? maxTs : System.currentTimeMillis();
+                long newTs = maxTs > since ? maxTs + 1 : System.currentTimeMillis();
                 setLastTs(newTs);
             }
             setPollStatus("Last poll: 200 OK, " + count + " message(s)");
@@ -479,17 +484,22 @@ public class MainActivity extends Activity {
         File out = File.createTempFile("selena-", ".mp3", getCacheDir());
         InputStream in = null;
         FileOutputStream fos = null;
+        long total = 0;
         try {
             in = conn.getInputStream();
             fos = new FileOutputStream(out);
             byte[] buf = new byte[8192];
             int n;
-            while ((n = in.read(buf)) > 0) fos.write(buf, 0, n);
+            while ((n = in.read(buf)) > 0) { fos.write(buf, 0, n); total += n; }
         } finally {
             if (in != null) try { in.close(); } catch (Exception ignored) {}
             if (fos != null) try { fos.close(); } catch (Exception ignored) {}
             conn.disconnect();
         }
+        // Nick 2026-10-18 v1.7: verify the download is a real file, not an
+        // empty/corrupt stub — silent playback with a 0-byte file looks
+        // identical to the audio-routing bug in the logs.
+        log("audio: downloaded " + total + " bytes to " + out.getAbsolutePath());
         return out;
     }
 
@@ -514,31 +524,46 @@ public class MainActivity extends Activity {
     }
 
     /** Runs on main thread: starts MediaPlayer for the downloaded file. */
+    // setSpeakerphoneOn is deprecated (API 31+) but still functional through
+    // API 34; its replacement (setCommunicationDevice) is for voice-call
+    // routing — the wrong semantic for media playback.
+    @SuppressWarnings("deprecation")
     private void playFileNow(File f) {
         try {
-            // Nick 2026-10-18 v1.5: VoiceService.muteBeep() zeroes
-            // STREAM_VOICE_CALL (and others) for beep suppression and the
-            // volumes can stay zeroed — this player's USAGE_VOICE_COMMUNICATION
-            // routes through that stream, so playback was silent. Ensure an
-            // audible level here independently; do NOT rely on the service's
-            // unmuteBeep().
+            // Nick 2026-10-18 v1.7: THE SILENT-PLAYBACK FIX. v1.5/v1.6 used
+            // USAGE_VOICE_COMMUNICATION, which Android routes to the EARPIECE
+            // (like a phone call) — MediaPlayer reported "started"/"done"
+            // with no errors while Nick heard nothing. Route through the
+            // loudspeaker instead: USAGE_MEDIA (= STREAM_MUSIC) +
+            // setSpeakerphoneOn(true).
             ensureAudibleVolume();
+            try {
+                speakerWasOn = audioManager.isSpeakerphoneOn();
+                audioManager.setSpeakerphoneOn(true);
+            } catch (Exception e) {
+                log("audio: setSpeakerphoneOn failed: " + e);
+            }
+            log("audio: speakerphone on");
+            log("audio: stream=MUSIC (USAGE_MEDIA)");
             requestAudioFocus();
             releasePlayer();
             player = new MediaPlayer();
             player.setAudioAttributes(new AudioAttributes.Builder()
-                    .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
+                    .setUsage(AudioAttributes.USAGE_MEDIA)
                     .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
                     .build());
             player.setOnCompletionListener(mp -> onPlaybackDone());
             player.setOnErrorListener((mp, what, extra) -> {
+                log("audio: MediaPlayer error what=" + what + " extra=" + extra);
                 onPlaybackDone();
                 return true;
             });
             player.setDataSource(f.getAbsolutePath());
+            log("audio: MediaPlayer setDataSource " + f.getAbsolutePath());
             // Synchronous prepare on main thread for a local file is fast
             // (<100ms).
             player.prepare();
+            log("audio: MediaPlayer prepared, duration=" + player.getDuration() + "ms");
             player.start();
             VoiceService.setPlayingAudio(true);
             log("playback started (echo guard on)");
@@ -549,28 +574,46 @@ public class MainActivity extends Activity {
         }
     }
 
-    /** Nick 2026-10-18 v1.5: guarantee audible playback volume. */
+    /**
+     * Nick 2026-10-18 v1.7: guarantee audible playback volume WITHOUT
+     * flashing the system volume panel. v1.5 stomped both STREAM_VOICE_CALL
+     * and STREAM_MUSIC to 80% before every playback — on Samsung that pops
+     * the volume indicator as if Nick pressed the buttons. Now: playback
+     * uses USAGE_MEDIA (STREAM_MUSIC) via the speaker, so only touch
+     * STREAM_MUSIC, only when it's below the target, and always with flag
+     * 0 (no UI). Never touch STREAM_VOICE_CALL here — the service zeroes
+     * it for mic-beep suppression and playback no longer depends on it.
+     */
     private void ensureAudibleVolume() {
         try {
-            int maxVoice = audioManager.getStreamMaxVolume(AudioManager.STREAM_VOICE_CALL);
             int maxMusic = audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC);
-            // 80% of max — loud and clear without blasting.
-            audioManager.setStreamVolume(
-                    AudioManager.STREAM_VOICE_CALL, (int) (maxVoice * 0.8f), 0);
-            audioManager.setStreamVolume(
-                    AudioManager.STREAM_MUSIC, (int) (maxMusic * 0.8f), 0);
-            log("playback volumes ensured at 80% (voice_call/music)");
+            int curMusic = audioManager.getStreamVolume(AudioManager.STREAM_MUSIC);
+            int target = (int) (maxMusic * 0.8f);
+            if (curMusic < target) {
+                audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, target, 0);
+                log("audio: raised STREAM_MUSIC " + curMusic + " -> " + target + " (no UI)");
+            } else {
+                log("audio: STREAM_MUSIC already audible (" + curMusic + "/" + maxMusic + ")");
+            }
         } catch (Exception e) {
             log("ensureAudibleVolume failed: " + e);
         }
     }
 
     /** Runs on main thread after playback finishes or fails. */
+    @SuppressWarnings("deprecation") // setSpeakerphoneOn, see playFileNow
     private void onPlaybackDone() {
         abandonAudioFocus();
         releasePlayer();
         playing = false;
         VoiceService.setPlayingAudio(false);
+        // Nick 2026-10-18 v1.7: put the speakerphone back the way we found
+        // it, so Nick's next real phone call doesn't start on speaker.
+        try {
+            audioManager.setSpeakerphoneOn(speakerWasOn);
+        } catch (Exception e) {
+            log("audio: speakerphone restore failed: " + e);
+        }
         log("playback done (echo guard off)");
         if (currentAudioFile != null) {
             //noinspection ResultOfMethodCallIgnored
@@ -589,8 +632,10 @@ public class MainActivity extends Activity {
 
     private void requestAudioFocus() {
         try {
+            // Nick 2026-10-18 v1.7: match the playback usage (USAGE_MEDIA)
+            // so focus is requested for the music stream, not voice-call.
             AudioAttributes attrs = new AudioAttributes.Builder()
-                    .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
+                    .setUsage(AudioAttributes.USAGE_MEDIA)
                     .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
                     .build();
             focusRequest = new AudioFocusRequest.Builder(

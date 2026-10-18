@@ -23,8 +23,8 @@ aapt2 link -o $OUT/base.apk \
   --manifest app/src/main/AndroidManifest.xml \
   --min-sdk-version 26 \
   --target-sdk-version 34 \
-  --version-code 7 \
-  --version-name 1.6 \
+  --version-code 8 \
+  --version-name 1.7 \
   --java $OUT/gen \
   $OUT/res.zip
 
@@ -56,14 +56,14 @@ KEY_PASS=$(grep keyPassword keystore.properties | cut -d= -f2 | tr -d ' ')
 export KS_PASS KEY_PASS
 apksigner sign \
   --ks selena-voice.keystore --ks-pass env:KS_PASS --ks-key-alias "$KEY_ALIAS" --key-pass env:KEY_PASS \
-  --out $OUT/selena-voice-v1.6.apk $OUT/aligned.apk
+  --out $OUT/selena-voice-v1.7.apk $OUT/aligned.apk
 
 echo "== verify =="
-apksigner verify --print-certs $OUT/selena-voice-v1.6.apk | head -3
-aapt2 dump badging $OUT/selena-voice-v1.6.apk | grep -E "sdkVersion|targetSdkVersion|versionCode|application-label" | head -5
-echo "BUILD DONE: $OUT/selena-voice-v1.6.apk"
+apksigner verify --print-certs $OUT/selena-voice-v1.7.apk | head -3
+aapt2 dump badging $OUT/selena-voice-v1.7.apk | grep -E "sdkVersion|targetSdkVersion|versionCode|application-label" | head -5
+echo "BUILD DONE: $OUT/selena-voice-v1.7.apk"
 # Nick 2026-10-18: also stage copies at the deliverable locations
 mkdir -p app/build
-cp $OUT/selena-voice-v1.6.apk app/build/selena-voice-v1.6.apk
-cp $OUT/selena-voice-v1.6.apk ~/workspace/your_files/selena-voice-v1.6.apk
-echo "COPIED: app/build/selena-voice-v1.6.apk, ~/workspace/your_files/selena-voice-v1.6.apk"
+cp $OUT/selena-voice-v1.7.apk app/build/selena-voice-v1.7.apk
+cp $OUT/selena-voice-v1.7.apk ~/workspace/your_files/selena-voice-v1.7.apk
+echo "COPIED: app/build/selena-voice-v1.7.apk, ~/workspace/your_files/selena-voice-v1.7.apk"
