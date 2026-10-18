@@ -78,7 +78,31 @@
         android:textColor="#888888"
         android:gravity="center"
         android:paddingTop="8dp"
-        android:paddingBottom="16dp" />
+        android:paddingBottom="8dp" />
+
+    <!-- Voice mode: Phone (fast, on-device TTS) vs Aria (quality, server MP3) -->
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="horizontal"
+        android:gravity="center"
+        android:paddingBottom="16dp">
+
+        <TextView
+            android:id="@+id/voiceModeLabel"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="Voice: Phone (fast)"
+            android:textSize="16sp"
+            android:textColor="@color/selena_dark"
+            android:paddingEnd="8dp" />
+
+        <Switch
+            android:id="@+id/voiceModeSwitch"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:checked="true" />
+    </LinearLayout>
 
     <!-- Message log -->
     <TextView

@@ -8,6 +8,7 @@ import android.content.Intent;
 import android.content.IntentFilter;
 import android.content.pm.PackageManager;
 import android.media.AudioAttributes;
+import android.media.AudioDeviceInfo;
 import android.media.AudioFocusRequest;
 import android.media.AudioManager;
 import android.media.MediaPlayer;
@@ -15,6 +16,8 @@ import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.speech.tts.TextToSpeech;
+import android.speech.tts.UtteranceProgressListener;
 import android.text.Html;
 import android.text.TextUtils;
 import android.util.Log;
@@ -39,6 +42,7 @@ import java.net.URLEncoder;
 import java.util.ArrayList;
 import java.util.LinkedList;
 import java.util.List;
+import java.util.Locale;
 import java.util.Queue;
 
 /**
@@ -56,7 +60,7 @@ import java.util.Queue;
  * foreground and plays Selena's voice messages itself. The app must be
  * open for her messages to arrive — better than nothing working at all.
  */
-public class MainActivity extends Activity {
+public class MainActivity extends Activity implements TtsProgressListener.Callback {
     private static final String TAG = "SelenaVoice";
     private static final String BASE_URL = "https://siteview-pi.vercel.app";
     private static final long POLL_MS = 3000;
@@ -113,10 +117,28 @@ public class MainActivity extends Activity {
     // it back after playback — leaving it forced on would make Nick's next
     // real phone call blast out of the speaker.
     private boolean speakerWasOn = false;
+    // Nick 2026-10-18 v1.11: true when the current playback was routed to
+    // Bluetooth (speakerphone left untouched). Set by routeAudioForPlayback.
+    private boolean btRouted = false;
     // Nick 2026-10-18 v1.8: the mic button is a real on/off toggle (manual
     // fallback when always-listening is off). One press starts, next stops.
     private Button micButton;
     private boolean manualMicOn = false;
+
+    // Nick 2026-10-18 v1.11: on-device TTS for speed. The server sends
+    // text-only replies and the phone speaks them locally (~5s round-trip)
+    // instead of waiting for server-generated Aria MP3s (~48s). Messages
+    // that DO carry an audioUrl still download and play the MP3 (Aria
+    // quality mode). Default is phone/fast.
+    private TextToSpeech tts;
+    private boolean ttsReady = false;
+    private static final String KEY_VOICE_MODE = "voice_mode";
+    private static final String VOICE_PHONE = "phone"; // fast, on-device
+    private static final String VOICE_ARIA = "aria";   // quality, server MP3
+    private TextView voiceModeLabel;
+    private Switch voiceModeSwitch;
+    private final Queue<String> ttsQueue = new LinkedList<>();
+    private boolean ttsSpeaking = false;
 
     public MainActivity() {
         receiver = new MessageReceiver(this);
@@ -207,12 +229,76 @@ public class MainActivity extends Activity {
             updateMicButton();
         });
 
+        // Nick 2026-10-18 v1.11: voice mode toggle — Phone (fast, on-device
+        // TTS, default) vs Aria (quality, server-generated MP3). Stored in
+        // SharedPreferences so it survives restarts.
+        voiceModeLabel = findViewById(R.id.voiceModeLabel);
+        voiceModeSwitch = findViewById(R.id.voiceModeSwitch);
+        voiceModeSwitch.setChecked(isPhoneVoiceMode());
+        updateVoiceModeLabel();
+        voiceModeSwitch.setOnCheckedChangeListener((v, phone) -> {
+            getSharedPreferences(PREFS, MODE_PRIVATE).edit()
+                    .putString(KEY_VOICE_MODE, phone ? VOICE_PHONE : VOICE_ARIA)
+                    .apply();
+            updateVoiceModeLabel();
+            log("voice: mode=" + (phone ? "phone (fast)" : "aria (quality)"));
+        });
+
+        initOnDeviceTts();
+
         requestPermissions();
         // Service starts after permission grant (see onRequestPermissionsResult).
         // If already granted, start now.
         if (hasAllPermissions()) {
             startVoiceService();
         }
+    }
+
+    private boolean isPhoneVoiceMode() {
+        return VOICE_PHONE.equals(getSharedPreferences(PREFS, MODE_PRIVATE)
+                .getString(KEY_VOICE_MODE, VOICE_PHONE));
+    }
+
+    private void updateVoiceModeLabel() {
+        final boolean phone = isPhoneVoiceMode();
+        runOnUiThread(() -> voiceModeLabel.setText(
+                phone ? "Voice: Phone (fast)" : "Voice: Aria (quality)"));
+    }
+
+    /** Nick 2026-10-18 v1.11: init Android's built-in TTS for speed mode. */
+    private void initOnDeviceTts() {
+        try {
+            tts = new TextToSpeech(this, status -> {
+                if (status == TextToSpeech.SUCCESS) {
+                    int r = tts.setLanguage(Locale.US);
+                    ttsReady = (r != TextToSpeech.LANG_MISSING_DATA
+                            && r != TextToSpeech.LANG_NOT_SUPPORTED);
+                    if (ttsReady) {
+                        tts.setOnUtteranceProgressListener(
+                                new TtsProgressListener(MainActivity.this));
+                        log("tts: on-device engine ready");
+                    } else {
+                        log("tts: on-device language not available");
+                    }
+                } else {
+                    log("tts: on-device init failed status=" + status);
+                }
+            });
+        } catch (Exception e) {
+            log("tts: on-device init exception: " + e);
+        }
+    }
+
+    // TtsProgressListener.Callback — onStart already raised the echo guard
+    // directly, so onTtsStarted is a no-op.
+    @Override
+    public void onTtsStarted() {
+    }
+
+    @Override
+    public void onTtsFinished() {
+        // Binder thread — marshal to main thread before touching UI/audio.
+        runOnUiThread(this::onTtsDone);
     }
 
     private boolean hasAllPermissions() {
@@ -313,7 +399,28 @@ public class MainActivity extends Activity {
         }
         playing = false;
         VoiceService.setPlayingAudio(false);
+        // Nick 2026-10-18 v1.11: stop on-device TTS when backgrounding so
+        // it never talks over another app.
+        try {
+            if (tts != null) tts.stop();
+        } catch (Exception ignored) {}
+        synchronized (ttsQueue) {
+            ttsQueue.clear();
+        }
+        ttsSpeaking = false;
         Log.i(TAG, "activity polling stopped");
+    }
+
+    @Override
+    protected void onDestroy() {
+        try {
+            if (tts != null) {
+                tts.stop();
+                tts.shutdown();
+            }
+        } catch (Exception ignored) {}
+        tts = null;
+        super.onDestroy();
     }
 
     public boolean isPolling() {
@@ -496,6 +603,18 @@ public class MainActivity extends Activity {
                     } catch (Exception e) {
                         log("audio download failed: " + full + ": " + e);
                     }
+                } else if (isPhoneVoiceMode()) {
+                    // Nick 2026-10-18 v1.11: SPEED MODE. The server sends
+                    // text-only replies; the phone speaks them locally with
+                    // on-device TTS (~5s round-trip) instead of waiting for
+                    // a server-generated Aria MP3 (~48s). No download at all.
+                    final String speakText = text;
+                    runOnUiThread(() -> enqueueTts(speakText));
+                } else {
+                    // Aria quality mode with no audioUrl yet — the Aria MP3
+                    // will arrive as its own queue message. Don't speak the
+                    // text on-device; that would double up.
+                    log("tts: text-only message held for Aria MP3 (quality mode)");
                 }
             }
             // Nick 2026-10-18 v1.7: ALWAYS advance last_ts PAST the newest
@@ -571,6 +690,62 @@ public class MainActivity extends Activity {
         playFileNow(f);
     }
 
+    /**
+     * Nick 2026-10-18 v1.11: Bluetooth-aware audio routing. v1.7 forced the
+     * speakerphone on for every playback, which steals audio from Bluetooth
+     * earbuds (sound blasts out of the phone speaker instead). If a BT
+     * output device is connected, leave routing alone and let Android use
+     * it. Otherwise fall back to the v1.7 speakerphone behavior. Sets
+     * btRouted so restoreAudioRouting() knows what to undo.
+     */
+    @SuppressWarnings("deprecation") // setSpeakerphoneOn / isBluetoothA2dpOn
+    private boolean routeAudioForPlayback() {
+        boolean btConnected = false;
+        try {
+            // minSdk 26 — getDevices() is always available.
+            for (AudioDeviceInfo d :
+                    audioManager.getDevices(AudioManager.GET_DEVICES_OUTPUTS)) {
+                int t = d.getType();
+                if (t == AudioDeviceInfo.TYPE_BLUETOOTH_A2DP
+                        || t == AudioDeviceInfo.TYPE_BLUETOOTH_SCO
+                        || t == AudioDeviceInfo.TYPE_BLE_HEADSET
+                        || t == AudioDeviceInfo.TYPE_BLE_SPEAKER) {
+                    btConnected = true;
+                    break;
+                }
+            }
+        } catch (Exception e) {
+            log("audio: BT check failed: " + e);
+        }
+        btRouted = btConnected;
+        if (btConnected) {
+            log("audio: bluetooth connected, routing to BT");
+            return true;
+        }
+        try {
+            speakerWasOn = audioManager.isSpeakerphoneOn();
+            audioManager.setSpeakerphoneOn(true);
+        } catch (Exception e) {
+            log("audio: setSpeakerphoneOn failed: " + e);
+        }
+        log("audio: no BT, using speakerphone");
+        return false;
+    }
+
+    /** Undo what routeAudioForPlayback() did (no-op when BT routed). */
+    @SuppressWarnings("deprecation") // setSpeakerphoneOn
+    private void restoreAudioRouting() {
+        if (btRouted) {
+            btRouted = false;
+            return; // speakerphone was never touched
+        }
+        try {
+            audioManager.setSpeakerphoneOn(speakerWasOn);
+        } catch (Exception e) {
+            log("audio: speakerphone restore failed: " + e);
+        }
+    }
+
     /** Runs on main thread: starts MediaPlayer for the downloaded file. */
     // setSpeakerphoneOn is deprecated (API 31+) but still functional through
     // API 34; its replacement (setCommunicationDevice) is for voice-call
@@ -601,13 +776,9 @@ public class MainActivity extends Activity {
                 log("audio: volume restore failed: " + e);
             }
             log("audio: using device volume (no override)");
-            try {
-                speakerWasOn = audioManager.isSpeakerphoneOn();
-                audioManager.setSpeakerphoneOn(true);
-            } catch (Exception e) {
-                log("audio: setSpeakerphoneOn failed: " + e);
-            }
-            log("audio: speakerphone on");
+            // Nick 2026-10-18 v1.11: Bluetooth-aware — earbuds win over the
+            // speakerphone when connected.
+            routeAudioForPlayback();
             log("audio: stream=MUSIC (USAGE_MEDIA)");
             requestAudioFocus();
             releasePlayer();
@@ -647,17 +818,97 @@ public class MainActivity extends Activity {
         VoiceService.setPlayingAudio(false);
         // Nick 2026-10-18 v1.7: put the speakerphone back the way we found
         // it, so Nick's next real phone call doesn't start on speaker.
-        try {
-            audioManager.setSpeakerphoneOn(speakerWasOn);
-        } catch (Exception e) {
-            log("audio: speakerphone restore failed: " + e);
-        }
+        // Nick 2026-10-18 v1.11: no-op when Bluetooth handled the routing.
+        restoreAudioRouting();
         log("playback done (echo guard off)");
         if (currentAudioFile != null) {
             //noinspection ResultOfMethodCallIgnored
             currentAudioFile.delete();
             currentAudioFile = null;
         }
+        pumpAudioQueue();
+        pumpTtsQueue();
+    }
+
+    // ------------------------------------------------------------ v1.11 on-device TTS (speed mode)
+
+    /** Runs on main thread: queue text for on-device speech. */
+    private void enqueueTts(String text) {
+        synchronized (ttsQueue) {
+            ttsQueue.add(text);
+        }
+        pumpTtsQueue();
+    }
+
+    /** Runs on main thread: speak the next queued text if nothing is playing. */
+    private void pumpTtsQueue() {
+        if (ttsSpeaking || playing) return;
+        String text;
+        synchronized (ttsQueue) {
+            text = ttsQueue.poll();
+        }
+        if (text == null) return;
+        ttsSpeaking = true;
+        speakOnDevice(text);
+    }
+
+    /** Runs on main thread: speak text with Android's built-in TTS. */
+    @SuppressWarnings("deprecation") // setSpeakerphoneOn, see playFileNow
+    private void speakOnDevice(String text) {
+        if (tts == null || !ttsReady) {
+            log("tts: on-device not ready, dropping text");
+            onTtsDone();
+            return;
+        }
+        String preview = text.length() > 30 ? text.substring(0, 30) + "…" : text;
+        log("tts: on-device speak '" + preview + "'");
+        // Same routing as MP3 playback (v1.7): loudspeaker, and undo the
+        // service's mic-beep volume zeroing first so we use Nick's real
+        // device volume (v1.10: no override, respect his setting).
+        try {
+            Intent restore = new Intent(this, VoiceService.class);
+            restore.setAction("RESTORE_VOLUMES");
+            startService(restore);
+        } catch (Exception e) {
+            log("tts: volume restore failed: " + e);
+        }
+        // Nick 2026-10-18 v1.11: Bluetooth-aware — earbuds win over the
+        // speakerphone when connected, same as MP3 playback.
+        routeAudioForPlayback();
+        log("tts: stream=MUSIC");
+        requestAudioFocus();
+        VoiceService.setPlayingAudio(true);
+        log("tts: echo guard on");
+        try {
+            // minSdk is 26, so the API-21+ speak() with utterance ID is
+            // always available.
+            Bundle params = new Bundle();
+            String utteranceId = "selena-" + System.currentTimeMillis();
+            params.putString(TextToSpeech.Engine.KEY_PARAM_UTTERANCE_ID,
+                    utteranceId);
+            int rc = tts.speak(text, TextToSpeech.QUEUE_FLUSH, params,
+                    utteranceId);
+            if (rc != TextToSpeech.SUCCESS) {
+                log("tts: speak() returned " + rc);
+                onTtsDone();
+            }
+        } catch (Exception e) {
+            log("tts: speak failed: " + e);
+            onTtsDone();
+        }
+    }
+
+    /** Runs on main thread after on-device TTS finishes or fails. */
+    @SuppressWarnings("deprecation") // setSpeakerphoneOn, see playFileNow
+    private void onTtsDone() {
+        abandonAudioFocus();
+        ttsSpeaking = false;
+        VoiceService.setPlayingAudio(false);
+        // Put the speakerphone back the way we found it (v1.7), same as MP3.
+        // v1.11: no-op when Bluetooth handled the routing.
+        restoreAudioRouting();
+        log("tts: echo guard off");
+        pumpTtsQueue();
         pumpAudioQueue();
     }
 
