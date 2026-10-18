@@ -3,13 +3,19 @@ package com.selena.voice;
 import android.Manifest;
 import android.animation.ObjectAnimator;
 import android.app.Activity;
-import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
 import android.content.pm.PackageManager;
+import android.media.AudioAttributes;
+import android.media.AudioFocusRequest;
+import android.media.AudioManager;
+import android.media.MediaPlayer;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
+import android.util.Log;
 import android.view.View;
 import android.widget.Button;
 import android.widget.ScrollView;
@@ -17,18 +23,44 @@ import android.widget.Switch;
 import android.widget.TextView;
 import android.widget.Toast;
 
+import org.json.JSONArray;
+import org.json.JSONObject;
+
+import java.io.BufferedReader;
+import java.io.File;
+import java.io.FileOutputStream;
+import java.io.InputStream;
+import java.io.InputStreamReader;
+import java.net.HttpURLConnection;
+import java.net.URL;
+import java.net.URLEncoder;
 import java.util.ArrayList;
+import java.util.LinkedList;
 import java.util.List;
+import java.util.Queue;
 
 /**
  * Selena Voice main UI (Nick, 2026-10-18).
  *
  * - Status line, always-listening toggle, pulse dot (flashes when speech
  *   is detected), message log, and a mic button as manual fallback.
- * - Starts the VoiceService foreground service on launch.
+ * - Starts the VoiceService foreground service on launch (inbound mic only).
  * - Requests RECORD_AUDIO + POST_NOTIFICATIONS at runtime.
+ *
+ * Nick 2026-10-18 v1.4: OUTBOUND polling (Selena -> Nick) moved here from
+ * VoiceService. Samsung's background execution limits kill the service's
+ * Handler loop, so the service never polled ("Poll: not started" forever).
+ * The activity polls /api/selena-voice/queue every 3s while it is in the
+ * foreground and plays Selena's voice messages itself. The app must be
+ * open for her messages to arrive — better than nothing working at all.
  */
 public class MainActivity extends Activity {
+    private static final String TAG = "SelenaVoice";
+    private static final String BASE_URL = "https://siteview-pi.vercel.app";
+    private static final long POLL_MS = 3000;
+    private static final String PREFS = "selena_voice";
+    private static final String KEY_LAST_TS = "last_ts";
+
     private TextView statusText;
     private TextView pollStatusText;
     private TextView logText;
@@ -38,6 +70,16 @@ public class MainActivity extends Activity {
     private ObjectAnimator pulseAnimator;
 
     private final MessageReceiver receiver;
+
+    // v1.4: outbound polling + playback owned by the activity
+    private final Handler pollHandler = new Handler(Looper.getMainLooper());
+    private boolean polling = false;
+    private MediaPlayer player;
+    private AudioManager audioManager;
+    private AudioFocusRequest focusRequest;
+    private final Queue<File> audioQueue = new LinkedList<>();
+    private boolean playing = false;
+    private File currentAudioFile;
 
     public MainActivity() {
         receiver = new MessageReceiver(this);
@@ -68,7 +110,7 @@ public class MainActivity extends Activity {
     /** Called by MessageReceiver with the last queue-poll result. */
     public void onPollStatus(String status) {
         if (status == null) return;
-        runOnUiThread(() -> pollStatusText.setText(status));
+        setPollStatus(status);
     }
 
     @Override
@@ -160,13 +202,287 @@ public class MainActivity extends Activity {
         } else {
             registerReceiver(receiver, f);
         }
+        startPolling();
     }
 
     @Override
     protected void onPause() {
+        stopPolling();
         super.onPause();
         try { unregisterReceiver(receiver); } catch (Exception ignored) {}
     }
+
+    // ------------------------------------------------------------ v1.4 outbound polling
+
+    /** Start the 3s queue poll while the app is visible. */
+    private void startPolling() {
+        if (polling) return;
+        polling = true;
+        audioManager = (AudioManager) getSystemService(Context.AUDIO_SERVICE);
+        pollHandler.post(new ActivityPollTask(this));
+        Log.i(TAG, "activity polling started");
+    }
+
+    /** Stop polling when the app goes to background. */
+    private void stopPolling() {
+        polling = false;
+        pollHandler.removeCallbacksAndMessages(null);
+        releasePlayer();
+        synchronized (audioQueue) {
+            File f;
+            while ((f = audioQueue.poll()) != null) {
+                //noinspection ResultOfMethodCallIgnored
+                f.delete();
+            }
+        }
+        playing = false;
+        VoiceService.setPlayingAudio(false);
+        Log.i(TAG, "activity polling stopped");
+    }
+
+    public boolean isPolling() {
+        return polling;
+    }
+
+    /**
+     * Called by ActivityPollTask on the main thread. Network work goes to a
+     * worker thread (Android forbids network on the main thread).
+     */
+    public void pollOnce() {
+        try {
+            setPollStatus("Poll: starting…");
+            new Thread(() -> doPollWork()).start();
+        } catch (Exception e) {
+            Log.w(TAG, "pollOnce failed", e);
+            scheduleNextPoll();
+        }
+    }
+
+    /** Called after each poll (from the worker thread) to schedule the next. */
+    public void scheduleNextPoll() {
+        if (!polling) return;
+        pollHandler.postDelayed(new ActivityPollTask(this), POLL_MS);
+    }
+
+    /** Runs on a worker thread: HTTP GET the queue, update UI, fetch audio. */
+    private void doPollWork() {
+        long since = getLastTs();
+        HttpURLConnection conn = null;
+        try {
+            String urlStr = BASE_URL + "/api/selena-voice/queue?since="
+                    + URLEncoder.encode(String.valueOf(since), "UTF-8");
+            conn = (HttpURLConnection) new URL(urlStr).openConnection();
+            conn.setConnectTimeout(8000);
+            conn.setReadTimeout(8000);
+            int code = conn.getResponseCode();
+            Log.i(TAG, "poll: HTTP " + code + " (since=" + since + ")");
+            if (code != 200) {
+                setPollStatus("Last poll: HTTP " + code);
+                return;
+            }
+            String body = readAll(conn.getInputStream());
+            Log.d(TAG, "poll: body length=" + body.length());
+            JSONArray arr;
+            try {
+                String trimmed = body.trim();
+                if (trimmed.startsWith("{")) {
+                    // Tolerant: API may return {"messages": [...]}
+                    JSONObject obj = new JSONObject(trimmed);
+                    arr = obj.optJSONArray("messages");
+                    if (arr == null) arr = new JSONArray();
+                } else {
+                    arr = new JSONArray(trimmed);
+                }
+            } catch (Exception e) {
+                Log.e(TAG, "poll: JSON parse failed. Body: " + body, e);
+                setPollStatus("Last poll: JSON parse error");
+                return;
+            }
+            int count = arr.length();
+            Log.i(TAG, "poll: " + count + " message(s)");
+            long maxTs = since;
+            for (int i = 0; i < count; i++) {
+                JSONObject m = arr.getJSONObject(i);
+                long ts = parseTimestamp(m);
+                String text = m.optString("text", "");
+                String audioUrl = m.optString("audioUrl", "");
+                if (ts > maxTs) maxTs = ts;
+                if (!text.isEmpty()) {
+                    onSelenaMessage(text);
+                }
+                if (!audioUrl.isEmpty()) {
+                    String full = audioUrl.startsWith("http")
+                            ? audioUrl : BASE_URL + audioUrl;
+                    try {
+                        File f = downloadToCache(full);
+                        enqueueAudio(f);
+                    } catch (Exception e) {
+                        Log.w(TAG, "audio download failed: " + full, e);
+                    }
+                }
+            }
+            if (maxTs > since) setLastTs(maxTs);
+            setPollStatus("Last poll: 200 OK, " + count + " message(s)");
+        } catch (Exception e) {
+            Log.e(TAG, "poll: exception", e);
+            setPollStatus("Last poll: failed - " + e.getClass().getSimpleName());
+        } finally {
+            if (conn != null) conn.disconnect();
+            scheduleNextPoll();
+        }
+    }
+
+    private void setPollStatus(String status) {
+        final String s = status;
+        runOnUiThread(() -> pollStatusText.setText(s));
+    }
+
+    /** Runs on a worker thread: download one audio file to the cache dir. */
+    private File downloadToCache(String urlStr) throws Exception {
+        HttpURLConnection conn = (HttpURLConnection) new URL(urlStr).openConnection();
+        conn.setConnectTimeout(10000);
+        conn.setReadTimeout(15000);
+        File out = File.createTempFile("selena-", ".mp3", getCacheDir());
+        InputStream in = null;
+        FileOutputStream fos = null;
+        try {
+            in = conn.getInputStream();
+            fos = new FileOutputStream(out);
+            byte[] buf = new byte[8192];
+            int n;
+            while ((n = in.read(buf)) > 0) fos.write(buf, 0, n);
+        } finally {
+            if (in != null) try { in.close(); } catch (Exception ignored) {}
+            if (fos != null) try { fos.close(); } catch (Exception ignored) {}
+            conn.disconnect();
+        }
+        return out;
+    }
+
+    /** Called on a worker thread after download; hands playback to the main thread. */
+    private void enqueueAudio(File f) {
+        synchronized (audioQueue) {
+            audioQueue.add(f);
+        }
+        runOnUiThread(this::pumpAudioQueue);
+    }
+
+    /** Runs on main thread: start the next download's playback if idle. */
+    private void pumpAudioQueue() {
+        if (playing) return;
+        File f;
+        synchronized (audioQueue) {
+            f = audioQueue.poll();
+        }
+        if (f == null) return;
+        playing = true;
+        playFileNow(f);
+    }
+
+    /** Runs on main thread: starts MediaPlayer for the downloaded file. */
+    private void playFileNow(File f) {
+        try {
+            requestAudioFocus();
+            releasePlayer();
+            player = new MediaPlayer();
+            player.setAudioAttributes(new AudioAttributes.Builder()
+                    .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
+                    .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                    .build());
+            player.setOnCompletionListener(mp -> onPlaybackDone());
+            player.setOnErrorListener((mp, what, extra) -> {
+                onPlaybackDone();
+                return true;
+            });
+            player.setDataSource(f.getAbsolutePath());
+            // Synchronous prepare on main thread for a local file is fast
+            // (<100ms).
+            player.prepare();
+            player.start();
+            VoiceService.setPlayingAudio(true);
+            Log.d(TAG, "playback started (echo guard on)");
+            currentAudioFile = f;
+        } catch (Exception e) {
+            Log.w(TAG, "play failed", e);
+            onPlaybackDone();
+        }
+    }
+
+    /** Runs on main thread after playback finishes or fails. */
+    private void onPlaybackDone() {
+        abandonAudioFocus();
+        releasePlayer();
+        playing = false;
+        VoiceService.setPlayingAudio(false);
+        Log.d(TAG, "playback done (echo guard off)");
+        if (currentAudioFile != null) {
+            //noinspection ResultOfMethodCallIgnored
+            currentAudioFile.delete();
+            currentAudioFile = null;
+        }
+        pumpAudioQueue();
+    }
+
+    private void releasePlayer() {
+        if (player != null) {
+            try { player.release(); } catch (Exception ignored) {}
+            player = null;
+        }
+    }
+
+    private void requestAudioFocus() {
+        try {
+            AudioAttributes attrs = new AudioAttributes.Builder()
+                    .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
+                    .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                    .build();
+            focusRequest = new AudioFocusRequest.Builder(
+                    AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK)
+                    .setAudioAttributes(attrs)
+                    .build();
+            audioManager.requestAudioFocus(focusRequest);
+        } catch (Exception ignored) {}
+    }
+
+    private void abandonAudioFocus() {
+        try {
+            if (focusRequest != null) audioManager.abandonAudioFocusRequest(focusRequest);
+        } catch (Exception ignored) {}
+    }
+
+    private long getLastTs() {
+        return getSharedPreferences(PREFS, MODE_PRIVATE).getLong(KEY_LAST_TS, 0);
+    }
+
+    private void setLastTs(long ts) {
+        getSharedPreferences(PREFS, MODE_PRIVATE).edit().putLong(KEY_LAST_TS, ts).apply();
+    }
+
+    /** Tolerant timestamp parse: epoch millis (long) or ISO-8601 string. */
+    private static long parseTimestamp(JSONObject m) {
+        long ts = m.optLong("timestamp", -1);
+        if (ts >= 0) return ts;
+        String s = m.optString("timestamp", "");
+        if (s.isEmpty()) return 0;
+        try {
+            // Try ISO-8601 via java.time (API 26+)
+            return java.time.OffsetDateTime.parse(s).toInstant().toEpochMilli();
+        } catch (Exception e) {
+            Log.w(TAG, "parseTimestamp: unparseable '" + s + "'");
+            return 0;
+        }
+    }
+
+    private static String readAll(InputStream in) throws Exception {
+        BufferedReader r = new BufferedReader(new InputStreamReader(in, "UTF-8"));
+        StringBuilder sb = new StringBuilder();
+        String line;
+        while ((line = r.readLine()) != null) sb.append(line);
+        r.close();
+        return sb.toString();
+    }
+
+    // ------------------------------------------------------------ existing UI helpers
 
     private void appendLog(String line) {
         runOnUiThread(() -> {

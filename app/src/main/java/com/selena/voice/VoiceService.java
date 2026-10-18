@@ -37,10 +37,12 @@ import java.util.Queue;
 /**
  * Selena Voice foreground service (Nick, 2026-10-18).
  *
- * Two jobs:
+ * Two jobs (Nick 2026-10-18):
  *  1. OUTBOUND (Selena -> Nick): polls /api/selena-voice/queue?since= every
  *     3 seconds, downloads new voice-message audio, plays immediately via
  *     MediaPlayer.
+ *     [v1.4: MOVED to MainActivity — Samsung kills this service's Handler
+ *     loop, so the service never polled. The activity polls while visible.]
  *  2. INBOUND (Nick -> Selena): continuous SpeechRecognizer ("always
  *     listening"). On speech, transcribes and POSTs to
  *     /api/selena-voice/input. Auto-restarts on NO_MATCH / SPEECH_TIMEOUT
@@ -95,10 +97,17 @@ public class VoiceService extends Service {
     // Nick 2026-10-18 v1.2: echo prevention. True while Selena's audio
     // response is playing via MediaPlayer — recognition results arriving
     // during playback are the speaker, not Nick, and get discarded.
-    private boolean isPlayingAudio = false;
+    // Nick 2026-10-18 v1.4: static — MainActivity now owns outbound
+    // polling + playback, so it sets this flag; the service is mic-only.
+    private static volatile boolean isPlayingAudio = false;
 
     public boolean isPlayingAudio() {
         return isPlayingAudio;
+    }
+
+    /** Called by MainActivity while it plays Selena's voice messages. */
+    public static void setPlayingAudio(boolean playing) {
+        isPlayingAudio = playing;
     }
 
     private final Handler handler = new Handler(Looper.getMainLooper());
@@ -123,7 +132,11 @@ public class VoiceService extends Service {
         recognitionListener = new ServiceRecognitionListener(this);
         createChannel();
         startForeground(NOTIF_ID, buildNotification("Listening for Selena…"));
-        scheduleNextPoll();
+        // Nick 2026-10-18 v1.4: outbound polling moved to MainActivity.
+        // Samsung's background execution limits kill this service's Handler
+        // loop, so the service never polled ("Poll: not started" forever).
+        // The service is now INBOUND (mic) only.
+        // scheduleNextPoll();
         if (isAlwaysListening()) {
             startContinuousListening();
         }
