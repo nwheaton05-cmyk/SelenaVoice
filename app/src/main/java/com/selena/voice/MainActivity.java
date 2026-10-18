@@ -111,6 +111,10 @@ public class MainActivity extends Activity {
     // it back after playback — leaving it forced on would make Nick's next
     // real phone call blast out of the speaker.
     private boolean speakerWasOn = false;
+    // Nick 2026-10-18 v1.8: the mic button is a real on/off toggle (manual
+    // fallback when always-listening is off). One press starts, next stops.
+    private Button micButton;
+    private boolean manualMicOn = false;
 
     public MainActivity() {
         receiver = new MessageReceiver(this);
@@ -155,17 +159,41 @@ public class MainActivity extends Activity {
         logScroll = findViewById(R.id.logScroll);
         alwaysOnSwitch = findViewById(R.id.alwaysOnSwitch);
         pulseDot = findViewById(R.id.pulseDot);
-        Button micButton = findViewById(R.id.micButton);
+        micButton = findViewById(R.id.micButton);
 
         alwaysOnSwitch.setChecked(VoiceService.getAlwaysListening(this));
-        alwaysOnSwitch.setOnCheckedChangeListener((v, on) ->
-                VoiceService.setAlwaysListening(this, on));
+        alwaysOnSwitch.setOnCheckedChangeListener((v, on) -> {
+            VoiceService.setAlwaysListening(this, on);
+            if (on) {
+                // The switch owns the mic now — drop any manual toggle state.
+                manualMicOn = false;
+            }
+            updateMicButton();
+        });
 
         micButton.setOnClickListener(v -> {
-            Intent i = new Intent(this, VoiceService.class);
-            i.setAction("MANUAL_LISTEN");
-            startForegroundService(i);
-            Toast.makeText(this, "Listening… speak now", Toast.LENGTH_SHORT).show();
+            if (alwaysOnSwitch.isChecked()) {
+                Toast.makeText(this, "Already always listening — mic is live",
+                        Toast.LENGTH_SHORT).show();
+                return;
+            }
+            if (!manualMicOn) {
+                Intent i = new Intent(this, VoiceService.class);
+                i.setAction("MANUAL_LISTEN");
+                startForegroundService(i);
+                manualMicOn = true;
+                log("mic: manual toggle ON");
+                Toast.makeText(this, "Listening… tap mic again to stop",
+                        Toast.LENGTH_SHORT).show();
+            } else {
+                Intent i = new Intent(this, VoiceService.class);
+                i.setAction("MANUAL_STOP");
+                startForegroundService(i);
+                manualMicOn = false;
+                log("mic: manual toggle OFF");
+                Toast.makeText(this, "Mic off", Toast.LENGTH_SHORT).show();
+            }
+            updateMicButton();
         });
 
         requestPermissions();
@@ -235,6 +263,10 @@ public class MainActivity extends Activity {
         }
         startPolling();
         startHeartbeat();
+        // Nick 2026-10-18 v1.8: if the activity was recreated while the
+        // service was in manual-listen mode, pick up the real state.
+        manualMicOn = VoiceService.isManualListening();
+        updateMicButton();
     }
 
     @Override
@@ -696,6 +728,25 @@ public class MainActivity extends Activity {
     private void updateListeningUi(boolean listening) {
         runOnUiThread(() -> statusText.setText(
                 listening ? "🎙️ Listening for Selena…" : "⏸️ Paused — toggle to resume"));
+    }
+
+    /**
+     * Nick 2026-10-18 v1.8: the mic button is a real toggle. Green = manual
+     * listening is ON (tap to stop), purple/default = OFF (tap to talk).
+     * When always-listening owns the mic, the button stays in its OFF look.
+     */
+    private void updateMicButton() {
+        runOnUiThread(() -> {
+            if (manualMicOn) {
+                micButton.setText("🎤 ON\ntap to stop");
+                micButton.setBackgroundTintList(
+                        android.content.res.ColorStateList.valueOf(0xFF2E7D32));
+            } else {
+                micButton.setText("🎤");
+                micButton.setBackgroundTintList(
+                        android.content.res.ColorStateList.valueOf(0xFF6B4FA1));
+            }
+        });
     }
 
     /** Nick 2026-10-18: visual pulse so he knows the app hears him. */

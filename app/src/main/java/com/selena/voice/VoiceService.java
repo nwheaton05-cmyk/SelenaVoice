@@ -110,6 +110,17 @@ public class VoiceService extends Service {
         isPlayingAudio = playing;
     }
 
+    // Nick 2026-10-18 v1.8: manual mic toggle state. The mic button starts a
+    // one-shot listening session when always-listening is off; a second press
+    // stops it. Tracked here (not just in the activity) so it survives
+    // activity recreation.
+    private static volatile boolean manualListening = false;
+
+    /** True while a manual (mic-button) listening session is active. */
+    public static boolean isManualListening() {
+        return manualListening;
+    }
+
     private final Handler handler = new Handler(Looper.getMainLooper());
     private SpeechRecognizer recognizer;
     private boolean recognizerActive = false;
@@ -149,11 +160,28 @@ public class VoiceService extends Service {
             if ("TOGGLE_LISTENING".equals(intent.getAction())) {
                 boolean on = intent.getBooleanExtra("on", true);
                 setAlwaysListening(on);
-                if (on) startContinuousListening();
-                else stopContinuousListening();
+                if (on) {
+                    manualListening = false; // switch owns the mic now
+                    startContinuousListening();
+                } else {
+                    manualListening = false;
+                    stopContinuousListening();
+                }
                 broadcastListeningState();
             } else if ("MANUAL_LISTEN".equals(intent.getAction())) {
-                if (!recognizerActive) startContinuousListening();
+                if (!recognizerActive) {
+                    manualListening = true;
+                    startContinuousListening();
+                }
+            } else if ("MANUAL_STOP".equals(intent.getAction())) {
+                // Safety: a manual stop must never kill the always-on loop.
+                if (isAlwaysListening()) {
+                    Log.i(TAG, "MANUAL_STOP ignored — always-listening is on");
+                    return START_STICKY;
+                }
+                manualListening = false;
+                if (recognizerActive) stopContinuousListening();
+                else broadcastListeningState();
             }
         }
         return START_STICKY;
