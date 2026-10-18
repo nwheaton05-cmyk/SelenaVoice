@@ -73,7 +73,10 @@ public class VoiceService extends Service {
 
     private static final String BASE_URL = "https://siteview-pi.vercel.app";
     private static final long POLL_MS = 3000;
-    private static final long RESTART_DELAY_MS = 500;
+    // Nick 2026-10-18 v1.3: was 500ms — the Samsung A17 plays a system
+    // beep on every recognizer start, so 500ms restarts = constant beeping.
+    // 5s backoff = far fewer beeps. NO_MATCH/TIMEOUT use quiet restart.
+    private static final long RESTART_DELAY_MS = 5000;
 
     // Nick 2026-10-18 v1.2: ADJUST_MUTE did NOT stop the beep on the
     // Samsung A17 — the recognizer beep apparently plays on a stream that
@@ -220,6 +223,9 @@ public class VoiceService extends Service {
 
     /** Called by PollTask (runs on background thread). */
     public void pollOnce() throws Exception {
+        // Nick 2026-10-18 v1.3: broadcast at START so the UI can tell
+        // whether poll is even being called (was stuck on "not started").
+        broadcastPollStatus("Poll: starting…");
         long since = getLastTs();
         String urlStr = BASE_URL + "/api/selena-voice/queue?since="
                 + URLEncoder.encode(String.valueOf(since), "UTF-8");
@@ -467,6 +473,18 @@ public class VoiceService extends Service {
 
     private void scheduleRecognizerRestart() {
         if (destroyed || !recognizerActive) return;
+        handler.postDelayed(new RecognizerRestartTask(this), RESTART_DELAY_MS);
+    }
+
+    /**
+     * Nick 2026-10-18 v1.3: for NO_MATCH/SPEECH_TIMEOUT (routine silence,
+     * not a real error). Skips the unmuteBeep() — volumes stay zeroed from
+     * the last mute, so there's no window where the beep can slip through.
+     * launchRecognizer() will re-mute (no-op) before startListening().
+     */
+    public void scheduleQuietRestart() {
+        if (destroyed || !recognizerActive) return;
+        Log.d(TAG, "quiet restart scheduled (" + RESTART_DELAY_MS + "ms)");
         handler.postDelayed(new RecognizerRestartTask(this), RESTART_DELAY_MS);
     }
 
