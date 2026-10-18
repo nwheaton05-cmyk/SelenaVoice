@@ -138,6 +138,14 @@ public class MainActivity extends Activity implements TtsProgressListener.Callba
     private TextView voiceModeLabel;
     private Switch voiceModeSwitch;
     private final Queue<String> ttsQueue = new LinkedList<>();
+    // Nick 2026-10-18 v1.13: dedupe set for two-phase server delivery.
+    // The server queues TEXT immediately, then queues the SAME text with an
+    // MP3 audioUrl seconds later when TTS finishes. Without dedupe the app
+    // would speak (Phone mode) or hold-then-play (Aria mode) the same reply
+    // twice. Texts are added only when actually spoken/played, so Aria mode
+    // holding a text-only message doesn't consume the dedupe entry the MP3
+    // version still needs. Bounded FIFO (20 entries), main thread only.
+    private final LinkedList<String> spokenTexts = new LinkedList<>();
     private boolean ttsSpeaking = false;
 
     public MainActivity() {
@@ -592,14 +600,31 @@ public class MainActivity extends Activity implements TtsProgressListener.Callba
                 String audioUrl = m.isNull("audioUrl") ? "" : m.optString("audioUrl", "");
                 log("audio: audioUrl='" + audioUrl + "'");
                 if (ts > maxTs) maxTs = ts;
-                if (!text.isEmpty()) {
-                    onSelenaMessage(text);
+                // Nick 2026-10-18 v1.13: two-phase server delivery dedupe.
+                // The server queues TEXT immediately, then queues the SAME
+                // text with an MP3 audioUrl seconds later when TTS finishes.
+                // Without this, Phone mode would speak the reply twice and
+                // Aria mode would hold-then-play it twice. Texts are added
+                // to spokenTexts only when actually spoken/played — Aria
+                // mode holding a text-only message must NOT consume the
+                // entry the MP3 version still needs.
+                if (text.isEmpty()) {
+                    continue;
+                }
+                if (spokenTexts.contains(text)) {
+                    log("dedupe: skipping duplicate text '" +
+                            (text.length() > 30 ? text.substring(0, 30) + "…" : text) + "'");
+                    continue;
                 }
                 if (isPhoneVoiceMode()) {
                     // Nick 2026-10-18 v1.11/v1.12 SPEED MODE. Phone voice mode
                     // speaks the text IMMEDIATELY with on-device TTS and
                     // ignores audioUrl entirely — no download, no wait for a
-                    // server-generated Aria MP3. This is the fast path (~5s).
+                    // server-generated Aria MP3. This is the fast path.
+                    // v1.13: mark spoken FIRST so the second (MP3) phase
+                    // dedupes against it.
+                    markSpoken(text);
+                    onSelenaMessage(text);
                     final String speakText = text;
                     runOnUiThread(() -> enqueueTts(speakText));
                 } else if (!audioUrl.isEmpty()) {
@@ -615,6 +640,8 @@ public class MainActivity extends Activity implements TtsProgressListener.Callba
                         // and played. Nick's own voice inputs go to
                         // /api/selena-voice/input as text and are never
                         // read aloud.
+                        markSpoken(text);
+                        onSelenaMessage(text);
                         String full = audioUrl;
                         try {
                             File f = downloadToCache(full);
@@ -626,7 +653,10 @@ public class MainActivity extends Activity implements TtsProgressListener.Callba
                 } else {
                     // Aria quality mode with no audioUrl yet — the Aria MP3
                     // will arrive as its own queue message. Don't speak the
-                    // text on-device; that would double up.
+                    // text on-device; that would double up. v1.13: don't
+                    // markSpoken here; the MP3 phase will mark it when it
+                    // actually plays.
+                    onSelenaMessage(text);
                     log("tts: text-only message held for Aria MP3 (quality mode)");
                 }
             }
@@ -854,6 +884,16 @@ public class MainActivity extends Activity implements TtsProgressListener.Callba
     }
 
     /** Runs on main thread: speak the next queued text if nothing is playing. */
+    /**
+     * Nick 2026-10-18 v1.13: record a message text as actually spoken or
+     * played (two-phase delivery dedupe). Bounded FIFO of 20 entries;
+     * called only from the poll worker thread, so no locking needed.
+     */
+    private void markSpoken(String text) {
+        spokenTexts.add(text);
+        while (spokenTexts.size() > 20) spokenTexts.removeFirst();
+    }
+
     private void pumpTtsQueue() {
         if (ttsSpeaking || playing) return;
         String text;
