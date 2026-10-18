@@ -321,7 +321,16 @@ public class MainActivity extends Activity {
                     }
                 }
             }
-            if (maxTs > since) setLastTs(maxTs);
+            // Nick 2026-10-18 v1.5: ALWAYS advance last_ts after a poll that
+            // returned messages. The old conditional (maxTs > since) never
+            // fired when a timestamp came back unparseable (parseTimestamp
+            // -> 0), leaving last_ts at 0 forever and re-fetching the same
+            // messages on every poll -> the 7x duplicate log Nick saw.
+            // Fallback to now() so we always make forward progress.
+            if (count > 0) {
+                long newTs = maxTs > since ? maxTs : System.currentTimeMillis();
+                setLastTs(newTs);
+            }
             setPollStatus("Last poll: 200 OK, " + count + " message(s)");
         } catch (Exception e) {
             Log.e(TAG, "poll: exception", e);
@@ -382,6 +391,13 @@ public class MainActivity extends Activity {
     /** Runs on main thread: starts MediaPlayer for the downloaded file. */
     private void playFileNow(File f) {
         try {
+            // Nick 2026-10-18 v1.5: VoiceService.muteBeep() zeroes
+            // STREAM_VOICE_CALL (and others) for beep suppression and the
+            // volumes can stay zeroed — this player's USAGE_VOICE_COMMUNICATION
+            // routes through that stream, so playback was silent. Ensure an
+            // audible level here independently; do NOT rely on the service's
+            // unmuteBeep().
+            ensureAudibleVolume();
             requestAudioFocus();
             releasePlayer();
             player = new MediaPlayer();
@@ -405,6 +421,22 @@ public class MainActivity extends Activity {
         } catch (Exception e) {
             Log.w(TAG, "play failed", e);
             onPlaybackDone();
+        }
+    }
+
+    /** Nick 2026-10-18 v1.5: guarantee audible playback volume. */
+    private void ensureAudibleVolume() {
+        try {
+            int maxVoice = audioManager.getStreamMaxVolume(AudioManager.STREAM_VOICE_CALL);
+            int maxMusic = audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC);
+            // 80% of max — loud and clear without blasting.
+            audioManager.setStreamVolume(
+                    AudioManager.STREAM_VOICE_CALL, (int) (maxVoice * 0.8f), 0);
+            audioManager.setStreamVolume(
+                    AudioManager.STREAM_MUSIC, (int) (maxMusic * 0.8f), 0);
+            Log.d(TAG, "playback volumes ensured at 80% (voice_call/music)");
+        } catch (Exception e) {
+            Log.w(TAG, "ensureAudibleVolume failed", e);
         }
     }
 
