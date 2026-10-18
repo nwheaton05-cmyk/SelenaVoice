@@ -17,6 +17,17 @@
         android:textColor="@color/selena_dark"
         android:gravity="center"
         android:paddingTop="24dp"
+        android:paddingBottom="4dp" />
+
+    <!-- Poll status (Nick 2026-10-18 v1.2: shows last queue-poll result) -->
+    <TextView
+        android:id="@+id/pollStatusText"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="Poll: not started"
+        android:textSize="12sp"
+        android:textColor="#888888"
+        android:gravity="center"
         android:paddingBottom="8dp" />
 
     <!-- Always-listening toggle + pulse dot -->

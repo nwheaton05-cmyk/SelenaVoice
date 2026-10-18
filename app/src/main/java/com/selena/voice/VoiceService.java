@@ -62,6 +62,8 @@ public class VoiceService extends Service {
     public static final String ACTION_SPEECH_DETECTED = "com.selena.voice.SPEECH_DETECTED";
     public static final String ACTION_INPUT_SENT = "com.selena.voice.INPUT_SENT";
     public static final String ACTION_LISTENING_STATE = "com.selena.voice.LISTENING_STATE";
+    public static final String ACTION_POLL_STATUS = "com.selena.voice.POLL_STATUS";
+    public static final String EXTRA_POLL_STATUS = "poll_status";
     public static final String EXTRA_TEXT = "text";
     public static final String EXTRA_STATE = "listening";
 
@@ -73,13 +75,28 @@ public class VoiceService extends Service {
     private static final long POLL_MS = 3000;
     private static final long RESTART_DELAY_MS = 500;
 
-    // Nick 2026-10-18: streams to mute to suppress the SpeechRecognizer beep.
+    // Nick 2026-10-18 v1.2: ADJUST_MUTE did NOT stop the beep on the
+    // Samsung A17 — the recognizer beep apparently plays on a stream that
+    // ignores the mute flag. New approach: save each stream's volume and
+    // set it to 0 (not mute), then restore. STREAM_VOICE_CALL added too.
     private static final int[] BEEP_STREAMS = {
             AudioManager.STREAM_SYSTEM,
             AudioManager.STREAM_MUSIC,
             AudioManager.STREAM_NOTIFICATION,
             AudioManager.STREAM_ALARM,
+            AudioManager.STREAM_VOICE_CALL,
     };
+    private final int[] savedVolumes = new int[BEEP_STREAMS.length];
+    private boolean beepMuted = false;
+
+    // Nick 2026-10-18 v1.2: echo prevention. True while Selena's audio
+    // response is playing via MediaPlayer — recognition results arriving
+    // during playback are the speaker, not Nick, and get discarded.
+    private boolean isPlayingAudio = false;
+
+    public boolean isPlayingAudio() {
+        return isPlayingAudio;
+    }
 
     private final Handler handler = new Handler(Looper.getMainLooper());
     private SpeechRecognizer recognizer;
@@ -173,19 +190,30 @@ public class VoiceService extends Service {
     // ------------------------------------------------------------ beep suppression
 
     private void muteBeep() {
+        if (beepMuted) return;
         try {
-            for (int stream : BEEP_STREAMS) {
-                audioManager.adjustStreamVolume(stream, AudioManager.ADJUST_MUTE, 0);
+            for (int i = 0; i < BEEP_STREAMS.length; i++) {
+                savedVolumes[i] = audioManager.getStreamVolume(BEEP_STREAMS[i]);
+                audioManager.setStreamVolume(BEEP_STREAMS[i], 0, 0);
             }
-        } catch (Exception ignored) {}
+            beepMuted = true;
+            Log.d(TAG, "beep streams zeroed");
+        } catch (Exception e) {
+            Log.w(TAG, "muteBeep failed", e);
+        }
     }
 
     private void unmuteBeep() {
+        if (!beepMuted) return;
         try {
-            for (int stream : BEEP_STREAMS) {
-                audioManager.adjustStreamVolume(stream, AudioManager.ADJUST_UNMUTE, 0);
+            for (int i = 0; i < BEEP_STREAMS.length; i++) {
+                audioManager.setStreamVolume(BEEP_STREAMS[i], savedVolumes[i], 0);
             }
-        } catch (Exception ignored) {}
+            beepMuted = false;
+            Log.d(TAG, "beep streams restored");
+        } catch (Exception e) {
+            Log.w(TAG, "unmuteBeep failed", e);
+        }
     }
 
     // ------------------------------------------------------------ outbound: poll & play
@@ -199,13 +227,39 @@ public class VoiceService extends Service {
         conn.setConnectTimeout(8000);
         conn.setReadTimeout(8000);
         try {
-            if (conn.getResponseCode() != 200) return;
+            int code = conn.getResponseCode();
+            Log.i(TAG, "poll: HTTP " + code + " (since=" + since + ")");
+            if (code != 200) {
+                Log.w(TAG, "poll: non-200 response: " + code);
+                broadcastPollStatus("Last poll: HTTP " + code);
+                return;
+            }
             String body = readAll(conn.getInputStream());
-            JSONArray arr = new JSONArray(body);
+            Log.d(TAG, "poll: body length=" + body.length());
+            JSONArray arr;
+            try {
+                String trimmed = body.trim();
+                if (trimmed.startsWith("{")) {
+                    // Tolerant: API may return {"messages": [...]}
+                    JSONObject obj = new JSONObject(trimmed);
+                    arr = obj.optJSONArray("messages");
+                    if (arr == null) arr = new JSONArray();
+                    Log.w(TAG, "poll: wrapped object, extracted " + arr.length()
+                            + " messages");
+                } else {
+                    arr = new JSONArray(trimmed);
+                }
+            } catch (Exception e) {
+                Log.e(TAG, "poll: JSON parse failed. Body: " + body, e);
+                broadcastPollStatus("Last poll: JSON parse error");
+                return;
+            }
+            int count = arr.length();
+            Log.i(TAG, "poll: " + count + " message(s)");
             long maxTs = since;
-            for (int i = 0; i < arr.length(); i++) {
+            for (int i = 0; i < count; i++) {
                 JSONObject m = arr.getJSONObject(i);
-                long ts = m.optLong("timestamp", 0);
+                long ts = parseTimestamp(m);
                 String text = m.optString("text", "");
                 String audioUrl = m.optString("audioUrl", "");
                 if (ts > maxTs) maxTs = ts;
@@ -219,6 +273,11 @@ public class VoiceService extends Service {
                 }
             }
             if (maxTs > since) setLastTs(maxTs);
+            broadcastPollStatus("Last poll: 200 OK, " + count + " message(s)");
+        } catch (Exception e) {
+            Log.e(TAG, "poll: exception", e);
+            broadcastPollStatus("Last poll: failed - " + e.getClass().getSimpleName());
+            throw e;
         } finally {
             conn.disconnect();
         }
@@ -294,6 +353,8 @@ public class VoiceService extends Service {
             // (<100ms); avoids the prepareAsync listener (d8 inner-class bug).
             player.prepare();
             player.start();
+            isPlayingAudio = true;
+            Log.d(TAG, "playback started (echo guard on)");
             currentAudioFile = f;
         } catch (Exception e) {
             Log.w(TAG, "play failed", e);
@@ -313,6 +374,8 @@ public class VoiceService extends Service {
         abandonAudioFocus();
         releasePlayer();
         playing = false;
+        isPlayingAudio = false;
+        Log.d(TAG, "playback done (echo guard off)");
         if (currentAudioFile != null) {
             //noinspection ResultOfMethodCallIgnored
             currentAudioFile.delete();
@@ -474,6 +537,27 @@ public class VoiceService extends Service {
     }
 
     // ------------------------------------------------------------ helpers
+
+    private void broadcastPollStatus(String status) {
+        Intent i = new Intent(ACTION_POLL_STATUS);
+        i.putExtra(EXTRA_POLL_STATUS, status);
+        sendBroadcast(i);
+    }
+
+    /** Tolerant timestamp parse: epoch millis (long) or ISO-8601 string. */
+    private static long parseTimestamp(JSONObject m) {
+        long ts = m.optLong("timestamp", -1);
+        if (ts >= 0) return ts;
+        String s = m.optString("timestamp", "");
+        if (s.isEmpty()) return 0;
+        try {
+            // Try ISO-8601 via java.time (API 26+)
+            return java.time.OffsetDateTime.parse(s).toInstant().toEpochMilli();
+        } catch (Exception e) {
+            Log.w(TAG, "parseTimestamp: unparseable '" + s + "'");
+            return 0;
+        }
+    }
 
     private void broadcastMessage(String text) {
         Intent i = new Intent(ACTION_MESSAGE);

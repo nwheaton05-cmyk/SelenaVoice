@@ -30,6 +30,7 @@ import java.util.List;
  */
 public class MainActivity extends Activity {
     private TextView statusText;
+    private TextView pollStatusText;
     private TextView logText;
     private ScrollView logScroll;
     private Switch alwaysOnSwitch;
@@ -64,12 +65,19 @@ public class MainActivity extends Activity {
         updateListeningUi(listening);
     }
 
+    /** Called by MessageReceiver with the last queue-poll result. */
+    public void onPollStatus(String status) {
+        if (status == null) return;
+        runOnUiThread(() -> pollStatusText.setText(status));
+    }
+
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         setContentView(R.layout.activity_main);
 
         statusText = findViewById(R.id.statusText);
+        pollStatusText = findViewById(R.id.pollStatusText);
         logText = findViewById(R.id.logText);
         logScroll = findViewById(R.id.logScroll);
         alwaysOnSwitch = findViewById(R.id.alwaysOnSwitch);
@@ -146,6 +154,7 @@ public class MainActivity extends Activity {
         f.addAction(VoiceService.ACTION_INPUT_SENT);
         f.addAction(VoiceService.ACTION_SPEECH_DETECTED);
         f.addAction(VoiceService.ACTION_LISTENING_STATE);
+        f.addAction(VoiceService.ACTION_POLL_STATUS);
         if (Build.VERSION.SDK_INT >= 33) {
             registerReceiver(receiver, f, Context.RECEIVER_NOT_EXPORTED);
         } else {

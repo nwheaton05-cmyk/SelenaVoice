@@ -27,6 +27,8 @@ public class MessageReceiver extends BroadcastReceiver {
             activity.onSpeechDetected();
         } else if (action.equals(VoiceService.ACTION_LISTENING_STATE)) {
             activity.onListeningState(intent.getBooleanExtra(VoiceService.EXTRA_STATE, false));
+        } else if (action.equals(VoiceService.ACTION_POLL_STATUS)) {
+            activity.onPollStatus(intent.getStringExtra(VoiceService.EXTRA_POLL_STATUS));
         }
     }
 }

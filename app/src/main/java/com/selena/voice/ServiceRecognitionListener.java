@@ -43,6 +43,12 @@ public class ServiceRecognitionListener implements RecognitionListener {
                 results.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION);
         String text = (matches != null && !matches.isEmpty()) ? matches.get(0) : "";
         service.onRecognizerDone();
+        if (service.isPlayingAudio()) {
+            // Nick 2026-10-18 v1.2: echo prevention — the recognizer picked
+            // up Selena's own playback, not Nick. Discard, don't POST.
+            Log.i(TAG, "discarding result during playback: " + text);
+            return;
+        }
         if (!text.isEmpty()) {
             service.onVoiceInput(text);
         }
