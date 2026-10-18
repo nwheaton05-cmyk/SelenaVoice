@@ -7,16 +7,13 @@ import android.app.PendingIntent;
 import android.app.Service;
 import android.content.Context;
 import android.content.Intent;
-import android.content.SharedPreferences;
 import android.media.AudioAttributes;
 import android.media.AudioFocusRequest;
 import android.media.AudioManager;
 import android.media.MediaPlayer;
-import android.os.Bundle;
 import android.os.Handler;
 import android.os.IBinder;
 import android.os.Looper;
-import android.speech.RecognitionListener;
 import android.speech.RecognizerIntent;
 import android.speech.SpeechRecognizer;
 import android.util.Log;
@@ -33,7 +30,6 @@ import java.io.OutputStream;
 import java.net.HttpURLConnection;
 import java.net.URL;
 import java.net.URLEncoder;
-import java.util.ArrayList;
 import java.util.LinkedList;
 import java.util.Locale;
 import java.util.Queue;
@@ -44,14 +40,18 @@ import java.util.Queue;
  * Two jobs:
  *  1. OUTBOUND (Selena -> Nick): polls /api/selena-voice/queue?since= every
  *     3 seconds, downloads new voice-message audio, plays immediately via
- *     MediaPlayer (prepareAsync for low latency).
+ *     MediaPlayer.
  *  2. INBOUND (Nick -> Selena): continuous SpeechRecognizer ("always
  *     listening"). On speech, transcribes and POSTs to
  *     /api/selena-voice/input. Auto-restarts on NO_MATCH / SPEECH_TIMEOUT
- *     with a 500ms backoff to avoid tight loops.
+ *     with a 500ms backoff to avoid tight loops. Beep suppressed via
+ *     stream mute; visual indication only.
  *
- * Token-lean by design: polling is plain HTTP delta fetches, STT is
- * on-device, and input POSTs carry only {text, timestamp}.
+ * Token-lean: polling is plain HTTP delta fetches, STT is on-device,
+ * input POSTs carry only {text, timestamp}.
+ *
+ * NOTE: All helpers are top-level classes (no inner/anonymous classes)
+ * because d8 8.2.2 crashes on inner-class bytecode from javac 21.
  */
 public class VoiceService extends Service {
     private static final String TAG = "SelenaVoice";
@@ -70,8 +70,16 @@ public class VoiceService extends Service {
     private static final String KEY_ALWAYS_ON = "always_listening";
 
     private static final String BASE_URL = "https://siteview-pi.vercel.app";
-    private static final long POLL_MS = 3000;       // Nick 2026-10-18: 3s, not 5
+    private static final long POLL_MS = 3000;
     private static final long RESTART_DELAY_MS = 500;
+
+    // Nick 2026-10-18: streams to mute to suppress the SpeechRecognizer beep.
+    private static final int[] BEEP_STREAMS = {
+            AudioManager.STREAM_SYSTEM,
+            AudioManager.STREAM_MUSIC,
+            AudioManager.STREAM_NOTIFICATION,
+            AudioManager.STREAM_ALARM,
+    };
 
     private final Handler handler = new Handler(Looper.getMainLooper());
     private SpeechRecognizer recognizer;
@@ -83,25 +91,19 @@ public class VoiceService extends Service {
     private AudioManager audioManager;
     private AudioFocusRequest focusRequest;
     private NotificationManager notificationManager;
-    // Nick 2026-10-18: streams to mute to suppress the SpeechRecognizer
-    // start/stop beep. Different manufacturers use different streams.
-    private static final int[] BEEP_STREAMS = {
-            AudioManager.STREAM_SYSTEM,
-            AudioManager.STREAM_MUSIC,
-            AudioManager.STREAM_NOTIFICATION,
-            AudioManager.STREAM_ALARM,
-    };
+    private ServiceRecognitionListener recognitionListener;
 
-    // ------------------------------------------------------------------ lifecycle
+    // ------------------------------------------------------------ lifecycle
 
     @Override
     public void onCreate() {
         super.onCreate();
         audioManager = (AudioManager) getSystemService(Context.AUDIO_SERVICE);
         notificationManager = getSystemService(NotificationManager.class);
+        recognitionListener = new ServiceRecognitionListener(this);
         createChannel();
         startForeground(NOTIF_ID, buildNotification("Listening for Selena…"));
-        handler.post(pollRunnable);
+        scheduleNextPoll();
         if (isAlwaysListening()) {
             startContinuousListening();
         }
@@ -118,8 +120,7 @@ public class VoiceService extends Service {
                 else stopContinuousListening();
                 broadcastListeningState();
             } else if ("MANUAL_LISTEN".equals(intent.getAction())) {
-                // One-shot manual fallback (mic button).
-                startOneShotListening();
+                if (!recognizerActive) startContinuousListening();
             }
         }
         return START_STICKY;
@@ -130,7 +131,8 @@ public class VoiceService extends Service {
         destroyed = true;
         handler.removeCallbacksAndMessages(null);
         unmuteBeep();
-        stopContinuousListening();
+        recognizerActive = false;
+        destroyRecognizer();
         releasePlayer();
         super.onDestroy();
     }
@@ -140,13 +142,13 @@ public class VoiceService extends Service {
         return null;
     }
 
-    // ------------------------------------------------------------------ notification
+    // ------------------------------------------------------------ notification
 
     private void createChannel() {
         NotificationChannel ch = new NotificationChannel(
                 CHANNEL_ID, "Selena Voice", NotificationManager.IMPORTANCE_LOW);
         ch.setDescription("Hands-free voice link to Selena");
-        getSystemService(NotificationManager.class).createNotificationChannel(ch);
+        notificationManager.createNotificationChannel(ch);
     }
 
     private Notification buildNotification(String text) {
@@ -162,18 +164,14 @@ public class VoiceService extends Service {
                 .build();
     }
 
-    /** Nick 2026-10-18: update the persistent notification text. */
     private void updateNotification(String text) {
         try {
             notificationManager.notify(NOTIF_ID, buildNotification(text));
         } catch (Exception ignored) {}
     }
 
-    /**
-     * Nick 2026-10-18: suppress the SpeechRecognizer start/stop beep.
-     * Mute the streams that carry it BEFORE startListening(); unmute after
-     * the utterance ends (results/error). Visual indication only — no sound.
-     */
+    // ------------------------------------------------------------ beep suppression
+
     private void muteBeep() {
         try {
             for (int stream : BEEP_STREAMS) {
@@ -190,24 +188,10 @@ public class VoiceService extends Service {
         } catch (Exception ignored) {}
     }
 
-    // ------------------------------------------------------------------ outbound: poll & play
+    // ------------------------------------------------------------ outbound: poll & play
 
-    private final Runnable pollRunnable = new Runnable() {
-        @Override
-        public void run() {
-            if (destroyed) return;
-            new Thread(() -> {
-                try {
-                    pollOnce();
-                } catch (Exception e) {
-                    Log.w(TAG, "poll failed", e);
-                }
-                if (!destroyed) handler.postDelayed(pollRunnable, POLL_MS);
-            }).start();
-        }
-    };
-
-    private void pollOnce() throws Exception {
+    /** Called by PollTask (runs on background thread). */
+    public void pollOnce() throws Exception {
         long since = getLastTs();
         String urlStr = BASE_URL + "/api/selena-voice/queue?since="
                 + URLEncoder.encode(String.valueOf(since), "UTF-8");
@@ -225,14 +209,13 @@ public class VoiceService extends Service {
                 String text = m.optString("text", "");
                 String audioUrl = m.optString("audioUrl", "");
                 if (ts > maxTs) maxTs = ts;
-                final String fText = text;
-                handler.post(() -> broadcastMessage(fText));
+                broadcastMessage(text);
                 if (!audioUrl.isEmpty()) {
                     String full = audioUrl.startsWith("http") ? audioUrl : BASE_URL + audioUrl;
                     synchronized (audioQueue) {
                         audioQueue.add(full);
                     }
-                    handler.post(this::pumpAudioQueue);
+                    pumpAudioQueue();
                 }
             }
             if (maxTs > since) setLastTs(maxTs);
@@ -241,7 +224,22 @@ public class VoiceService extends Service {
         }
     }
 
+    /** Called by PollTask after pollOnce (runs on background thread). */
+    public void scheduleNextPoll() {
+        if (destroyed) return;
+        handler.postDelayed(new PollTask(this), POLL_MS);
+    }
+
+    public boolean isDestroyedFlag() {
+        return destroyed;
+    }
+
     private void pumpAudioQueue() {
+        handler.post(new PumpTask(this));
+    }
+
+    /** Called on main thread to start the next download if idle. */
+    public void pumpAudioQueueNow() {
         if (playing) return;
         String url;
         synchronized (audioQueue) {
@@ -249,37 +247,38 @@ public class VoiceService extends Service {
         }
         if (url == null) return;
         playing = true;
-        new Thread(() -> {
-            try {
-                File f = downloadToCache(url);
-                handler.post(() -> playFile(f));
-            } catch (Exception e) {
-                Log.w(TAG, "audio download failed", e);
-                handler.post(() -> {
-                    playing = false;
-                    pumpAudioQueue();
-                });
-            }
-        }).start();
+        new Thread(new AudioDownloadTask(this, url)).start();
     }
 
-    private File downloadToCache(String urlStr) throws Exception {
+    /** Called by AudioDownloadTask on background thread. */
+    public File downloadToCache(String urlStr) throws Exception {
         HttpURLConnection conn = (HttpURLConnection) new URL(urlStr).openConnection();
         conn.setConnectTimeout(10000);
         conn.setReadTimeout(15000);
         File out = File.createTempFile("selena-", ".mp3", getCacheDir());
-        try (InputStream in = conn.getInputStream();
-             FileOutputStream fos = new FileOutputStream(out)) {
+        InputStream in = null;
+        FileOutputStream fos = null;
+        try {
+            in = conn.getInputStream();
+            fos = new FileOutputStream(out);
             byte[] buf = new byte[8192];
             int n;
             while ((n = in.read(buf)) > 0) fos.write(buf, 0, n);
         } finally {
+            if (in != null) try { in.close(); } catch (Exception ignored) {}
+            if (fos != null) try { fos.close(); } catch (Exception ignored) {}
             conn.disconnect();
         }
         return out;
     }
 
-    private void playFile(File f) {
+    /** Called by AudioDownloadTask on background thread. Plays immediately. */
+    public void playDownloadedFile(final File f) {
+        handler.post(new PlayTask(this, f));
+    }
+
+    /** Runs on main thread: starts MediaPlayer for the downloaded file. */
+    public void playFileNow(File f) {
         try {
             requestAudioFocus();
             releasePlayer();
@@ -288,30 +287,38 @@ public class VoiceService extends Service {
                     .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
                     .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
                     .build());
-            // Nick 2026-10-18: prepareAsync for lowest playback latency.
-            player.setOnPreparedListener(MediaPlayer::start);
-            player.setOnCompletionListener(mp -> {
-                abandonAudioFocus();
-                playing = false;
-                //noinspection ResultOfMethodCallIgnored
-                f.delete();
-                pumpAudioQueue();
-            });
-            player.setOnErrorListener((mp, what, extra) -> {
-                abandonAudioFocus();
-                playing = false;
-                //noinspection ResultOfMethodCallIgnored
-                f.delete();
-                pumpAudioQueue();
-                return true;
-            });
+            player.setOnCompletionListener(new PlayerCompletionListener(this));
+            player.setOnErrorListener(new PlayerErrorListener(this));
             player.setDataSource(f.getAbsolutePath());
-            player.prepareAsync();
+            // Synchronous prepare on main thread for a local file is fast
+            // (<100ms); avoids the prepareAsync listener (d8 inner-class bug).
+            player.prepare();
+            player.start();
+            currentAudioFile = f;
         } catch (Exception e) {
             Log.w(TAG, "play failed", e);
-            playing = false;
-            pumpAudioQueue();
+            onPlaybackDone();
         }
+    }
+
+    private File currentAudioFile;
+
+    /** Called by PlayerCompletionListener / PlayerErrorListener. */
+    public void onPlaybackDone() {
+        handler.post(new PlaybackDoneTask(this));
+    }
+
+    /** Runs on main thread after playback finishes or fails. */
+    public void onPlaybackDoneNow() {
+        abandonAudioFocus();
+        releasePlayer();
+        playing = false;
+        if (currentAudioFile != null) {
+            //noinspection ResultOfMethodCallIgnored
+            currentAudioFile.delete();
+            currentAudioFile = null;
+        }
+        pumpAudioQueue();
     }
 
     private void releasePlayer() {
@@ -327,7 +334,8 @@ public class VoiceService extends Service {
                     .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
                     .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
                     .build();
-            focusRequest = new AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK)
+            focusRequest = new AudioFocusRequest.Builder(
+                    AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK)
                     .setAudioAttributes(attrs)
                     .build();
             audioManager.requestAudioFocus(focusRequest);
@@ -340,7 +348,7 @@ public class VoiceService extends Service {
         } catch (Exception ignored) {}
     }
 
-    // ------------------------------------------------------------------ inbound: always listening
+    // ------------------------------------------------------------ inbound: always listening
 
     private void startContinuousListening() {
         if (recognizerActive || destroyed) return;
@@ -369,16 +377,9 @@ public class VoiceService extends Service {
         broadcastListeningState();
     }
 
-    private void startOneShotListening() {
-        // Manual fallback: single utterance even if always-on is off.
-        if (recognizerActive) return; // already listening
-        startContinuousListening();
-    }
-
     private void launchRecognizer() {
         if (!recognizerActive || recognizer == null || destroyed) return;
         try {
-            // Nick 2026-10-18: mute BEFORE startListening to kill the beep.
             muteBeep();
             Intent intent = new Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH);
             intent.putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL,
@@ -390,7 +391,7 @@ public class VoiceService extends Service {
         } catch (Exception e) {
             Log.w(TAG, "launchRecognizer failed", e);
             unmuteBeep();
-            scheduleRestart();
+            scheduleRecognizerRestart();
         }
     }
 
@@ -401,94 +402,78 @@ public class VoiceService extends Service {
         }
     }
 
-    private void scheduleRestart() {
+    private void scheduleRecognizerRestart() {
         if (destroyed || !recognizerActive) return;
-        handler.postDelayed(() -> {
-            if (destroyed || !recognizerActive) return;
-            // Recreate (not just startListening) — the recognizer is
-            // single-shot; a fresh instance is the reliable restart path.
-            destroyRecognizer();
-            try {
-                recognizer = SpeechRecognizer.createSpeechRecognizer(this);
-                recognizer.setRecognitionListener(recognitionListener);
-                launchRecognizer();
-            } catch (Exception e) {
-                Log.w(TAG, "restart failed", e);
-                scheduleRestart();
-            }
-        }, RESTART_DELAY_MS);
+        handler.postDelayed(new RecognizerRestartTask(this), RESTART_DELAY_MS);
     }
 
-    private final RecognitionListener recognitionListener = new RecognitionListener() {
-        @Override public void onReadyForSpeech(Bundle params) {}
-        @Override public void onBufferReceived(byte[] buffer) {}
-        @Override public void onRmsChanged(float rmsdB) {}
-
-        @Override
-        public void onBeginningOfSpeech() {
-            // Nick 2026-10-18: pulse the UI dot so he knows it's hearing him.
-            sendBroadcast(new Intent(ACTION_SPEECH_DETECTED));
+    /** Called by RecognizerRestartTask on main thread. */
+    public void restartRecognizerNow() {
+        if (destroyed || !recognizerActive) return;
+        destroyRecognizer();
+        try {
+            recognizer = SpeechRecognizer.createSpeechRecognizer(this);
+            recognizer.setRecognitionListener(recognitionListener);
+            launchRecognizer();
+        } catch (Exception e) {
+            Log.w(TAG, "restart failed", e);
+            scheduleRecognizerRestart();
         }
-
-        @Override public void onEndOfSpeech() {
-            unmuteBeep();
-        }
-
-        @Override
-        public void onError(int error) {
-            // NO_MATCH / SPEECH_TIMEOUT in a quiet room are normal — just
-            // restart. Any error restarts; 500ms backoff avoids tight loops.
-            Log.d(TAG, "recognizer error: " + error);
-            unmuteBeep();
-            scheduleRestart();
-        }
-
-        @Override
-        public void onResults(Bundle results) {
-            unmuteBeep();
-            ArrayList<String> matches =
-                    results.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION);
-            String text = (matches != null && !matches.isEmpty()) ? matches.get(0) : "";
-            if (!text.isEmpty()) {
-                postInput(text);
-            }
-            scheduleRestart();
-        }
-
-        @Override public void onPartialResults(Bundle partialResults) {}
-        @Override public void onEvent(int eventType, Bundle params) {}
-    };
-
-    /** POST transcribed text to Selena. Minimal payload: {text, timestamp}. */
-    private void postInput(final String text) {
-        new Thread(() -> {
-            try {
-                URL url = new URL(BASE_URL + "/api/selena-voice/input");
-                HttpURLConnection conn = (HttpURLConnection) url.openConnection();
-                conn.setRequestMethod("POST");
-                conn.setRequestProperty("Content-Type", "application/json");
-                conn.setConnectTimeout(8000);
-                conn.setReadTimeout(8000);
-                conn.setDoOutput(true);
-                JSONObject body = new JSONObject();
-                body.put("text", text);
-                body.put("timestamp", System.currentTimeMillis());
-                try (OutputStream os = conn.getOutputStream()) {
-                    os.write(body.toString().getBytes("UTF-8"));
-                }
-                int code = conn.getResponseCode();
-                conn.disconnect();
-                Log.i(TAG, "input posted (" + code + "): " + text);
-                Intent i = new Intent(ACTION_INPUT_SENT);
-                i.putExtra(EXTRA_TEXT, text);
-                sendBroadcast(i);
-            } catch (Exception e) {
-                Log.w(TAG, "postInput failed", e);
-            }
-        }).start();
     }
 
-    // ------------------------------------------------------------------ helpers
+    // Callbacks from ServiceRecognitionListener (main thread):
+
+    public void onSpeechDetected() {
+        sendBroadcast(new Intent(ACTION_SPEECH_DETECTED));
+    }
+
+    public void onSpeechEnd() {
+        unmuteBeep();
+    }
+
+    public void onRecognizerDone() {
+        unmuteBeep();
+        scheduleRecognizerRestart();
+    }
+
+    public void onVoiceInput(String text) {
+        new Thread(new InputPostTask(this, text)).start();
+    }
+
+    /** Called by InputPostTask on background thread. */
+    public void doPostInput(String text) {
+        HttpURLConnection conn = null;
+        try {
+            URL url = new URL(BASE_URL + "/api/selena-voice/input");
+            conn = (HttpURLConnection) url.openConnection();
+            conn.setRequestMethod("POST");
+            conn.setRequestProperty("Content-Type", "application/json");
+            conn.setConnectTimeout(8000);
+            conn.setReadTimeout(8000);
+            conn.setDoOutput(true);
+            JSONObject body = new JSONObject();
+            body.put("text", text);
+            body.put("timestamp", System.currentTimeMillis());
+            OutputStream os = null;
+            try {
+                os = conn.getOutputStream();
+                os.write(body.toString().getBytes("UTF-8"));
+            } finally {
+                if (os != null) try { os.close(); } catch (Exception ignored) {}
+            }
+            int code = conn.getResponseCode();
+            Log.i(TAG, "input posted (" + code + "): " + text);
+            Intent i = new Intent(ACTION_INPUT_SENT);
+            i.putExtra(EXTRA_TEXT, text);
+            sendBroadcast(i);
+        } catch (Exception e) {
+            Log.w(TAG, "postInput failed", e);
+        } finally {
+            if (conn != null) conn.disconnect();
+        }
+    }
+
+    // ------------------------------------------------------------ helpers
 
     private void broadcastMessage(String text) {
         Intent i = new Intent(ACTION_MESSAGE);
@@ -518,7 +503,6 @@ public class VoiceService extends Service {
         getSharedPreferences(PREFS, MODE_PRIVATE).edit().putBoolean(KEY_ALWAYS_ON, on).apply();
     }
 
-    /** Called by MainActivity toggle. */
     public static void setAlwaysListening(Context ctx, boolean on) {
         ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
                 .edit().putBoolean(KEY_ALWAYS_ON, on).apply();
@@ -538,6 +522,7 @@ public class VoiceService extends Service {
         StringBuilder sb = new StringBuilder();
         String line;
         while ((line = r.readLine()) != null) sb.append(line);
+        r.close();
         return sb.toString();
     }
 }

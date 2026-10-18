@@ -36,22 +36,33 @@ public class MainActivity extends Activity {
     private View pulseDot;
     private ObjectAnimator pulseAnimator;
 
-    private final BroadcastReceiver receiver = new BroadcastReceiver() {
-        @Override
-        public void onReceive(Context context, Intent intent) {
-            String action = intent.getAction();
-            if (VoiceService.ACTION_MESSAGE.equals(action)) {
-                appendLog("Selena: " + intent.getStringExtra(VoiceService.EXTRA_TEXT));
-            } else if (VoiceService.ACTION_INPUT_SENT.equals(action)) {
-                appendLog("You: " + intent.getStringExtra(VoiceService.EXTRA_TEXT));
-                Toast.makeText(MainActivity.this, "Sent to Selena", Toast.LENGTH_SHORT).show();
-            } else if (VoiceService.ACTION_SPEECH_DETECTED.equals(action)) {
-                pulse();
-            } else if (VoiceService.ACTION_LISTENING_STATE.equals(action)) {
-                updateListeningUi(intent.getBooleanExtra(VoiceService.EXTRA_STATE, false));
-            }
-        }
-    };
+    private final MessageReceiver receiver;
+
+    public MainActivity() {
+        receiver = new MessageReceiver(this);
+    }
+
+    /** Called by MessageReceiver when Selena has a new voice message. */
+    public void onSelenaMessage(String text) {
+        appendLog("Selena: " + text);
+    }
+
+    /** Called by MessageReceiver when Nick's voice input was sent. */
+    public void onInputSent(String text) {
+        appendLog("You: " + text);
+        runOnUiThread(() ->
+                Toast.makeText(this, "Sent to Selena", Toast.LENGTH_SHORT).show());
+    }
+
+    /** Called by MessageReceiver when speech is detected (pulse the dot). */
+    public void onSpeechDetected() {
+        pulse();
+    }
+
+    /** Called by MessageReceiver when the listening state changes. */
+    public void onListeningState(boolean listening) {
+        updateListeningUi(listening);
+    }
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
