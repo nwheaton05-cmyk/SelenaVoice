@@ -74,6 +74,12 @@ public class MainActivity extends Activity {
     // v1.4: outbound polling + playback owned by the activity
     private final Handler pollHandler = new Handler(Looper.getMainLooper());
     private boolean polling = false;
+
+    // v1.6: app-open heartbeat — tells the server the app is visible so the
+    // fast responder only burns tokens while Nick can hear replies.
+    private static final long HEARTBEAT_MS = 30000;
+    private final Handler heartbeatHandler = new Handler(Looper.getMainLooper());
+    private boolean heartbeating = false;
     private MediaPlayer player;
     private AudioManager audioManager;
     private AudioFocusRequest focusRequest;
@@ -203,11 +209,13 @@ public class MainActivity extends Activity {
             registerReceiver(receiver, f);
         }
         startPolling();
+        startHeartbeat();
     }
 
     @Override
     protected void onPause() {
         stopPolling();
+        stopHeartbeat();
         super.onPause();
         try { unregisterReceiver(receiver); } catch (Exception ignored) {}
     }
@@ -242,6 +250,61 @@ public class MainActivity extends Activity {
 
     public boolean isPolling() {
         return polling;
+    }
+
+    // ------------------------------------------------------------ v1.6 app-open heartbeat
+
+    /** Start the 30s heartbeat while the app is visible. */
+    private void startHeartbeat() {
+        if (heartbeating) return;
+        heartbeating = true;
+        heartbeatHandler.post(new HeartbeatTask(this));
+        Log.i(TAG, "heartbeat started");
+    }
+
+    /** Stop the heartbeat when the app goes to background. */
+    private void stopHeartbeat() {
+        heartbeating = false;
+        heartbeatHandler.removeCallbacksAndMessages(null);
+        Log.i(TAG, "heartbeat stopped");
+    }
+
+    public boolean isHeartbeating() {
+        return heartbeating;
+    }
+
+    /**
+     * Called by HeartbeatTask on the main thread. POSTs to the heartbeat
+     * endpoint on a worker thread (Android forbids network on main thread).
+     */
+    public void sendHeartbeat() {
+        new Thread(() -> {
+            HttpURLConnection conn = null;
+            try {
+                URL url = new URL(BASE_URL + "/api/selena-voice/heartbeat");
+                conn = (HttpURLConnection) url.openConnection();
+                conn.setRequestMethod("POST");
+                conn.setRequestProperty("Content-Type", "application/json");
+                conn.setConnectTimeout(8000);
+                conn.setReadTimeout(8000);
+                conn.setDoOutput(true);
+                byte[] body = "{}".getBytes("UTF-8");
+                conn.getOutputStream().write(body);
+                int code = conn.getResponseCode();
+                Log.d(TAG, "heartbeat: HTTP " + code);
+            } catch (Exception e) {
+                Log.w(TAG, "heartbeat failed", e);
+            } finally {
+                if (conn != null) conn.disconnect();
+                scheduleNextHeartbeat();
+            }
+        }).start();
+    }
+
+    /** Called after each heartbeat to schedule the next (worker thread). */
+    private void scheduleNextHeartbeat() {
+        if (!heartbeating) return;
+        heartbeatHandler.postDelayed(new HeartbeatTask(this), HEARTBEAT_MS);
     }
 
     /**
