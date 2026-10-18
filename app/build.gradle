@@ -1,0 +1,51 @@
+plugins {
+    id 'com.android.application'
+}
+
+android {
+    namespace "com.selena.voice"
+    compileSdk 34
+
+    defaultConfig {
+        applicationId "com.selena.voice"
+        minSdk 26
+        targetSdk 34
+        versionCode 1
+        versionName "1.0"
+    }
+
+    signingConfigs {
+        release {
+            def ksProps = new Properties()
+            def ksPropsFile = rootProject.file('keystore.properties')
+            if (ksPropsFile.exists()) {
+                ksPropsFile.withInputStream { ksProps.load(it) }
+                storeFile file(ksProps['storeFile'])
+                storePassword ksProps['storePassword']
+                keyAlias ksProps['keyAlias']
+                keyPassword ksProps['keyPassword']
+            }
+        }
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            signingConfig signingConfigs.release
+        }
+        debug {
+            // Debug builds use the auto-generated debug key.
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+}
+
+// Zero external dependencies — pure Android SDK (HttpURLConnection,
+// org.json, MediaPlayer, SpeechRecognizer). Keeps the build fast and
+// the APK small.
+dependencies {
+}

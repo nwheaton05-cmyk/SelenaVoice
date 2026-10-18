@@ -1,0 +1,4 @@
+// Top-level build file for SelenaVoice (Nick, 2026-10-18).
+plugins {
+    id 'com.android.application' version '8.5.2' apply false
+}
