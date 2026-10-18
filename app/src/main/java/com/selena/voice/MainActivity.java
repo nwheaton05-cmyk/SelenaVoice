@@ -58,6 +58,27 @@ public class MainActivity extends Activity {
     private static final String TAG = "SelenaVoice";
     private static final String BASE_URL = "https://siteview-pi.vercel.app";
     private static final long POLL_MS = 3000;
+
+    // Nick 2026-10-18 v1.6: remote-visible log buffer. The app is Selena's
+    // "ears and mouth" — she needs to see poll/download/playback internals
+    // without Nick sending screenshots. Entries are uploaded every 30s
+    // alongside the heartbeat, then cleared.
+    private static final int MAX_LOG_ENTRIES = 200;
+    private static final java.util.List<String> LOG_BUFFER = new java.util.ArrayList<>();
+
+    /**
+     * Remote-visible log: appends a timestamped entry to the in-memory
+     * buffer (uploaded every 30s) AND writes to logcat as usual.
+     */
+    public static void log(String msg) {
+        String entry = new java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.US)
+                .format(new java.util.Date()) + " " + msg;
+        synchronized (LOG_BUFFER) {
+            LOG_BUFFER.add(entry);
+            while (LOG_BUFFER.size() > MAX_LOG_ENTRIES) LOG_BUFFER.remove(0);
+        }
+        Log.i(TAG, msg);
+    }
     private static final String PREFS = "selena_voice";
     private static final String KEY_LAST_TS = "last_ts";
 
@@ -291,14 +312,55 @@ public class MainActivity extends Activity {
                 byte[] body = "{}".getBytes("UTF-8");
                 conn.getOutputStream().write(body);
                 int code = conn.getResponseCode();
-                Log.d(TAG, "heartbeat: HTTP " + code);
+                log("heartbeat: HTTP " + code);
             } catch (Exception e) {
-                Log.w(TAG, "heartbeat failed", e);
+                log("heartbeat failed: " + e);
             } finally {
                 if (conn != null) conn.disconnect();
+                uploadLogs();
                 scheduleNextHeartbeat();
             }
         }).start();
+    }
+
+    /**
+     * Nick 2026-10-18 v1.6: POST the buffered remote logs (runs on the
+     * heartbeat's worker thread, every 30s). Buffer is cleared only after
+     * a successful upload so failed uploads are retried next cycle.
+     */
+    private void uploadLogs() {
+        java.util.List<String> pending;
+        synchronized (LOG_BUFFER) {
+            if (LOG_BUFFER.isEmpty()) return;
+            pending = new java.util.ArrayList<>(LOG_BUFFER);
+        }
+        HttpURLConnection logConn = null;
+        try {
+            URL logUrl = new URL(BASE_URL + "/api/selena-voice/logs");
+            logConn = (HttpURLConnection) logUrl.openConnection();
+            logConn.setRequestMethod("POST");
+            logConn.setRequestProperty("Content-Type", "application/json");
+            logConn.setConnectTimeout(8000);
+            logConn.setReadTimeout(8000);
+            logConn.setDoOutput(true);
+            JSONObject payload = new JSONObject();
+            payload.put("logs", new JSONArray(pending));
+            logConn.getOutputStream().write(payload.toString().getBytes("UTF-8"));
+            int logCode = logConn.getResponseCode();
+            if (logCode == 200) {
+                synchronized (LOG_BUFFER) {
+                    LOG_BUFFER.removeAll(pending);
+                }
+                Log.d(TAG, "log upload: HTTP 200 (" + pending.size() + " entries)");
+            } else {
+                Log.w(TAG, "log upload: HTTP " + logCode + " (" + pending.size()
+                        + " entries kept for retry)");
+            }
+        } catch (Exception e) {
+            Log.w(TAG, "log upload failed (" + pending.size() + " entries kept)", e);
+        } finally {
+            if (logConn != null) logConn.disconnect();
+        }
     }
 
     /** Called after each heartbeat to schedule the next (worker thread). */
@@ -338,13 +400,13 @@ public class MainActivity extends Activity {
             conn.setConnectTimeout(8000);
             conn.setReadTimeout(8000);
             int code = conn.getResponseCode();
-            Log.i(TAG, "poll: HTTP " + code + " (since=" + since + ")");
+            log("poll: HTTP " + code + " (since=" + since + ")");
             if (code != 200) {
                 setPollStatus("Last poll: HTTP " + code);
                 return;
             }
             String body = readAll(conn.getInputStream());
-            Log.d(TAG, "poll: body length=" + body.length());
+            log("poll: body length=" + body.length());
             JSONArray arr;
             try {
                 String trimmed = body.trim();
@@ -357,12 +419,12 @@ public class MainActivity extends Activity {
                     arr = new JSONArray(trimmed);
                 }
             } catch (Exception e) {
-                Log.e(TAG, "poll: JSON parse failed. Body: " + body, e);
+                log("poll: JSON parse failed: " + e + ". Body: " + body);
                 setPollStatus("Last poll: JSON parse error");
                 return;
             }
             int count = arr.length();
-            Log.i(TAG, "poll: " + count + " message(s)");
+            log("poll: " + count + " message(s)");
             long maxTs = since;
             for (int i = 0; i < count; i++) {
                 JSONObject m = arr.getJSONObject(i);
@@ -380,7 +442,7 @@ public class MainActivity extends Activity {
                         File f = downloadToCache(full);
                         enqueueAudio(f);
                     } catch (Exception e) {
-                        Log.w(TAG, "audio download failed: " + full, e);
+                        log("audio download failed: " + full + ": " + e);
                     }
                 }
             }
@@ -396,7 +458,7 @@ public class MainActivity extends Activity {
             }
             setPollStatus("Last poll: 200 OK, " + count + " message(s)");
         } catch (Exception e) {
-            Log.e(TAG, "poll: exception", e);
+            log("poll: exception: " + e);
             setPollStatus("Last poll: failed - " + e.getClass().getSimpleName());
         } finally {
             if (conn != null) conn.disconnect();
@@ -479,10 +541,10 @@ public class MainActivity extends Activity {
             player.prepare();
             player.start();
             VoiceService.setPlayingAudio(true);
-            Log.d(TAG, "playback started (echo guard on)");
+            log("playback started (echo guard on)");
             currentAudioFile = f;
         } catch (Exception e) {
-            Log.w(TAG, "play failed", e);
+            log("play failed: " + e);
             onPlaybackDone();
         }
     }
@@ -497,9 +559,9 @@ public class MainActivity extends Activity {
                     AudioManager.STREAM_VOICE_CALL, (int) (maxVoice * 0.8f), 0);
             audioManager.setStreamVolume(
                     AudioManager.STREAM_MUSIC, (int) (maxMusic * 0.8f), 0);
-            Log.d(TAG, "playback volumes ensured at 80% (voice_call/music)");
+            log("playback volumes ensured at 80% (voice_call/music)");
         } catch (Exception e) {
-            Log.w(TAG, "ensureAudibleVolume failed", e);
+            log("ensureAudibleVolume failed: " + e);
         }
     }
 
@@ -509,7 +571,7 @@ public class MainActivity extends Activity {
         releasePlayer();
         playing = false;
         VoiceService.setPlayingAudio(false);
-        Log.d(TAG, "playback done (echo guard off)");
+        log("playback done (echo guard off)");
         if (currentAudioFile != null) {
             //noinspection ResultOfMethodCallIgnored
             currentAudioFile.delete();
@@ -563,7 +625,7 @@ public class MainActivity extends Activity {
             // Try ISO-8601 via java.time (API 26+)
             return java.time.OffsetDateTime.parse(s).toInstant().toEpochMilli();
         } catch (Exception e) {
-            Log.w(TAG, "parseTimestamp: unparseable '" + s + "'");
+            log("parseTimestamp: unparseable '" + s + "'");
             return 0;
         }
     }
