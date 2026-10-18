@@ -584,7 +584,23 @@ public class MainActivity extends Activity {
             // with no errors while Nick heard nothing. Route through the
             // loudspeaker instead: USAGE_MEDIA (= STREAM_MUSIC) +
             // setSpeakerphoneOn(true).
-            ensureAudibleVolume();
+            // Nick 2026-10-18 v1.10: respect his device volume — do NOT
+            // touch setStreamVolume at all. If he's got it muted, it plays
+            // muted. His choice.
+            //
+            // One catch: the service's mic-beep suppression keeps streams
+            // zeroed while idle-listening (quiet restart). Undo that first
+            // so playback uses his REAL volume, not 0 and not a forced
+            // level.
+            try {
+                Intent restore = new Intent(this, VoiceService.class);
+                restore.setAction("RESTORE_VOLUMES");
+                startService(restore);
+                log("audio: restored device volumes for playback");
+            } catch (Exception e) {
+                log("audio: volume restore failed: " + e);
+            }
+            log("audio: using device volume (no override)");
             try {
                 speakerWasOn = audioManager.isSpeakerphoneOn();
                 audioManager.setSpeakerphoneOn(true);
@@ -619,32 +635,6 @@ public class MainActivity extends Activity {
         } catch (Exception e) {
             log("play failed: " + e);
             onPlaybackDone();
-        }
-    }
-
-    /**
-     * Nick 2026-10-18 v1.7: guarantee audible playback volume WITHOUT
-     * flashing the system volume panel. v1.5 stomped both STREAM_VOICE_CALL
-     * and STREAM_MUSIC to 80% before every playback — on Samsung that pops
-     * the volume indicator as if Nick pressed the buttons. Now: playback
-     * uses USAGE_MEDIA (STREAM_MUSIC) via the speaker, so only touch
-     * STREAM_MUSIC, only when it's below the target, and always with flag
-     * 0 (no UI). Never touch STREAM_VOICE_CALL here — the service zeroes
-     * it for mic-beep suppression and playback no longer depends on it.
-     */
-    private void ensureAudibleVolume() {
-        try {
-            int maxMusic = audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC);
-            int curMusic = audioManager.getStreamVolume(AudioManager.STREAM_MUSIC);
-            int target = (int) (maxMusic * 0.8f);
-            if (curMusic < target) {
-                audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, target, 0);
-                log("audio: raised STREAM_MUSIC " + curMusic + " -> " + target + " (no UI)");
-            } else {
-                log("audio: STREAM_MUSIC already audible (" + curMusic + "/" + maxMusic + ")");
-            }
-        } catch (Exception e) {
-            log("ensureAudibleVolume failed: " + e);
         }
     }
 

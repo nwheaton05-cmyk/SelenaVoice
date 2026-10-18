@@ -173,6 +173,14 @@ public class VoiceService extends Service {
                     manualListening = true;
                     startContinuousListening();
                 }
+            } else if ("RESTORE_VOLUMES".equals(intent.getAction())) {
+                // Nick 2026-10-18 v1.10: MainActivity asks for the real
+                // device volumes back before playing a reply. The quiet
+                // restart keeps streams zeroed while idle-listening, which
+                // would make playback silent. Restoring here = playback
+                // uses Nick's actual volume setting, not 0 and not a
+                // forced level.
+                unmuteBeep();
             } else if ("MANUAL_STOP".equals(intent.getAction())) {
                 // Safety: a manual stop must never kill the always-on loop.
                 if (isAlwaysListening()) {
@@ -251,7 +259,13 @@ public class VoiceService extends Service {
         if (!beepMuted) return;
         try {
             for (int i = 0; i < BEEP_STREAMS.length; i++) {
-                audioManager.setStreamVolume(BEEP_STREAMS[i], savedVolumes[i], 0);
+                // Nick 2026-10-18 v1.10: only restore a stream we actually
+                // zeroed. If Nick changed the volume himself while the
+                // streams were zeroed, his new setting stays — we never
+                // clobber it with a stale saved value.
+                if (audioManager.getStreamVolume(BEEP_STREAMS[i]) == 0) {
+                    audioManager.setStreamVolume(BEEP_STREAMS[i], savedVolumes[i], 0);
+                }
             }
             beepMuted = false;
             Log.d(TAG, "beep streams restored");
