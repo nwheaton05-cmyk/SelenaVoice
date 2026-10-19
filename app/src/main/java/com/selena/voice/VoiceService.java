@@ -406,7 +406,7 @@ public class VoiceService extends Service
 
     // Nick 2026-10-19 v1.17: temporarily raise STREAM_MUSIC to max while
     // Selena talks, so her voice overpowers background audio like Spotify.
-    // The existing AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK request makes Spotify
+    // The existing AUDIOFOCUS_GAIN_TRANSIENT request makes Spotify
     // duck at the same time. Called AFTER unmuteBeep() so the saved value
     // is the user's real volume, not a zeroed beep stream.
     private void boostMusicVolume() {
@@ -1126,7 +1126,7 @@ public class VoiceService extends Service
                     .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
                     .build();
             focusRequest = new AudioFocusRequest.Builder(
-                    AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK)
+                    AudioManager.AUDIOFOCUS_GAIN_TRANSIENT)
                     .setAudioAttributes(attrs)
                     .build();
             // Nick 2026-10-19 v1.18: capture the result and retry once on
@@ -1136,7 +1136,7 @@ public class VoiceService extends Service
             if (rc == AudioManager.AUDIOFOCUS_REQUEST_FAILED) {
                 try { Thread.sleep(500); } catch (InterruptedException ignored) {}
                 focusRequest = new AudioFocusRequest.Builder(
-                        AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK)
+                        AudioManager.AUDIOFOCUS_GAIN_TRANSIENT)
                         .setAudioAttributes(attrs)
                         .build();
                 rc = audioManager.requestAudioFocus(focusRequest);
