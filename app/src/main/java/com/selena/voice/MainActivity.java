@@ -203,6 +203,13 @@ public class MainActivity extends Activity
 
         statusText = findViewById(R.id.statusText);
         pollStatusText = findViewById(R.id.pollStatusText);
+        // Nick 2026-10-19 v1.15: show the installed version so we can
+        // verify which build is on the phone (kills version-guessing).
+        try {
+            String vn = getPackageManager()
+                    .getPackageInfo(getPackageName(), 0).versionName;
+            ((TextView) findViewById(R.id.versionText)).setText("v" + vn);
+        } catch (Exception ignored) {}
         logText = findViewById(R.id.logText);
         logScroll = findViewById(R.id.logScroll);
         alwaysOnSwitch = findViewById(R.id.alwaysOnSwitch);
@@ -1079,7 +1086,19 @@ public class MainActivity extends Activity
     }
 
     private long getLastTs() {
-        return getSharedPreferences(PREFS, MODE_PRIVATE).getLong(KEY_LAST_TS, 0);
+        // Nick 2026-10-19 v1.15: fresh install used to default to 0, so the
+        // first poll asked for ?since=0 and the server returned EVERY message
+        // ever queued — the app read the entire history aloud on reinstall.
+        // On first run (key absent), anchor to now so only new messages arrive.
+        android.content.SharedPreferences prefs =
+                getSharedPreferences(PREFS, MODE_PRIVATE);
+        if (!prefs.contains(KEY_LAST_TS)) {
+            long now = System.currentTimeMillis();
+            prefs.edit().putLong(KEY_LAST_TS, now).apply();
+            log("fresh install: last_ts anchored to now, skipping history");
+            return now;
+        }
+        return prefs.getLong(KEY_LAST_TS, 0);
     }
 
     private void setLastTs(long ts) {
