@@ -116,6 +116,12 @@ public class VoiceService extends Service
     private final int[] savedVolumes = new int[BEEP_STREAMS.length];
     private boolean beepMuted = false;
 
+    // Nick 2026-10-19 v1.17: audio-ducking boost. While Selena's reply
+    // plays, STREAM_MUSIC goes to max so she overpowers background audio
+    // (Spotify); the MAY_DUCK focus request keeps Spotify ducked. The
+    // user's volume is restored when playback ends. -1 = no boost active.
+    private int savedMusicVolume = -1;
+
     // Nick 2026-10-18 v1.2: echo prevention. True while Selena's audio
     // response is playing — recognition results arriving during playback
     // are the speaker, not Nick, and get discarded.
@@ -273,6 +279,8 @@ public class VoiceService extends Service
         stopPolling();
         heartbeating = false;
         handler.removeCallbacksAndMessages(null);
+        restoreMusicVolume(); // Nick 2026-10-19 v1.17: safety net — never
+        // leave the music stream stuck at the boosted max.
         unmuteBeep();
         recognizerActive = false;
         destroyRecognizer();
@@ -375,6 +383,49 @@ public class VoiceService extends Service
         } catch (Exception e) {
             Log.w(TAG, "unmuteBeep failed", e);
         }
+    }
+
+    // Nick 2026-10-19 v1.17: temporarily raise STREAM_MUSIC to max while
+    // Selena talks, so her voice overpowers background audio like Spotify.
+    // The existing AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK request makes Spotify
+    // duck at the same time. Called AFTER unmuteBeep() so the saved value
+    // is the user's real volume, not a zeroed beep stream.
+    private void boostMusicVolume() {
+        try {
+            int max = audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC);
+            int cur = audioManager.getStreamVolume(AudioManager.STREAM_MUSIC);
+            if (cur >= max) {
+                log("audio: music already at max, no boost");
+                return; // savedMusicVolume stays -1: nothing to restore
+            }
+            savedMusicVolume = cur;
+            audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, max, 0);
+            log("audio: music boosted " + cur + " -> " + max);
+        } catch (Exception e) {
+            log("audio: boost failed: " + e);
+        }
+    }
+
+    // Nick 2026-10-19 v1.17: undo boostMusicVolume(). Only restores when
+    // the stream is still sitting at the boosted max — if the user (or a
+    // recognizer muteBeep cycle) changed it mid-playback, we never clobber
+    // their setting with a stale saved value (same rule as unmuteBeep).
+    private void restoreMusicVolume() {
+        if (savedMusicVolume < 0) return;
+        try {
+            int max = audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC);
+            int cur = audioManager.getStreamVolume(AudioManager.STREAM_MUSIC);
+            if (cur == max) {
+                audioManager.setStreamVolume(AudioManager.STREAM_MUSIC,
+                        savedMusicVolume, 0);
+                log("audio: music restored to " + savedMusicVolume);
+            } else {
+                log("audio: music changed mid-playback (" + cur + "), keeping it");
+            }
+        } catch (Exception e) {
+            log("audio: restore failed: " + e);
+        }
+        savedMusicVolume = -1;
     }
 
     // ------------------------------------------------------------ v1.14 Realtime push (moved here v1.16)
@@ -725,6 +776,10 @@ public class VoiceService extends Service
             //
             // Undo the mic-beep volume zeroing first so playback uses
             // his REAL volume, not 0 and not a forced level.
+            // Nick 2026-10-19 v1.17: then boost to max for the duration of
+            // playback so Selena overpowers background audio (Spotify);
+            // restored when playback ends. His explicit request, supersedes
+            // the v1.10 no-override rule for the playback window only.
             unmuteBeep();
             log("audio: using device volume (no override)");
             // Nick 2026-10-18 v1.11: Bluetooth-aware — earbuds win over the
@@ -732,6 +787,7 @@ public class VoiceService extends Service
             routeAudioForPlayback();
             log("audio: stream=MUSIC (USAGE_MEDIA)");
             requestAudioFocus();
+            boostMusicVolume();
             releasePlayer();
             player = new MediaPlayer();
             player.setAudioAttributes(new AudioAttributes.Builder()
@@ -769,6 +825,7 @@ public class VoiceService extends Service
     @SuppressWarnings("deprecation") // setSpeakerphoneOn, see playFileNow
     public void onPlaybackDoneNow() {
         abandonAudioFocus();
+        restoreMusicVolume(); // Nick 2026-10-19 v1.17: undo the playback boost
         releasePlayer();
         playing = false;
         isPlayingAudio = false;
@@ -886,12 +943,15 @@ public class VoiceService extends Service
         // Same routing as MP3 playback: loudspeaker, and undo the
         // mic-beep volume zeroing first so we use Nick's real device
         // volume (v1.10: no override, respect his setting).
+        // Nick 2026-10-19 v1.17: then boost to max while she talks so she
+        // overpowers Spotify; restored in onTtsDone. His explicit request.
         unmuteBeep();
         // Nick 2026-10-18 v1.11: Bluetooth-aware — earbuds win over the
         // speakerphone when connected, same as MP3 playback.
         routeAudioForPlayback();
         log("tts: stream=MUSIC");
         requestAudioFocus();
+        boostMusicVolume();
         isPlayingAudio = true;
         log("tts: echo guard on");
         try {
@@ -917,6 +977,7 @@ public class VoiceService extends Service
     @SuppressWarnings("deprecation") // setSpeakerphoneOn, see playFileNow
     private void onTtsDone() {
         abandonAudioFocus();
+        restoreMusicVolume(); // Nick 2026-10-19 v1.17: undo the speech boost
         ttsSpeaking = false;
         isPlayingAudio = false;
         // Put the speakerphone back the way we found it, same as MP3.
