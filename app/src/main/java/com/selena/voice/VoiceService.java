@@ -12,6 +12,7 @@ import android.media.AudioDeviceInfo;
 import android.media.AudioFocusRequest;
 import android.media.AudioManager;
 import android.media.MediaPlayer;
+import android.media.audiofx.LoudnessEnhancer;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.IBinder;
@@ -178,6 +179,10 @@ public class VoiceService extends Service
     private boolean recognizerActive = false;
     private boolean destroyed = false;
     private MediaPlayer player;
+    // Nick 2026-10-19 v1.18: LoudnessEnhancer on the player's audio session
+    // pushes her voice ~+4dB past max stream volume (MP3/Aria path only —
+    // on-device TTS exposes no audio session). Released in releasePlayer().
+    private LoudnessEnhancer loudnessEnhancer = null;
     private File currentAudioFile;
     private final Queue<File> audioQueue = new LinkedList<>();
     private boolean playing = false;
@@ -361,6 +366,15 @@ public class VoiceService extends Service
         if (beepMuted) return;
         try {
             for (int i = 0; i < BEEP_STREAMS.length; i++) {
+                // Nick 2026-10-19 v1.18: never zero STREAM_MUSIC while she is
+                // talking. Recognizer restarts can fire mid-playback and would
+                // knock her max-volume boost down. The Samsung beep is masked
+                // by her voice during playback anyway, so suppression loses
+                // nothing here.
+                if (isPlayingAudio && BEEP_STREAMS[i] == AudioManager.STREAM_MUSIC) {
+                    log("audio: muteBeep skipped STREAM_MUSIC (playback active)");
+                    continue;
+                }
                 savedVolumes[i] = audioManager.getStreamVolume(BEEP_STREAMS[i]);
                 audioManager.setStreamVolume(BEEP_STREAMS[i], 0, 0);
             }
@@ -431,6 +445,22 @@ public class VoiceService extends Service
             log("audio: restore failed: " + e);
         }
         savedMusicVolume = -1;
+    }
+
+    // Nick 2026-10-19 v1.18: re-assert max immediately before start()/speak()
+    // so nothing that ran between boostMusicVolume() and playback (e.g. a
+    // recognizer cycle) can knock her down. Does not touch savedMusicVolume —
+    // restoreMusicVolume() still owns the undo.
+    private void ensureMaxMusic() {
+        try {
+            int max = audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC);
+            if (audioManager.getStreamVolume(AudioManager.STREAM_MUSIC) < max) {
+                audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, max, 0);
+                log("audio: re-asserted music max right before playback");
+            }
+        } catch (Exception e) {
+            log("audio: re-assert failed: " + e);
+        }
     }
 
     // ------------------------------------------------------------ v1.14 Realtime push (moved here v1.16)
@@ -864,6 +894,30 @@ public class VoiceService extends Service
             // (<100ms).
             player.prepare();
             log("audio: MediaPlayer prepared, duration=" + player.getDuration() + "ms");
+            // Nick 2026-10-19 v1.18: LoudnessEnhancer on this player's audio
+            // session — pushes her ~+4dB past max stream volume for a wider
+            // margin over Spotify. MP3/Aria path only; TTS has no session.
+            try {
+                if (loudnessEnhancer != null) {
+                    try { loudnessEnhancer.release(); } catch (Exception ignored) {}
+                    loudnessEnhancer = null;
+                }
+                int sessionId = player.getAudioSessionId();
+                if (sessionId == 0) {
+                    // Session 0 = global output mix: attaching here would boost
+                    // Spotify too. Skip rather than widen the effect.
+                    log("audio: LoudnessEnhancer skipped (session 0)");
+                } else {
+                    loudnessEnhancer = new LoudnessEnhancer(sessionId);
+                    loudnessEnhancer.setEnabled(true);
+                    loudnessEnhancer.setTargetGain(400); // +4dB; cap is +600
+                    log("audio: LoudnessEnhancer +400mB on session " + sessionId);
+                }
+            } catch (Exception e) {
+                log("audio: LoudnessEnhancer failed: " + e);
+                loudnessEnhancer = null;
+            }
+            ensureMaxMusic(); // Nick 2026-10-19 v1.18: re-assert before start()
             player.start();
             isPlayingAudio = true;
             log("playback started (echo guard on)");
@@ -1019,6 +1073,7 @@ public class VoiceService extends Service
             String utteranceId = "selena-" + System.currentTimeMillis();
             params.putString(TextToSpeech.Engine.KEY_PARAM_UTTERANCE_ID,
                     utteranceId);
+            ensureMaxMusic(); // Nick 2026-10-19 v1.18: re-assert before speak()
             int rc = tts.speak(text, TextToSpeech.QUEUE_FLUSH, params,
                     utteranceId);
             if (rc != TextToSpeech.SUCCESS) {
@@ -1047,6 +1102,13 @@ public class VoiceService extends Service
     }
 
     private void releasePlayer() {
+        // Nick 2026-10-19 v1.18: release the LoudnessEnhancer with the player
+        // so it never lingers on a dead audio session.
+        if (loudnessEnhancer != null) {
+            try { loudnessEnhancer.setEnabled(false); } catch (Exception ignored) {}
+            try { loudnessEnhancer.release(); } catch (Exception ignored) {}
+            loudnessEnhancer = null;
+        }
         if (player != null) {
             try { player.release(); } catch (Exception ignored) {}
             player = null;
@@ -1065,8 +1127,22 @@ public class VoiceService extends Service
                     AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK)
                     .setAudioAttributes(attrs)
                     .build();
-            audioManager.requestAudioFocus(focusRequest);
-        } catch (Exception ignored) {}
+            // Nick 2026-10-19 v1.18: capture the result and retry once on
+            // failure — a failed focus means Spotify never ducks.
+            int rc = audioManager.requestAudioFocus(focusRequest);
+            log("audio: focus request rc=" + rc + " (1=granted)");
+            if (rc == AudioManager.AUDIOFOCUS_REQUEST_FAILED) {
+                try { Thread.sleep(500); } catch (InterruptedException ignored) {}
+                focusRequest = new AudioFocusRequest.Builder(
+                        AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK)
+                        .setAudioAttributes(attrs)
+                        .build();
+                rc = audioManager.requestAudioFocus(focusRequest);
+                log("audio: focus retry rc=" + rc + " (1=granted)");
+            }
+        } catch (Exception e) {
+            log("audio: focus request failed: " + e);
+        }
     }
 
     private void abandonAudioFocus() {
