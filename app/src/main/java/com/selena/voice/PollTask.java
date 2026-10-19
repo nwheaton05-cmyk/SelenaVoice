@@ -4,7 +4,11 @@ import android.util.Log;
 
 /**
  * Polling task for VoiceService (top-level to avoid d8 inner-class bug).
- * Runs the queue poll on a background thread, then reschedules.
+ *
+ * Nick 2026-10-19 v1.16: the service owns outbound polling again (moved
+ * back from MainActivity for background operation). pollOnce() spawns a
+ * worker thread and the worker schedules the next poll when it finishes,
+ * so this task only kicks off one poll — no double-scheduling.
  */
 public class PollTask implements Runnable {
     private static final String TAG = "SelenaVoice";
@@ -21,7 +25,7 @@ public class PollTask implements Runnable {
             service.pollOnce();
         } catch (Exception e) {
             Log.w(TAG, "poll failed", e);
+            service.scheduleNextPoll();
         }
-        service.scheduleNextPoll();
     }
 }

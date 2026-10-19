@@ -14,7 +14,7 @@ import android.speech.tts.UtteranceProgressListener;
  */
 public class TtsProgressListener extends UtteranceProgressListener {
 
-    /** Implemented by MainActivity. */
+    /** Implemented by VoiceService (v1.16: TTS moved into the service). */
     public interface Callback {
         /** Called when on-device speech starts: raise the echo guard. */
         void onTtsStarted();
@@ -43,13 +43,13 @@ public class TtsProgressListener extends UtteranceProgressListener {
 
     @Override
     public void onDone(String utteranceId) {
-        MainActivity.log("tts: on-device done");
+        VoiceService.log("tts: on-device done");
         callback.onTtsFinished();
     }
 
     @Override
     public void onError(String utteranceId) {
-        MainActivity.log("tts: on-device error id=" + utteranceId);
+        VoiceService.log("tts: on-device error id=" + utteranceId);
         callback.onTtsFinished();
     }
 }

@@ -6,7 +6,13 @@
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- Nick 2026-10-19 v1.16: background operation — the service holds a
+         partial wake lock so polling, Realtime, and playback keep running
+         with the screen locked. WAKE_LOCK is a normal (auto-granted)
+         permission. -->
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
 
     <application
         android:label="Selena Voice"
@@ -24,10 +30,13 @@
             </intent-filter>
         </activity>
 
+        <!-- Nick 2026-10-19 v1.16: mediaPlayback type added — the service
+             plays Selena's replies with the screen locked (Android 14
+             requires the declared type to match the work). -->
         <service
             android:name=".VoiceService"
             android:exported="false"
-            android:foregroundServiceType="microphone" />
+            android:foregroundServiceType="microphone|mediaPlayback" />
 
     </application>
 </manifest>
