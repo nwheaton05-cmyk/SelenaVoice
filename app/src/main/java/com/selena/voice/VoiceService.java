@@ -88,6 +88,11 @@ public class VoiceService extends Service
     public static final String KEY_VOICE_MODE = "voice_mode";
     public static final String VOICE_PHONE = "phone"; // fast, on-device TTS
     public static final String VOICE_ARIA = "aria";   // quality, server MP3
+    // Nick 2026-10-19 v1.17: no-auto-readout + output-route toggles.
+    // The two output toggles are mutually exclusive.
+    public static final String KEY_NO_AUTO_READOUT = "no_auto_readout";
+    public static final String KEY_FORCE_BLUETOOTH = "force_bluetooth";
+    public static final String KEY_FORCE_SPEAKER = "force_speaker";
 
     private static final String BASE_URL = "https://siteview-pi.vercel.app";
     // Nick 2026-10-18 v1.14: Supabase Realtime push (LEG 1). The anon
@@ -634,6 +639,17 @@ public class VoiceService extends Service
                 log("dedupe: skipping duplicate text");
                 return maxTs;
             }
+            // Nick 2026-10-19 v1.17: no-auto-readout toggle. The message
+            // is still marked spoken (so the two-phase MP3 redelivery
+            // dedupes), logged to the app, and last_ts advances via the
+            // returned maxTs — but nothing is ever played or spoken, and
+            // the volume boost never engages (no playback at all).
+            if (isNoAutoReadout()) {
+                markSpokenLocked(text);
+                broadcastMessage(text);
+                log("readout skipped (no-auto-readout on)");
+                return maxTs;
+            }
             if (isPhoneVoiceMode()) {
                 // SPEED MODE. Phone voice mode speaks the text
                 // IMMEDIATELY with on-device TTS and ignores audioUrl
@@ -708,6 +724,14 @@ public class VoiceService extends Service
      * output device is connected, leave routing alone and let Android use
      * it. Otherwise fall back to speakerphone. Sets btRouted so
      * restoreAudioRouting() knows what to undo.
+     *
+     * Nick 2026-10-19 v1.17: output-toggle overrides, EXCLUSIVE —
+     * - force_speaker on: ONLY the phone loudspeaker, never Bluetooth.
+     * - force_bluetooth on: ONLY Bluetooth, never the phone speaker.
+     *   If no BT device is actually connected, falls back to the
+     *   speakerphone (can't play to nothing) — never both at once.
+     * Neither on = the v1.11 auto behavior. btRouted is false whenever
+     * we touched the speakerphone, so restoreAudioRouting() undoes it.
      */
     @SuppressWarnings("deprecation") // setSpeakerphoneOn / isBluetoothA2dpOn
     private boolean routeAudioForPlayback() {
@@ -728,13 +752,47 @@ public class VoiceService extends Service
         } catch (Exception e) {
             log("audio: BT check failed: " + e);
         }
+        try {
+            speakerWasOn = audioManager.isSpeakerphoneOn();
+        } catch (Exception ignored) {}
+        if (isForceSpeaker()) {
+            try {
+                audioManager.setSpeakerphoneOn(true);
+            } catch (Exception e) {
+                log("audio: setSpeakerphoneOn failed: " + e);
+            }
+            btRouted = false;
+            log("audio: output toggle -> phone speaker only");
+            return false;
+        }
+        if (isForceBluetooth()) {
+            if (btConnected) {
+                // Exclusive BT: kill the speakerphone so nothing leaks
+                // to it; restoreAudioRouting() puts it back after.
+                try {
+                    audioManager.setSpeakerphoneOn(false);
+                } catch (Exception e) {
+                    log("audio: setSpeakerphoneOn(false) failed: " + e);
+                }
+                btRouted = false;
+                log("audio: output toggle -> Bluetooth only");
+                return true;
+            }
+            log("audio: BT toggle on but no BT connected, using speaker");
+            try {
+                audioManager.setSpeakerphoneOn(true);
+            } catch (Exception e) {
+                log("audio: setSpeakerphoneOn failed: " + e);
+            }
+            btRouted = false;
+            return false;
+        }
         btRouted = btConnected;
         if (btConnected) {
             log("audio: bluetooth connected, routing to BT");
             return true;
         }
         try {
-            speakerWasOn = audioManager.isSpeakerphoneOn();
             audioManager.setSpeakerphoneOn(true);
         } catch (Exception e) {
             log("audio: setSpeakerphoneOn failed: " + e);
@@ -1331,6 +1389,54 @@ public class VoiceService extends Service
     public static boolean getAlwaysListening(Context ctx) {
         return ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
                 .getBoolean(KEY_ALWAYS_ON, true);
+    }
+
+    // Nick 2026-10-19 v1.17: no-auto-readout toggle. When on, incoming
+    // queue messages are logged + deduped but never played aloud.
+    public static boolean getNoAutoReadout(Context ctx) {
+        return ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                .getBoolean(KEY_NO_AUTO_READOUT, false);
+    }
+
+    public static void setNoAutoReadout(Context ctx, boolean on) {
+        ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                .edit().putBoolean(KEY_NO_AUTO_READOUT, on).apply();
+    }
+
+    // Nick 2026-10-19 v1.17: output-route toggles. Mutually exclusive —
+    // turning one on turns the other off. Neither on = auto routing.
+    public static boolean getForceBluetooth(Context ctx) {
+        return ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                .getBoolean(KEY_FORCE_BLUETOOTH, false);
+    }
+
+    public static void setForceBluetooth(Context ctx, boolean on) {
+        ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                .edit().putBoolean(KEY_FORCE_BLUETOOTH, on)
+                .putBoolean(KEY_FORCE_SPEAKER, false).apply();
+    }
+
+    public static boolean getForceSpeaker(Context ctx) {
+        return ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                .getBoolean(KEY_FORCE_SPEAKER, false);
+    }
+
+    public static void setForceSpeaker(Context ctx, boolean on) {
+        ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                .edit().putBoolean(KEY_FORCE_SPEAKER, on)
+                .putBoolean(KEY_FORCE_BLUETOOTH, false).apply();
+    }
+
+    private boolean isNoAutoReadout() {
+        return getNoAutoReadout(this);
+    }
+
+    private boolean isForceBluetooth() {
+        return getForceBluetooth(this);
+    }
+
+    private boolean isForceSpeaker() {
+        return getForceSpeaker(this);
     }
 
     private static String readAll(InputStream in) throws Exception {

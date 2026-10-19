@@ -53,6 +53,11 @@ public class MainActivity extends Activity {
     private TextView voiceModeLabel;
     private Switch voiceModeSwitch;
 
+    // Nick 2026-10-19 v1.17: no-auto-readout + output-route toggles.
+    private Switch noReadoutSwitch;
+    private Switch btSwitch;
+    private Switch spkSwitch;
+
     public MainActivity() {
         receiver = new MessageReceiver(this);
     }
@@ -167,6 +172,32 @@ public class MainActivity extends Activity {
             VoiceService.log("voice: mode=" + (phone ? "phone (fast)" : "aria (quality)"));
         });
 
+        // Nick 2026-10-19 v1.17: no-auto-readout — messages land in the
+        // log but are never played aloud. Stored in SharedPreferences so
+        // the service's queue handling reads the same value.
+        noReadoutSwitch = findViewById(R.id.noReadoutSwitch);
+        noReadoutSwitch.setChecked(VoiceService.getNoAutoReadout(this));
+        noReadoutSwitch.setOnCheckedChangeListener((v, on) -> {
+            VoiceService.setNoAutoReadout(this, on);
+            VoiceService.log("voice: no-auto-readout=" + on);
+        });
+
+        // Nick 2026-10-19 v1.17: output-route toggles, mutually exclusive.
+        // Neither on = auto (Bluetooth wins when connected, else speaker).
+        btSwitch = findViewById(R.id.btSwitch);
+        spkSwitch = findViewById(R.id.spkSwitch);
+        syncOutputSwitches();
+        btSwitch.setOnCheckedChangeListener((v, on) -> {
+            VoiceService.setForceBluetooth(this, on); // clears speaker pref
+            VoiceService.log("voice: output=bluetooth" + (on ? " (exclusive)" : " (auto)"));
+            syncOutputSwitches();
+        });
+        spkSwitch.setOnCheckedChangeListener((v, on) -> {
+            VoiceService.setForceSpeaker(this, on); // clears BT pref
+            VoiceService.log("voice: output=speaker" + (on ? " (exclusive)" : " (auto)"));
+            syncOutputSwitches();
+        });
+
         requestPermissions();
         // Service starts after permission grant (see onRequestPermissionsResult).
         // If already granted, start now.
@@ -186,6 +217,14 @@ public class MainActivity extends Activity {
         final boolean phone = isPhoneVoiceMode();
         runOnUiThread(() -> voiceModeLabel.setText(
                 phone ? "Voice: Phone (fast)" : "Voice: Aria (quality)"));
+    }
+
+    /** Nick 2026-10-19 v1.17: reflect the mutually-exclusive output prefs
+     * in both switches. setChecked() only fires the listener when the
+     * value changes, so this can't recurse. */
+    private void syncOutputSwitches() {
+        btSwitch.setChecked(VoiceService.getForceBluetooth(this));
+        spkSwitch.setChecked(VoiceService.getForceSpeaker(this));
     }
 
     private boolean hasAllPermissions() {

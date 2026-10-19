@@ -115,6 +115,76 @@
             android:checked="true" />
     </LinearLayout>
 
+    <!-- No auto-readout (Nick 2026-10-19 v1.17): messages show in the log
+         but are never played aloud -->
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="horizontal"
+        android:gravity="center"
+        android:paddingBottom="8dp">
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="No auto-readout"
+            android:textSize="16sp"
+            android:textColor="@color/selena_dark"
+            android:paddingEnd="8dp" />
+
+        <Switch
+            android:id="@+id/noReadoutSwitch"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:checked="false" />
+    </LinearLayout>
+
+    <!-- Output route (Nick 2026-10-19 v1.17): mutually exclusive.
+         Neither on = auto (Bluetooth wins when connected). -->
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="horizontal"
+        android:gravity="center"
+        android:paddingBottom="8dp">
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="Output: Bluetooth"
+            android:textSize="16sp"
+            android:textColor="@color/selena_dark"
+            android:paddingEnd="8dp" />
+
+        <Switch
+            android:id="@+id/btSwitch"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:checked="false" />
+    </LinearLayout>
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="horizontal"
+        android:gravity="center"
+        android:paddingBottom="16dp">
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="Output: Phone speaker"
+            android:textSize="16sp"
+            android:textColor="@color/selena_dark"
+            android:paddingEnd="8dp" />
+
+        <Switch
+            android:id="@+id/spkSwitch"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:checked="false" />
+    </LinearLayout>
+
     <!-- Message log -->
     <TextView
         android:layout_width="match_parent"
