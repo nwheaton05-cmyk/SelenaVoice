@@ -895,8 +895,10 @@ public class VoiceService extends Service
             player.prepare();
             log("audio: MediaPlayer prepared, duration=" + player.getDuration() + "ms");
             // Nick 2026-10-19 v1.18: LoudnessEnhancer on this player's audio
-            // session — pushes her ~+4dB past max stream volume for a wider
+            // session — pushes her past max stream volume for a wider
             // margin over Spotify. MP3/Aria path only; TTS has no session.
+            // Nick 2026-10-19 v1.19: gain raised to +600mB (the cap); he
+            // asked for a little more margin.
             try {
                 if (loudnessEnhancer != null) {
                     try { loudnessEnhancer.release(); } catch (Exception ignored) {}
@@ -910,8 +912,8 @@ public class VoiceService extends Service
                 } else {
                     loudnessEnhancer = new LoudnessEnhancer(sessionId);
                     loudnessEnhancer.setEnabled(true);
-                    loudnessEnhancer.setTargetGain(400); // +4dB; cap is +600
-                    log("audio: LoudnessEnhancer +400mB on session " + sessionId);
+                    loudnessEnhancer.setTargetGain(600); // +6dB (cap)
+                    log("audio: LoudnessEnhancer +600mB on session " + sessionId);
                 }
             } catch (Exception e) {
                 log("audio: LoudnessEnhancer failed: " + e);
