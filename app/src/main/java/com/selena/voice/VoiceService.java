@@ -77,6 +77,8 @@ public class VoiceService extends Service
     public static final String ACTION_INPUT_SENT = "com.selena.voice.INPUT_SENT";
     public static final String ACTION_LISTENING_STATE = "com.selena.voice.LISTENING_STATE";
     public static final String ACTION_POLL_STATUS = "com.selena.voice.POLL_STATUS";
+    // Nick 2026-10-21: playback pause/resume state for the pause button.
+    public static final String ACTION_PLAYBACK_STATE = "com.selena.voice.PLAYBACK_STATE";
     public static final String EXTRA_POLL_STATUS = "poll_status";
     public static final String EXTRA_TEXT = "text";
     public static final String EXTRA_STATE = "listening";
@@ -277,6 +279,13 @@ public class VoiceService extends Service
                 manualListening = false;
                 if (recognizerActive) stopContinuousListening();
                 else broadcastListeningState();
+            } else if ("PAUSE_PLAYBACK".equals(intent.getAction())) {
+                // Nick 2026-10-21: pause button — halts the current MP3,
+                // keeps the position so resume picks up where it left off.
+                pausePlayback();
+            } else if ("RESUME_PLAYBACK".equals(intent.getAction())) {
+                // Nick 2026-10-21: resume from the paused position.
+                resumePlayback();
             }
         }
         return START_STICKY;
@@ -931,8 +940,10 @@ public class VoiceService extends Service
             ensureMaxMusic(); // Nick 2026-10-19 v1.18: re-assert before start()
             player.start();
             isPlayingAudio = true;
+            playbackPaused = false;
             log("playback started (echo guard on)");
             currentAudioFile = f;
+            broadcastPlaybackState();
         } catch (Exception e) {
             log("play failed: " + e);
             onPlaybackDone();
@@ -1124,6 +1135,46 @@ public class VoiceService extends Service
             try { player.release(); } catch (Exception ignored) {}
             player = null;
         }
+        playbackPaused = false;
+        broadcastPlaybackState();
+    }
+
+    // Nick 2026-10-21: pause/resume for the playback pause button.
+    // Pause keeps the MediaPlayer alive at the current position;
+    // resume continues from there. The queue is untouched.
+    private boolean playbackPaused = false;
+
+    private void pausePlayback() {
+        if (player != null && player.isPlaying()) {
+            try {
+                player.pause();
+                playbackPaused = true;
+                log("playback: paused at " + player.getCurrentPosition() + "ms");
+                broadcastPlaybackState();
+            } catch (Exception e) {
+                log("playback: pause failed: " + e.getMessage());
+            }
+        }
+    }
+
+    private void resumePlayback() {
+        if (player != null && playbackPaused) {
+            try {
+                player.start();
+                playbackPaused = false;
+                log("playback: resumed at " + player.getCurrentPosition() + "ms");
+                broadcastPlaybackState();
+            } catch (Exception e) {
+                log("playback: resume failed: " + e.getMessage());
+            }
+        }
+    }
+
+    private void broadcastPlaybackState() {
+        Intent i = new Intent(ACTION_PLAYBACK_STATE);
+        i.putExtra("playing", player != null && player.isPlaying());
+        i.putExtra("paused", playbackPaused);
+        sendBroadcast(i);
     }
 
     private void requestAudioFocus() {

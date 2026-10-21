@@ -81,6 +81,17 @@
         android:textSize="40sp"
         android:backgroundTint="@color/selena_purple" />
 
+    <!-- Playback pause/resume (Nick 2026-10-21): pauses the currently
+         playing message. Tap again to resume from the same spot. -->
+    <Button
+        android:id="@+id/pauseButton"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="center"
+        android:text="⏸️ Pause"
+        android:textSize="16sp"
+        android:visibility="gone" />
+
     <TextView
         android:layout_width="match_parent"
         android:layout_height="wrap_content"

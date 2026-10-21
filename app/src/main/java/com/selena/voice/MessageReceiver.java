@@ -29,6 +29,11 @@ public class MessageReceiver extends BroadcastReceiver {
             activity.onListeningState(intent.getBooleanExtra(VoiceService.EXTRA_STATE, false));
         } else if (action.equals(VoiceService.ACTION_POLL_STATUS)) {
             activity.onPollStatus(intent.getStringExtra(VoiceService.EXTRA_POLL_STATUS));
+        } else if (action.equals(VoiceService.ACTION_PLAYBACK_STATE)) {
+            // Nick 2026-10-21: pause button visibility + label.
+            activity.onPlaybackState(
+                intent.getBooleanExtra("playing", false),
+                intent.getBooleanExtra("paused", false));
         }
     }
 }

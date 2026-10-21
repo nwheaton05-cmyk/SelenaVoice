@@ -50,6 +50,10 @@ public class MainActivity extends Activity {
     private Button micButton;
     private boolean manualMicOn = false;
 
+    // Nick 2026-10-21: pause/resume button for playback.
+    private Button pauseButton;
+    private boolean playbackPaused = false;
+
     private TextView voiceModeLabel;
     private Switch voiceModeSwitch;
 
@@ -100,6 +104,22 @@ public class MainActivity extends Activity {
         runOnUiThread(() -> pollStatusText.setText(s));
     }
 
+    /**
+     * Nick 2026-10-21: playback pause button state. The button is visible
+     * only while audio is playing or paused. Label toggles ⏸️/▶️.
+     */
+    public void onPlaybackState(boolean playing, boolean paused) {
+        playbackPaused = paused;
+        runOnUiThread(() -> {
+            if (playing || paused) {
+                pauseButton.setVisibility(android.view.View.VISIBLE);
+                pauseButton.setText(paused ? "▶️ Resume" : "⏸️ Pause");
+            } else {
+                pauseButton.setVisibility(android.view.View.GONE);
+            }
+        });
+    }
+
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
@@ -119,6 +139,16 @@ public class MainActivity extends Activity {
         alwaysOnSwitch = findViewById(R.id.alwaysOnSwitch);
         pulseDot = findViewById(R.id.pulseDot);
         micButton = findViewById(R.id.micButton);
+        pauseButton = findViewById(R.id.pauseButton);
+
+        // Nick 2026-10-21: pause/resume button for playback. Toggles between
+        // PAUSE_PLAYBACK and RESUME_PLAYBACK intents. Visibility driven by
+        // the service's ACTION_PLAYBACK_STATE broadcasts.
+        pauseButton.setOnClickListener(v -> {
+            Intent i = new Intent(this, VoiceService.class);
+            i.setAction(playbackPaused ? "RESUME_PLAYBACK" : "PAUSE_PLAYBACK");
+            startForegroundService(i);
+        });
 
         alwaysOnSwitch.setChecked(VoiceService.getAlwaysListening(this));
         alwaysOnSwitch.setOnCheckedChangeListener((v, on) -> {
@@ -279,6 +309,7 @@ public class MainActivity extends Activity {
         f.addAction(VoiceService.ACTION_SPEECH_DETECTED);
         f.addAction(VoiceService.ACTION_LISTENING_STATE);
         f.addAction(VoiceService.ACTION_POLL_STATUS);
+        f.addAction(VoiceService.ACTION_PLAYBACK_STATE);
         if (Build.VERSION.SDK_INT >= 33) {
             registerReceiver(receiver, f, Context.RECEIVER_NOT_EXPORTED);
         } else {
