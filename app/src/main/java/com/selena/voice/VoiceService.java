@@ -492,12 +492,18 @@ public class VoiceService extends Service
             } else {
                 m.put("audioUrl", record.optString("audio_url", ""));
             }
-            // created_at is "YYYY-MM-DD HH:MM:SS.ffffff+00"; the poll's
-            // last_ts advances on wall-clock so the fallback poll won't
-            // refetch this row (dedupe via spokenTexts covers overlap).
-            m.put("timestamp", System.currentTimeMillis());
-            handleQueueMessage(m, getLastTs());
-            setLastTs(System.currentTimeMillis());
+            // Nick 2026-10-21: use the ROW's created_at for the cursor, never
+            // wall-clock. setLastTs(now()) here used to strand rows: the
+            // cursor jumped ahead of messages the poll hadn't seen yet, and
+            // they were never fetched or played. The cursor tracks messages,
+            // not the clock — advance past this row's timestamp only.
+            long rowTs = parseRowTimestamp(record.optString("created_at", ""));
+            m.put("timestamp", rowTs > 0 ? rowTs : System.currentTimeMillis());
+            long beforeTs = getLastTs();
+            handleQueueMessage(m, beforeTs);
+            if (rowTs > beforeTs) {
+                setLastTs(rowTs + 1);
+            }
         } catch (Exception e) {
             log("rt: push handling failed: " + e);
         }
@@ -621,10 +627,13 @@ public class VoiceService extends Service
             // Nick 2026-10-18 v1.7: ALWAYS advance last_ts PAST the newest
             // message processed (+1). The API returned a message whose
             // timestamp exactly equaled `since`, so a strict greater-than
-            // is needed on the next poll. Fallback to now() when no
-            // timestamp parsed so we always make forward progress.
+            // is needed on the next poll.
+            // Nick 2026-10-21: NEVER fall back to wall-clock here. A
+            // wall-clock cursor strands rows created between polls — they
+            // sit behind the cursor forever and are never fetched or played.
+            // If timestamps didn't parse, hold the cursor and refetch.
             if (count > 0) {
-                long newTs = maxTs > since ? maxTs + 1 : System.currentTimeMillis();
+                long newTs = maxTs > since ? maxTs + 1 : since;
                 setLastTs(newTs);
             }
             broadcastPollStatus("Last poll: 200 OK, " + count + " message(s)");
@@ -1411,6 +1420,21 @@ public class VoiceService extends Service
             return java.time.OffsetDateTime.parse(s).toInstant().toEpochMilli();
         } catch (Exception e) {
             log("parseTimestamp: unparseable '" + s + "'");
+            return 0;
+        }
+    }
+
+    /**
+     * Parse a Supabase row created_at ("YYYY-MM-DD HH:MM:SS.ffffff+00")
+     * to epoch millis. Returns 0 when unparseable. (Nick 2026-10-21:
+     * the realtime cursor must track the row's time, not wall-clock.)
+     */
+    private static long parseRowTimestamp(String createdAt) {
+        if (createdAt == null || createdAt.isEmpty()) return 0;
+        try {
+            return java.time.OffsetDateTime.parse(
+                createdAt.replace(' ', 'T')).toInstant().toEpochMilli();
+        } catch (Exception e) {
             return 0;
         }
     }
