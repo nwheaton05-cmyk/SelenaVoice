@@ -30,13 +30,16 @@ public class MessageHistory {
         public String audioPath; // null until the MP3 is cached
         public final long timestamp;
         public boolean locked;
+        /** Server-side selena_voice_queue row ID (for delete-unlocked). Null for local-only entries. */
+        public final String serverId;
 
-        Entry(String id, String text, String audioPath, long timestamp, boolean locked) {
+        Entry(String id, String text, String audioPath, long timestamp, boolean locked, String serverId) {
             this.id = id;
             this.text = text;
             this.audioPath = audioPath;
             this.timestamp = timestamp;
             this.locked = locked;
+            this.serverId = serverId;
         }
     }
 
@@ -50,10 +53,17 @@ public class MessageHistory {
     }
 
     public static synchronized Entry add(String text, File audioFile) {
+        return add(text, audioFile, null);
+    }
+
+    /** Nick 2026-10-22 v1.34: serverId links the local entry to the
+     * selena_voice_queue row, so delete-unlocked can preserve locked
+     * messages server-side. */
+    public static synchronized Entry add(String text, File audioFile, String serverId) {
         String id = "msg-" + System.currentTimeMillis() + "-" + (int)(Math.random() * 10000);
         Entry e = new Entry(id, text,
             audioFile != null ? audioFile.getAbsolutePath() : null,
-            System.currentTimeMillis(), false);
+            System.currentTimeMillis(), false, serverId);
         // Nick 2026-10-22 v1.26: chat order — newest at the bottom.
         entries.add(e);
         while (entries.size() > MAX_ENTRIES) {
@@ -88,6 +98,58 @@ public class MessageHistory {
                 return;
             }
         }
+    }
+
+    /** Nick 2026-10-22 v1.34: server IDs of locked entries, for the
+     * delete-unlocked keep_ids list. Entries without a serverId (local-only
+     * or from before v1.34) are skipped — they have no server row to keep. */
+    public static synchronized List<String> getLockedServerIds() {
+        List<String> ids = new ArrayList<>();
+        for (Entry e : entries) {
+            if (e.locked && e.serverId != null) ids.add(e.serverId);
+        }
+        return ids;
+    }
+
+    /** Nick 2026-10-22 v1.34: remove all unlocked entries (and their MP3s).
+     * Returns the count removed. Locked entries are preserved. */
+    public static synchronized int deleteUnlocked() {
+        int removed = 0;
+        for (int i = entries.size() - 1; i >= 0; i--) {
+            Entry e = entries.get(i);
+            if (!e.locked) {
+                deleteAudioFile(e);
+                entries.remove(i);
+                removed++;
+            }
+        }
+        if (removed > 0) save();
+        return removed;
+    }
+
+    /** Nick 2026-10-22 v1.34: delete selena-*.mp3 files in the given
+     * directory that are not referenced by any remaining history entry.
+     * Returns the count deleted. Catches orphans from failed downloads
+     * or entries removed before v1.34 tracked server IDs. */
+    public static synchronized int deleteOrphanedAudio(java.io.File dir) {
+        if (dir == null || !dir.isDirectory()) return 0;
+        java.util.Set<String> referenced = new java.util.HashSet<>();
+        for (Entry e : entries) {
+            if (e.audioPath != null) referenced.add(e.audioPath);
+        }
+        int deleted = 0;
+        java.io.File[] files = dir.listFiles();
+        if (files == null) return 0;
+        for (java.io.File f : files) {
+            String name = f.getName();
+            if (name.startsWith("selena-") && name.endsWith(".mp3")
+                    && !referenced.contains(f.getAbsolutePath())) {
+                try {
+                    if (f.delete()) deleted++;
+                } catch (Exception ignored) {}
+            }
+        }
+        return deleted;
     }
 
     /** Delete entries older than 3 days unless locked; delete their MP3s. */
@@ -129,6 +191,28 @@ public class MessageHistory {
         return false;
     }
 
+    /** Nick 2026-10-22 v1.34: true when the entry referencing this MP3
+     * path is locked. Used by delete-unlocked to preserve locked audio
+     * in the service playback queues. */
+    public static synchronized boolean isAudioLocked(String absPath) {
+        if (absPath == null) return false;
+        for (Entry e : entries) {
+            if (absPath.equals(e.audioPath)) return e.locked;
+        }
+        return false;
+    }
+
+    /** Nick 2026-10-22 v1.34: true when a locked entry has this exact
+     * text. Used by delete-unlocked for the TTS (phone-voice) queue,
+     * which holds raw strings. */
+    public static synchronized boolean isTextLocked(String text) {
+        if (text == null) return false;
+        for (Entry e : entries) {
+            if (text.equals(e.text) && e.locked) return true;
+        }
+        return false;
+    }
+
     private static void load() {
         entries.clear();
         if (appContext == null) return;
@@ -144,7 +228,8 @@ public class MessageHistory {
                     o.getString("text"),
                     o.isNull("audioPath") ? null : o.getString("audioPath"),
                     o.getLong("timestamp"),
-                    o.optBoolean("locked", false)));
+                    o.optBoolean("locked", false),
+                    o.isNull("serverId") ? null : o.optString("serverId", null)));
             }
             // Nick 2026-10-22 v1.26: v1.24/v1.25 saved newest-first.
             // Detect by timestamp order; flip only when needed.
@@ -168,6 +253,7 @@ public class MessageHistory {
                 o.put("audioPath", e.audioPath != null ? e.audioPath : JSONObject.NULL);
                 o.put("timestamp", e.timestamp);
                 o.put("locked", e.locked);
+                o.put("serverId", e.serverId != null ? e.serverId : JSONObject.NULL);
                 arr.put(o);
             }
             File f = new File(appContext.getFilesDir(), FILE_NAME);

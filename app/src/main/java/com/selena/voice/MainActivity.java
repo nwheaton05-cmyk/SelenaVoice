@@ -54,6 +54,19 @@ public class MainActivity extends Activity {
     private Button pauseButton;
     private boolean playbackPaused = false;
 
+    // Nick 2026-10-22 v1.33: skip to newest — abandon the current message
+    // and play the newest queued one.
+    private Button skipButton;
+
+    // Nick 2026-10-22 v1.34: delete unlocked — wipe the server queue and
+    // local history except for locked messages.
+    private Button deleteUnlockedButton;
+
+    // Nick 2026-10-22 v1.33: in-app auto-updater banner. Hidden until the
+    // version check finds a newer APK; tap downloads + installs it.
+    private Button updateBanner;
+    private String pendingApkUrl;
+
     private TextView voiceModeLabel;
     private Switch voiceModeSwitch;
 
@@ -176,6 +189,32 @@ public class MainActivity extends Activity {
             startForegroundService(i);
         });
 
+        // Nick 2026-10-22 v1.33: skip-to-newest button. Sends
+        // SKIP_TO_NEWEST — the service abandons the current message and
+        // plays the newest queued one. Always enabled; the service toasts
+        // the outcome so a tap never dies silently.
+        skipButton = findViewById(R.id.skipButton);
+        skipButton.setEnabled(true);
+        skipButton.setOnClickListener(v -> {
+            Intent i = new Intent(this, VoiceService.class);
+            i.setAction("SKIP_TO_NEWEST");
+            startForegroundService(i);
+        });
+
+        // Nick 2026-10-22 v1.34: delete-unlocked button. Deletes all
+        // messages except locked ones — server queue (via DELETE with
+        // keep_ids) and local history. Always toasts the outcome.
+        deleteUnlockedButton = findViewById(R.id.deleteUnlockedButton);
+        deleteUnlockedButton.setEnabled(true);
+        deleteUnlockedButton.setOnClickListener(v -> deleteUnlocked());
+
+        // Nick 2026-10-22 v1.33: in-app auto-updater. Hidden until the
+        // version check finds a newer APK — v1.33 is the last manual
+        // install.
+        updateBanner = findViewById(R.id.updateBanner);
+        updateBanner.setVisibility(View.GONE);
+        checkForAppUpdate();
+
         alwaysOnSwitch.setChecked(VoiceService.getAlwaysListening(this));
         alwaysOnSwitch.setOnCheckedChangeListener((v, on) -> {
             VoiceService.setAlwaysListening(this, on);
@@ -259,6 +298,230 @@ public class MainActivity extends Activity {
         // If already granted, start now.
         if (hasAllPermissions()) {
             startVoiceService();
+        }
+    }
+
+    // ------------------------------------------------------------ in-app updater
+    // Nick 2026-10-22 v1.33: self-update so this is the last manual
+    // install. On launch, compare the installed versionCode against
+    // /api/selena-voice/version. A newer build shows a green banner;
+    // tap downloads the APK and fires the system installer.
+
+    private static final String VERSION_URL =
+            "https://siteview-pi.vercel.app/api/selena-voice/version";
+
+    private int getInstalledVersionCode() {
+        try {
+            android.content.pm.PackageInfo pi = getPackageManager()
+                    .getPackageInfo(getPackageName(), 0);
+            if (android.os.Build.VERSION.SDK_INT >= 28) {
+                return (int) pi.getLongVersionCode();
+            } else {
+                return pi.versionCode;
+            }
+        } catch (Exception e) {
+            return 0;
+        }
+    }
+
+    private void checkForAppUpdate() {
+        new Thread(() -> {
+            try {
+                java.net.URL url = new java.net.URL(VERSION_URL);
+                java.net.HttpURLConnection conn =
+                        (java.net.HttpURLConnection) url.openConnection();
+                conn.setConnectTimeout(8000);
+                conn.setReadTimeout(8000);
+                if (conn.getResponseCode() != 200) {
+                    conn.disconnect();
+                    return;
+                }
+                java.io.BufferedReader br = new java.io.BufferedReader(
+                        new java.io.InputStreamReader(conn.getInputStream()));
+                StringBuilder sb = new StringBuilder();
+                String line;
+                while ((line = br.readLine()) != null) sb.append(line);
+                br.close();
+                conn.disconnect();
+                org.json.JSONObject obj = new org.json.JSONObject(sb.toString());
+                int latestCode = obj.optInt("versionCode", 0);
+                String apkUrl = obj.optString("apkUrl", "");
+                boolean available = obj.optBoolean("apkAvailable", false);
+                int installed = getInstalledVersionCode();
+                VoiceService.log("updater: installed=" + installed
+                        + " latest=" + latestCode + " available=" + available);
+                if (available && latestCode > installed && !apkUrl.isEmpty()) {
+                    final String dl = apkUrl;
+                    runOnUiThread(() -> showUpdateBanner(dl));
+                }
+            } catch (Exception e) {
+                VoiceService.log("updater: check failed: " + e.getMessage());
+            }
+        }).start();
+    }
+
+    private void showUpdateBanner(String apkUrl) {
+        pendingApkUrl = apkUrl;
+        updateBanner.setVisibility(View.VISIBLE);
+        updateBanner.setEnabled(true);
+        updateBanner.setText("⬆️ Update available — tap to install");
+        updateBanner.setOnClickListener(v -> downloadAndInstallApk(pendingApkUrl));
+        VoiceService.log("updater: banner shown");
+    }
+
+    // Nick 2026-10-22 v1.34: delete unlocked — wipe the server queue and
+    // local history except for locked messages. Server keeps the locked
+    // ones via keep_ids; local history drops unlocked entries (and MP3s).
+    // Always toasts the outcome so a tap never dies silently.
+    private static final String QUEUE_DELETE_URL =
+            "https://siteview-pi.vercel.app/api/selena-voice/queue";
+
+    private void deleteUnlocked() {
+        deleteUnlockedButton.setEnabled(false);
+        // Tell the service to drop unlocked items from its playback
+        // queues (locked ones keep playing/queued).
+        Intent clearIntent = new Intent(this, VoiceService.class);
+        clearIntent.setAction("CLEAR_UNLOCKED");
+        startForegroundService(clearIntent);
+        new Thread(() -> {
+            int serverDeleted = -1;
+            int serverKept = -1;
+            String err = null;
+            try {
+                java.util.List<String> keepIds = MessageHistory.getLockedServerIds();
+                org.json.JSONObject body = new org.json.JSONObject();
+                org.json.JSONArray arr = new org.json.JSONArray();
+                for (String id : keepIds) arr.put(id);
+                body.put("keep_ids", arr);
+
+                java.net.URL url = new java.net.URL(QUEUE_DELETE_URL);
+                java.net.HttpURLConnection conn =
+                        (java.net.HttpURLConnection) url.openConnection();
+                conn.setRequestMethod("DELETE");
+                conn.setDoOutput(true);
+                conn.setConnectTimeout(10000);
+                conn.setReadTimeout(10000);
+                conn.setRequestProperty("Content-Type", "application/json");
+                byte[] bytes = body.toString().getBytes("UTF-8");
+                conn.getOutputStream().write(bytes);
+                int code = conn.getResponseCode();
+                if (code == 200) {
+                    java.io.BufferedReader br = new java.io.BufferedReader(
+                            new java.io.InputStreamReader(conn.getInputStream()));
+                    StringBuilder sb = new StringBuilder();
+                    String line;
+                    while ((line = br.readLine()) != null) sb.append(line);
+                    br.close();
+                    org.json.JSONObject resp = new org.json.JSONObject(sb.toString());
+                    serverDeleted = resp.optInt("deleted", -1);
+                    serverKept = resp.optInt("kept", -1);
+                } else {
+                    err = "HTTP " + code;
+                }
+                conn.disconnect();
+            } catch (Exception e) {
+                err = e.getMessage();
+            }
+
+            // Clear unlocked from local history regardless of server result
+            // (local and server are independent; a server failure shouldn't
+            // block local cleanup). Then sweep orphaned MP3s.
+            int localRemoved = MessageHistory.deleteUnlocked();
+            int orphansDeleted = 0;
+            try {
+                orphansDeleted = MessageHistory.deleteOrphanedAudio(getCacheDir());
+            } catch (Exception e) {
+                VoiceService.log("delete-unlocked: orphan sweep failed: " + e.getMessage());
+            }
+
+            final int fDeleted = serverDeleted;
+            final int fKept = serverKept;
+            final String fErr = err;
+            final int fLocal = localRemoved;
+            final int fOrphans = orphansDeleted;
+            runOnUiThread(() -> {
+                deleteUnlockedButton.setEnabled(true);
+                renderHistory(false);
+                String msg;
+                if (fErr != null) {
+                    msg = "Server delete failed (" + fErr + ") — cleared "
+                            + fLocal + " local";
+                } else if (fDeleted == 0 && fLocal == 0) {
+                    msg = "Nothing to delete";
+                } else {
+                    msg = "Deleted " + fDeleted + " server, " + fLocal
+                            + " local" + (fOrphans > 0 ? ", " + fOrphans + " orphan files" : "")
+                            + (fKept > 0 ? " (" + fKept + " locked kept)" : "");
+                }
+                android.widget.Toast.makeText(MainActivity.this, msg,
+                        android.widget.Toast.LENGTH_LONG).show();
+                VoiceService.log("delete-unlocked: server deleted=" + fDeleted
+                        + " kept=" + fKept + " local removed=" + fLocal
+                        + " orphans=" + fOrphans
+                        + (fErr != null ? " err=" + fErr : ""));
+            });
+        }).start();
+    }
+
+    private void downloadAndInstallApk(String apkUrl) {
+        updateBanner.setEnabled(false);
+        updateBanner.setText("⬇️ Downloading update…");
+        new Thread(() -> {
+            try {
+                java.net.URL url = new java.net.URL(apkUrl);
+                java.net.HttpURLConnection conn =
+                        (java.net.HttpURLConnection) url.openConnection();
+                conn.setConnectTimeout(15000);
+                conn.setReadTimeout(60000);
+                int code = conn.getResponseCode();
+                if (code != 200) throw new java.io.IOException("HTTP " + code);
+                java.io.File outFile = new java.io.File(
+                        getExternalFilesDir(
+                                android.os.Environment.DIRECTORY_DOWNLOADS),
+                        "selena-voice-update.apk");
+                try (java.io.InputStream in = conn.getInputStream();
+                     java.io.FileOutputStream out =
+                             new java.io.FileOutputStream(outFile)) {
+                    byte[] buf = new byte[8192];
+                    int n;
+                    while ((n = in.read(buf)) > 0) out.write(buf, 0, n);
+                }
+                conn.disconnect();
+                VoiceService.log("updater: downloaded " + outFile.length()
+                        + " bytes -> " + outFile.getAbsolutePath());
+                runOnUiThread(() -> {
+                    updateBanner.setText("⬆️ Update available — tap to install");
+                    updateBanner.setEnabled(true);
+                    installApk(outFile);
+                });
+            } catch (Exception e) {
+                VoiceService.log("updater: download failed: " + e);
+                runOnUiThread(() -> {
+                    updateBanner.setText("⚠️ Download failed — tap to retry");
+                    updateBanner.setEnabled(true);
+                });
+            }
+        }).start();
+    }
+
+    private void installApk(java.io.File apkFile) {
+        try {
+            // Android 8+: the system prompts for the per-app "install
+            // unknown apps" grant on first use — no code needed.
+            android.net.Uri uri = android.net.Uri.parse(
+                    "content://com.selena.voice.apkprovider/"
+                            + apkFile.getName());
+            Intent i = new Intent(Intent.ACTION_VIEW);
+            i.setDataAndType(uri,
+                    "application/vnd.android.package-archive");
+            i.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK
+                    | Intent.FLAG_GRANT_READ_URI_PERMISSION);
+            startActivity(i);
+            VoiceService.log("updater: install intent fired");
+        } catch (Exception e) {
+            VoiceService.log("updater: install intent failed: " + e);
+            Toast.makeText(this, "Couldn't start installer",
+                    Toast.LENGTH_LONG).show();
         }
     }
 

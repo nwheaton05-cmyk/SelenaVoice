@@ -13,6 +13,11 @@
          with the screen locked. WAKE_LOCK is a normal (auto-granted)
          permission. -->
     <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <!-- Nick 2026-10-22 v1.33: in-app auto-updater — the app downloads
+         newer APKs and fires the package installer. Android 8+ requires
+         this permission; the system prompts the user for the per-app
+         "install unknown apps" grant on first use. -->
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
 
     <application
         android:label="Selena Voice"
@@ -37,6 +42,16 @@
             android:name=".VoiceService"
             android:exported="false"
             android:foregroundServiceType="microphone|mediaPlayback" />
+
+        <!-- Nick 2026-10-22 v1.33: serves the downloaded update APK to the
+             package installer. Minimal ContentProvider (no androidx on the
+             manual build classpath, so FileProvider isn't available). Only
+             serves files from the app's external downloads dir. -->
+        <provider
+            android:name=".ApkFileProvider"
+            android:authorities="com.selena.voice.apkprovider"
+            android:exported="false"
+            android:grantUriPermissions="true" />
 
     </application>
 </manifest>

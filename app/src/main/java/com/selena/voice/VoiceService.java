@@ -189,6 +189,10 @@ public class VoiceService extends Service
     private boolean recognizerActive = false;
     private boolean destroyed = false;
     private MediaPlayer player;
+    // Nick 2026-10-22 v1.34: path of the MP3 currently loaded in the
+    // player (null when idle). Lets CLEAR_UNLOCKED stop playback only
+    // when the playing message is unlocked.
+    private String currentAudioPath;
     // Nick 2026-10-19 v1.18: LoudnessEnhancer on the player's audio session
     // pushes her voice ~+4dB past max stream volume (MP3/Aria path only —
     // on-device TTS exposes no audio session). Released in releasePlayer().
@@ -312,6 +316,17 @@ public class VoiceService extends Service
                 log("intent: RESUME_PLAYBACK received");
                 if (ttsPaused || playbackPaused) resumePlayback();
                 else pausePlayback();
+            } else if ("SKIP_TO_NEWEST".equals(intent.getAction())) {
+                // Nick 2026-10-22 v1.33: skip the rest of the current
+                // (possibly paused) message and play the newest queued
+                // message immediately.
+                log("intent: SKIP_TO_NEWEST received");
+                skipToNewest();
+            } else if ("CLEAR_UNLOCKED".equals(intent.getAction())) {
+                // Nick 2026-10-22 v1.34: drop unlocked messages from the
+                // service playback queues (locked ones keep playing/queued).
+                log("intent: CLEAR_UNLOCKED received");
+                clearUnlockedQueues();
             } else if (ACTION_REQUEST_STATUS.equals(intent.getAction())) {
                 // Nick 2026-10-22 v1.25: activity re-opened — send it the
                 // current state instead of leaving stale layout defaults.
@@ -542,6 +557,9 @@ public class VoiceService extends Service
             log("rt: push received id=" + record.optString("id", "?"));
             JSONObject m = new JSONObject();
             m.put("text", record.optString("text", ""));
+            // Nick 2026-10-22 v1.34: carry the server row ID so
+            // MessageHistory can link the local entry for delete-unlocked.
+            m.put("serverId", record.optString("id", ""));
             if (record.isNull("audio_url")) {
                 m.put("audioUrl", JSONObject.NULL);
             } else {
@@ -716,6 +734,12 @@ public class VoiceService extends Service
     private long handleQueueMessage(JSONObject m, long maxTs) {
         long ts = parseTimestamp(m);
         String text = m.optString("text", "");
+        // Nick 2026-10-22 v1.34: server row ID for delete-unlocked.
+        // Realtime path carries it as "serverId"; poll API returns "id".
+        String serverId = m.optString("serverId", "");
+        if (serverId.isEmpty()) serverId = m.optString("id", "");
+        if (serverId.isEmpty()) serverId = null;
+        final String sid = serverId;
         // Nick 2026-10-18 v1.12: explicit JSON-null check. The server
         // sends "audioUrl": null for text-only speed-mode replies;
         // optString on a JSON null returns the literal string "null"
@@ -756,7 +780,7 @@ public class VoiceService extends Service
             if (isNoAutoReadout()) {
                 markSpokenLocked(text);
                 broadcastMessage(text);
-                MessageHistory.add(text, null);
+                MessageHistory.add(text, null, sid);
                 log("readout skipped (no-auto-readout on)");
                 if (ts > maxTs) maxTs = ts;
                 return maxTs;
@@ -768,7 +792,7 @@ public class VoiceService extends Service
                 // dedupes.
                 markSpokenLocked(text);
                 broadcastMessage(text);
-                final MessageHistory.Entry histEntry = MessageHistory.add(text, null);
+                final MessageHistory.Entry histEntry = MessageHistory.add(text, null, sid);
                 final String speakText = text;
                 handler.post(() -> enqueueTts(speakText));
                 // Nick 2026-10-22 v1.25: still fetch the server MP3 in the
@@ -805,7 +829,7 @@ public class VoiceService extends Service
                         File f = downloadToCache(audioUrl);
                         final File df = f;
                         // Nick 2026-10-21 v1.24: cache for replay.
-                        MessageHistory.add(text, f);
+                        MessageHistory.add(text, f, sid);
                         handler.post(() -> enqueueAudio(df));
                     } catch (Exception e) {
                         log("audio download failed: " + audioUrl + ": " + e);
@@ -995,6 +1019,8 @@ public class VoiceService extends Service
             player.setOnErrorListener(new PlayerErrorListener(this));
             player.setDataSource(f.getAbsolutePath());
             log("audio: MediaPlayer setDataSource " + f.getAbsolutePath());
+            // Nick 2026-10-22 v1.34: track for CLEAR_UNLOCKED.
+            currentAudioPath = f.getAbsolutePath();
             // Synchronous prepare on main thread for a local file is fast
             // (<100ms).
             player.prepare();
@@ -1287,6 +1313,7 @@ public class VoiceService extends Service
             try { player.release(); } catch (Exception ignored) {}
             player = null;
         }
+        currentAudioPath = null;
         playbackPaused = false;
         broadcastPlaybackState();
     }
@@ -1394,6 +1421,218 @@ public class VoiceService extends Service
             toast("Nothing paused");
         }
         broadcastPlaybackState();
+    }
+
+    /**
+     * Nick 2026-10-22 v1.33: SKIP_TO_NEWEST — abandon the current
+     * (possibly paused) message and play the newest queued message.
+     * Runs on the main thread (called from onStartCommand).
+     */
+    private void skipToNewest() {
+        log("skip: abandoning current playback, clearing queues");
+        // Disarm the TTS pause watchdog first — with ttsPauseRequested
+        // false, the engine's onStop routes to onTtsDone(), which pumps
+        // the (now empty) queues: a clean no-op.
+        ttsPauseRequested = false;
+        try {
+            if (tts != null) tts.stop();
+        } catch (Exception e) {
+            log("skip: tts.stop failed: " + e.getMessage());
+        }
+        ttsSpeaking = false;
+        ttsPaused = false;
+        ttsCurrentText = null;
+        ttsResumeAtChar = 0;
+        // Release the MP3 player (also clears playbackPaused and
+        // broadcasts state).
+        releasePlayer();
+        playing = false;
+        isPlayingAudio = false;
+        setPlayingAudio(false);
+        // Drop everything queued-but-unplayed (v1.28 rule: keep
+        // replay-cached MP3s, delete the rest).
+        synchronized (audioQueue) {
+            File f;
+            while ((f = audioQueue.poll()) != null) {
+                if (!MessageHistory.isAudioReferenced(f.getAbsolutePath())) {
+                    //noinspection ResultOfMethodCallIgnored
+                    f.delete();
+                }
+            }
+        }
+        synchronized (ttsQueue) {
+            ttsQueue.clear();
+        }
+        broadcastPlaybackState();
+        toast("Skipping to newest…");
+        // Network on a worker thread (Android forbids it on main).
+        new Thread(() -> doSkipToNewestWork()).start();
+    }
+
+    /**
+     * Nick 2026-10-22 v1.34: CLEAR_UNLOCKED — drop unlocked messages from
+     * the service playback queues. Locked messages keep their place.
+     * Currently-playing item is stopped only if unlocked. Runs on the
+     * main thread (called from onStartCommand).
+     */
+    private void clearUnlockedQueues() {
+        int droppedAudio = 0;
+        int droppedTts = 0;
+        boolean stoppedCurrent = false;
+
+        // Currently playing MP3 — stop only if unlocked.
+        if (playing && currentAudioPath != null
+                && !MessageHistory.isAudioLocked(currentAudioPath)) {
+            log("clear-unlocked: stopping unlocked playing audio");
+            ttsPauseRequested = false;
+            releasePlayer();
+            playing = false;
+            isPlayingAudio = false;
+            setPlayingAudio(false);
+            stoppedCurrent = true;
+        }
+        // Currently speaking TTS — stop only if unlocked.
+        if (ttsSpeaking && ttsCurrentText != null
+                && !MessageHistory.isTextLocked(ttsCurrentText)) {
+            log("clear-unlocked: stopping unlocked TTS");
+            ttsPauseRequested = false;
+            try {
+                if (tts != null) tts.stop();
+            } catch (Exception e) {
+                log("clear-unlocked: tts.stop failed: " + e.getMessage());
+            }
+            ttsSpeaking = false;
+            ttsPaused = false;
+            ttsCurrentText = null;
+            ttsResumeAtChar = 0;
+            stoppedCurrent = true;
+        }
+
+        // Queued-but-unplayed audio: keep locked, drop the rest.
+        // Locked files stay (their history entries are locked); unlocked
+        // files are deleted unless another entry still references them
+        // (v1.28 replay-cache rule).
+        synchronized (audioQueue) {
+            java.util.Queue<java.io.File> kept = new java.util.LinkedList<>();
+            java.io.File f;
+            while ((f = audioQueue.poll()) != null) {
+                String path = f.getAbsolutePath();
+                if (MessageHistory.isAudioLocked(path)) {
+                    kept.add(f);
+                } else {
+                    droppedAudio++;
+                    if (!MessageHistory.isAudioReferenced(path)) {
+                        //noinspection ResultOfMethodCallIgnored
+                        f.delete();
+                    }
+                }
+            }
+            audioQueue.addAll(kept);
+        }
+        // Queued-but-unspoken TTS texts: keep locked, drop the rest.
+        synchronized (ttsQueue) {
+            java.util.Queue<String> kept = new java.util.LinkedList<>();
+            String t;
+            while ((t = ttsQueue.poll()) != null) {
+                if (MessageHistory.isTextLocked(t)) {
+                    kept.add(t);
+                } else {
+                    droppedTts++;
+                }
+            }
+            ttsQueue.addAll(kept);
+        }
+
+        broadcastPlaybackState();
+        // Pump in case a locked item is now at the head.
+        pumpAudioQueue();
+        pumpTtsQueue();
+        log("clear-unlocked: dropped audio=" + droppedAudio
+                + " tts=" + droppedTts + " stoppedCurrent=" + stoppedCurrent);
+    }
+
+    /** Worker thread: fetch the queue, play the newest message. */
+    private void doSkipToNewestWork() {
+        HttpURLConnection conn = null;
+        try {
+            // since=0 returns the full queue; we take the newest by
+            // created_at. (v1.15's fresh-install lesson doesn't apply —
+            // we play exactly one message, never the history.)
+            String urlStr = BASE_URL + "/api/selena-voice/queue?since=0";
+            conn = (HttpURLConnection) new URL(urlStr).openConnection();
+            conn.setConnectTimeout(8000);
+            conn.setReadTimeout(8000);
+            int code = conn.getResponseCode();
+            log("skip: HTTP " + code);
+            if (code != 200) {
+                log("skip: failed, HTTP " + code);
+                toast("Skip failed");
+                return;
+            }
+            String body = readAll(conn.getInputStream());
+            JSONArray arr;
+            try {
+                String trimmed = body.trim();
+                if (trimmed.startsWith("{")) {
+                    JSONObject obj = new JSONObject(trimmed);
+                    arr = obj.optJSONArray("messages");
+                    if (arr == null) arr = new JSONArray();
+                } else {
+                    arr = new JSONArray(trimmed);
+                }
+            } catch (Exception e) {
+                log("skip: JSON parse failed: " + e);
+                toast("Skip failed");
+                return;
+            }
+            if (arr.length() == 0) {
+                log("skip: queue empty");
+                toast("No newer messages");
+                return;
+            }
+            // Newest by created_at (v1.30: parseTimestamp handles the
+            // server's formats; unparseable rows sort to the bottom).
+            JSONObject newest = null;
+            long newestTs = Long.MIN_VALUE;
+            for (int i = 0; i < arr.length(); i++) {
+                JSONObject m = arr.getJSONObject(i);
+                long ts = parseTimestamp(m);
+                if (ts >= newestTs) {
+                    newestTs = ts;
+                    newest = m;
+                }
+            }
+            if (newest == null) {
+                toast("No newer messages");
+                return;
+            }
+            String text = newest.optString("text", "");
+            if (text.isEmpty()) {
+                log("skip: newest message has no text");
+                toast("No newer messages");
+                return;
+            }
+            log("skip: newest=\"" + text.substring(0, Math.min(40, text.length())) + "…\"");
+            // Bypass the spokenTexts dedupe — the newest message was
+            // likely already consumed (it's why we're skipping to it);
+            // without this, handleQueueMessage would drop it silently.
+            synchronized (spokenTexts) {
+                spokenTexts.remove(text);
+            }
+            long maxTs = handleQueueMessage(newest, getLastTs());
+            // Advance the cursor past the newest so the next regular
+            // poll doesn't refetch it (v1.18 rule: strict greater-than).
+            long since = getLastTs();
+            long newTs = maxTs > since ? maxTs + 1 : since;
+            if (newestTs >= newTs) newTs = newestTs + 1;
+            setLastTs(newTs);
+            log("skip: playing newest, cursor -> " + newTs);
+        } catch (Exception e) {
+            log("skip: exception: " + e);
+            toast("Skip failed");
+        } finally {
+            if (conn != null) conn.disconnect();
+        }
     }
 
     /** isPlaying() without the IllegalStateException landmine. */
