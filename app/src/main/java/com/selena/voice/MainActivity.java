@@ -77,7 +77,8 @@ public class MainActivity extends Activity {
     /** Called by MessageReceiver when Selena has a new voice message. */
     public void onSelenaMessage(String text) {
         // Nick 2026-10-21 v1.24: history is the UI now; re-render.
-        renderHistory();
+        // Nick 2026-10-22 v1.26: new message — scroll to it.
+        renderHistory(true);
     }
 
     /** Called by MessageReceiver when Nick's voice input was accepted. */
@@ -147,6 +148,9 @@ public class MainActivity extends Activity {
         pulseDot = findViewById(R.id.pulseDot);
         micButton = findViewById(R.id.micButton);
         pauseButton = findViewById(R.id.pauseButton);
+        // Nick 2026-10-22 v1.26: starts greyed out — nothing to pause yet.
+        // Playback-state broadcasts enable it while audio plays/pauses.
+        pauseButton.setEnabled(false);
 
         // Nick 2026-10-21: pause/resume button for playback. Toggles between
         // PAUSE_PLAYBACK and RESUME_PLAYBACK intents. Visibility driven by
@@ -351,7 +355,7 @@ public class MainActivity extends Activity {
 
     // Nick 2026-10-21 v1.24: render persistent message history with
     // replay + lock buttons. Called on resume and when new messages arrive.
-    private void renderHistory() {
+    private void renderHistory(boolean scrollToNewest) {
         runOnUiThread(() -> {
             messageList.removeAllViews();
             java.util.List<MessageHistory.Entry> entries = MessageHistory.getAll();
@@ -367,15 +371,23 @@ public class MainActivity extends Activity {
             for (MessageHistory.Entry e : entries) {
                 messageList.addView(buildMessageCard(e));
             }
-            logScroll.post(() -> logScroll.fullScroll(android.view.View.FOCUS_DOWN));
+            // Nick 2026-10-22 v1.26: only jump to the newest message when a
+            // NEW message arrives — never on lock toggles or resume.
+            if (scrollToNewest) {
+                logScroll.post(() -> logScroll.fullScroll(android.view.View.FOCUS_DOWN));
+            }
         });
+    }
+
+    private void renderHistory() {
+        renderHistory(false);
     }
 
     private android.view.View buildMessageCard(MessageHistory.Entry e) {
         android.widget.LinearLayout card = new android.widget.LinearLayout(this);
         card.setOrientation(android.widget.LinearLayout.VERTICAL);
         card.setPadding(12, 12, 12, 12);
-        card.setBackgroundColor(0xFFF5F5F5);
+        card.setBackgroundColor(e.locked ? 0xFFFFF3D6 : 0xFFF5F5F5);
         android.widget.LinearLayout.LayoutParams cp =
             new android.widget.LinearLayout.LayoutParams(
                 android.widget.LinearLayout.LayoutParams.MATCH_PARENT,
@@ -406,9 +418,9 @@ public class MainActivity extends Activity {
         ts.setLayoutParams(tsp);
         row.addView(ts);
 
-        // Lock toggle
+        // Lock toggle — Nick 2026-10-22 v1.26: explicit words, not just emoji.
         android.widget.Button lockBtn = new android.widget.Button(this);
-        lockBtn.setText(e.locked ? "🔒" : "🔓");
+        lockBtn.setText(e.locked ? "🔒 LOCKED" : "🔓 Lock");
         lockBtn.setOnClickListener(v -> {
             MessageHistory.setLocked(e.id, !e.locked);
             renderHistory();

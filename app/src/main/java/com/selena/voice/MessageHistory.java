@@ -54,9 +54,10 @@ public class MessageHistory {
         Entry e = new Entry(id, text,
             audioFile != null ? audioFile.getAbsolutePath() : null,
             System.currentTimeMillis(), false);
-        entries.add(0, e);
+        // Nick 2026-10-22 v1.26: chat order — newest at the bottom.
+        entries.add(e);
         while (entries.size() > MAX_ENTRIES) {
-            Entry removed = entries.remove(entries.size() - 1);
+            Entry removed = entries.remove(0);
             deleteAudioFile(removed);
         }
         save();
@@ -131,6 +132,12 @@ public class MessageHistory {
                     o.isNull("audioPath") ? null : o.getString("audioPath"),
                     o.getLong("timestamp"),
                     o.optBoolean("locked", false)));
+            }
+            // Nick 2026-10-22 v1.26: v1.24/v1.25 saved newest-first.
+            // Detect by timestamp order; flip only when needed.
+            if (entries.size() >= 2
+                    && entries.get(0).timestamp > entries.get(entries.size() - 1).timestamp) {
+                java.util.Collections.reverse(entries);
             }
         } catch (Exception e) {
             Log.w(TAG, "history: load failed", e);
