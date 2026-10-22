@@ -1418,7 +1418,19 @@ public class VoiceService extends Service
     private void toast(String msg) {
         Intent i = new Intent(ACTION_TOAST);
         i.putExtra(EXTRA_TOAST, msg);
-        sendBroadcast(i);
+        sendAppBroadcast(i);
+    }
+
+    /**
+     * Nick 2026-10-22 v1.31: explicit package on all broadcasts. Implicit
+     * broadcasts from the service were not reaching the activity's
+     * dynamically-registered receiver (confirmed by "Poll: not started"
+     * stuck on screen and missing pause toasts/labels on v1.28-1.30).
+     * Setting the package makes delivery explicit and robust.
+     */
+    private void sendAppBroadcast(Intent i) {
+        i.setPackage(getPackageName());
+        sendAppBroadcast(i);
     }
 
     private void broadcastPlaybackState() {
@@ -1426,7 +1438,7 @@ public class VoiceService extends Service
         boolean mp3Playing = safeIsPlaying();
         i.putExtra("playing", mp3Playing || ttsSpeaking);
         i.putExtra("paused", playbackPaused || ttsPaused);
-        sendBroadcast(i);
+        sendAppBroadcast(i);
     }
 
     private void requestAudioFocus() {
@@ -1712,7 +1724,7 @@ public class VoiceService extends Service
         lastPollStatus = status;
         Intent i = new Intent(ACTION_POLL_STATUS);
         i.putExtra(EXTRA_POLL_STATUS, status);
-        sendBroadcast(i);
+        sendAppBroadcast(i);
     }
 
     /** Tolerant timestamp parse: epoch millis (long) or ISO-8601 string. */
@@ -1748,13 +1760,13 @@ public class VoiceService extends Service
     private void broadcastMessage(String text) {
         Intent i = new Intent(ACTION_MESSAGE);
         i.putExtra(EXTRA_TEXT, text);
-        sendBroadcast(i);
+        sendAppBroadcast(i);
     }
 
     private void broadcastListeningState() {
         Intent i = new Intent(ACTION_LISTENING_STATE);
         i.putExtra(EXTRA_STATE, recognizerActive);
-        sendBroadcast(i);
+        sendAppBroadcast(i);
     }
 
     private long getLastTs() {
