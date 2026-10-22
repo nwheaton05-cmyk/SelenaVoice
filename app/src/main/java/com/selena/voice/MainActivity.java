@@ -108,18 +108,28 @@ public class MainActivity extends Activity {
     }
 
     /**
-     * Nick 2026-10-21/22: playback pause button state. v1.25: the button is
-     * always visible, enabled only while audio is playing or paused.
-     * Label toggles ⏸️/▶️.
+     * Nick 2026-10-21/22: playback pause button state. v1.28: the button is
+     * ALWAYS enabled — a tap always reaches the service, which toasts what
+     * it did ("Paused" / "Nothing playing to pause"). Label toggles ⏸️/▶️.
      */
     public void onPlaybackState(boolean playing, boolean paused) {
         playbackPaused = paused;
         runOnUiThread(() -> {
-            // Nick 2026-10-22 v1.25: the button is always visible now —
-            // enabled only while there's something to pause/resume.
+            // Nick 2026-10-22 v1.28: always enabled — the service decides
+            // and reports back via toast.
             pauseButton.setVisibility(android.view.View.VISIBLE);
-            pauseButton.setEnabled(playing || paused);
+            pauseButton.setEnabled(true);
             pauseButton.setText(paused ? "▶️ Resume" : "⏸️ Pause");
+        });
+    }
+
+    /** Nick 2026-10-22 v1.28: service feedback toasts (pause/resume). */
+    public void onToast(String msg) {
+        runOnUiThread(() -> {
+            try {
+                android.widget.Toast.makeText(this, msg,
+                        android.widget.Toast.LENGTH_SHORT).show();
+            } catch (Exception ignored) {}
         });
     }
 
@@ -148,16 +158,16 @@ public class MainActivity extends Activity {
         pulseDot = findViewById(R.id.pulseDot);
         micButton = findViewById(R.id.micButton);
         pauseButton = findViewById(R.id.pauseButton);
-        // Nick 2026-10-22 v1.26: starts greyed out — nothing to pause yet.
-        // Playback-state broadcasts enable it while audio plays/pauses.
-        pauseButton.setEnabled(false);
+        // Nick 2026-10-22 v1.28: always enabled from launch — a tap always
+        // reaches the service, which toasts what it did.
+        pauseButton.setEnabled(true);
 
-        // Nick 2026-10-21: pause/resume button for playback. Toggles between
-        // PAUSE_PLAYBACK and RESUME_PLAYBACK intents. Visibility driven by
-        // the service's ACTION_PLAYBACK_STATE broadcasts.
+        // Nick 2026-10-21: pause/resume button for playback. v1.28: every
+        // tap sends the toggle — the SERVICE decides pause vs resume from
+        // live state, so a stale button label can never send the wrong one.
         pauseButton.setOnClickListener(v -> {
             Intent i = new Intent(this, VoiceService.class);
-            i.setAction(playbackPaused ? "RESUME_PLAYBACK" : "PAUSE_PLAYBACK");
+            i.setAction("PAUSE_PLAYBACK");
             startForegroundService(i);
         });
 
@@ -321,6 +331,7 @@ public class MainActivity extends Activity {
         f.addAction(VoiceService.ACTION_LISTENING_STATE);
         f.addAction(VoiceService.ACTION_POLL_STATUS);
         f.addAction(VoiceService.ACTION_PLAYBACK_STATE);
+        f.addAction(VoiceService.ACTION_TOAST);
         if (Build.VERSION.SDK_INT >= 33) {
             registerReceiver(receiver, f, Context.RECEIVER_NOT_EXPORTED);
         } else {

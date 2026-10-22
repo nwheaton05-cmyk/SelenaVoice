@@ -79,6 +79,10 @@ public class VoiceService extends Service
     public static final String ACTION_POLL_STATUS = "com.selena.voice.POLL_STATUS";
     // Nick 2026-10-21: playback pause/resume state for the pause button.
     public static final String ACTION_PLAYBACK_STATE = "com.selena.voice.PLAYBACK_STATE";
+    // Nick 2026-10-22 v1.28: short user-facing feedback ("Paused",
+    // "Nothing playing to pause") so a tap never silently dies.
+    public static final String ACTION_TOAST = "com.selena.voice.TOAST";
+    public static final String EXTRA_TOAST = "toast_text";
     // Nick 2026-10-21 v1.24: replay a cached message MP3 from the UI.
     public static final String ACTION_REPLAY = "com.selena.voice.REPLAY";
     public static final String ACTION_REQUEST_STATUS = "com.selena.voice.REQUEST_STATUS";
@@ -293,12 +297,21 @@ public class VoiceService extends Service
                 if (recognizerActive) stopContinuousListening();
                 else broadcastListeningState();
             } else if ("PAUSE_PLAYBACK".equals(intent.getAction())) {
-                // Nick 2026-10-21: pause button — halts the current MP3,
+                // Nick 2026-10-21: pause button — halts the current audio,
                 // keeps the position so resume picks up where it left off.
-                pausePlayback();
+                // v1.28: log receipt — a tap must never vanish silently.
+                // v1.28: TOGGLE — if already paused, the tap resumes. The
+                // activity's label can go stale (missed broadcast); the
+                // service is the source of truth.
+                log("intent: PAUSE_PLAYBACK received");
+                if (ttsPaused || playbackPaused) resumePlayback();
+                else pausePlayback();
             } else if ("RESUME_PLAYBACK".equals(intent.getAction())) {
                 // Nick 2026-10-21: resume from the paused position.
-                resumePlayback();
+                // v1.28: alias for the toggle above.
+                log("intent: RESUME_PLAYBACK received");
+                if (ttsPaused || playbackPaused) resumePlayback();
+                else pausePlayback();
             } else if (ACTION_REQUEST_STATUS.equals(intent.getAction())) {
                 // Nick 2026-10-22 v1.25: activity re-opened — send it the
                 // current state instead of leaving stale layout defaults.
@@ -1249,31 +1262,42 @@ public class VoiceService extends Service
     private boolean playbackPaused = false;
 
     private void pausePlayback() {
-        // MP3 path (Aria/quality mode).
-        if (player != null && player.isPlaying()) {
+        // Nick 2026-10-22 v1.28: UNCONDITIONAL pause — works in phone
+        // (on-device TTS) mode, Aria (MP3) mode, whatever is playing.
+        // Every tap logs what it found and toasts the outcome, so a tap
+        // can never silently die again.
+        boolean mp3Playing = safeIsPlaying();
+        log("pause: requested mp3Playing=" + mp3Playing
+                + " ttsSpeaking=" + ttsSpeaking
+                + " ttsPaused=" + ttsPaused
+                + " mp3Paused=" + playbackPaused);
+        boolean didPause = false;
+        // MP3 path (Aria/quality mode, replays).
+        if (player != null) {
             try {
-                player.pause();
-                playbackPaused = true;
-                log("playback: paused at " + player.getCurrentPosition() + "ms");
-                broadcastPlaybackState();
+                if (player.isPlaying()) {
+                    player.pause();
+                    playbackPaused = true;
+                    didPause = true;
+                    log("playback: paused at " + safePosition() + "ms");
+                }
             } catch (Exception e) {
                 log("playback: pause failed: " + e.getMessage());
             }
-            return;
         }
-        // Nick 2026-10-22 v1.27: phone (on-device TTS) path. Android TTS
-        // has no pause API — stop() it and resume from the last word
-        // boundary tracked via onRangeStart. onTtsStopped confirms the
-        // stop; the watchdog below covers engines that never call onStop.
+        // Phone (on-device TTS) path — TTS has no pause API; stop() it and
+        // resume from the last word boundary tracked via onRangeStart.
+        // onTtsStopped confirms the stop; the watchdog covers engines that
+        // never call onStop.
         if (ttsSpeaking && tts != null && !ttsPaused) {
             ttsPauseRequested = true;
             try {
                 tts.stop();
                 log("tts: pause requested");
+                didPause = true;
             } catch (Exception e) {
                 ttsPauseRequested = false;
                 log("tts: pause failed: " + e.getMessage());
-                return;
             }
             handler.postDelayed(() -> {
                 if (ttsPauseRequested) {
@@ -1287,23 +1311,32 @@ public class VoiceService extends Service
                 }
             }, 1500);
         }
+        if (didPause) {
+            toast("Paused");
+        } else {
+            log("pause: nothing was playing");
+            toast("Nothing playing to pause");
+        }
+        broadcastPlaybackState();
     }
 
     private void resumePlayback() {
-        // MP3 path (Aria/quality mode).
+        log("resume: requested ttsPaused=" + ttsPaused
+                + " mp3Paused=" + playbackPaused);
+        boolean didResume = false;
+        // MP3 path (Aria/quality mode, replays).
         if (player != null && playbackPaused) {
             try {
                 player.start();
                 playbackPaused = false;
-                log("playback: resumed at " + player.getCurrentPosition() + "ms");
-                broadcastPlaybackState();
+                didResume = true;
+                log("playback: resumed at " + safePosition() + "ms");
             } catch (Exception e) {
                 log("playback: resume failed: " + e.getMessage());
             }
-            return;
         }
-        // Nick 2026-10-22 v1.27: phone (on-device TTS) path — re-speak
-        // from the last word boundary before the pause.
+        // Phone (on-device TTS) path — re-speak from the last word
+        // boundary before the pause.
         if (ttsPaused && ttsCurrentText != null) {
             ttsPaused = false;
             String rest = ttsCurrentText.substring(
@@ -1312,17 +1345,50 @@ public class VoiceService extends Service
                 // Paused at the very end — nothing left to say.
                 ttsCurrentText = null;
                 onTtsDone();
-                return;
+            } else {
+                ttsSpeaking = true;
+                log("tts: resuming from char " + ttsResumeAtChar);
+                speakOnDevice(rest, true);
+                didResume = true;
             }
-            ttsSpeaking = true;
-            log("tts: resuming from char " + ttsResumeAtChar);
-            speakOnDevice(rest, true);
         }
+        if (didResume) {
+            toast("Resumed");
+        } else {
+            log("resume: nothing was paused");
+            toast("Nothing paused");
+        }
+        broadcastPlaybackState();
+    }
+
+    /** isPlaying() without the IllegalStateException landmine. */
+    private boolean safeIsPlaying() {
+        try {
+            return player != null && player.isPlaying();
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    /** getCurrentPosition() without the IllegalStateException landmine. */
+    private int safePosition() {
+        try {
+            return player != null ? player.getCurrentPosition() : 0;
+        } catch (Exception e) {
+            return 0;
+        }
+    }
+
+    /** User-visible one-line feedback for pause/resume taps. */
+    private void toast(String msg) {
+        Intent i = new Intent(ACTION_TOAST);
+        i.putExtra(EXTRA_TOAST, msg);
+        sendBroadcast(i);
     }
 
     private void broadcastPlaybackState() {
         Intent i = new Intent(ACTION_PLAYBACK_STATE);
-        boolean mp3Playing = player != null && player.isPlaying();
+        boolean mp3Playing = safeIsPlaying();
         i.putExtra("playing", mp3Playing || ttsSpeaking);
         i.putExtra("paused", playbackPaused || ttsPaused);
         sendBroadcast(i);

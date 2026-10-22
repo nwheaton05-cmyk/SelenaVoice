@@ -34,6 +34,10 @@ public class MessageReceiver extends BroadcastReceiver {
             activity.onPlaybackState(
                 intent.getBooleanExtra("playing", false),
                 intent.getBooleanExtra("paused", false));
+        } else if (action.equals(VoiceService.ACTION_TOAST)) {
+            // Nick 2026-10-22 v1.28: pause/resume feedback.
+            String msg = intent.getStringExtra(VoiceService.EXTRA_TOAST);
+            if (msg != null) activity.onToast(msg);
         }
     }
 }
