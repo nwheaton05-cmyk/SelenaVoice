@@ -555,9 +555,12 @@ public class VoiceService extends Service
             long rowTs = parseRowTimestamp(record.optString("created_at", ""));
             m.put("timestamp", rowTs > 0 ? rowTs : System.currentTimeMillis());
             long beforeTs = getLastTs();
-            handleQueueMessage(m, beforeTs);
-            if (rowTs > beforeTs) {
-                setLastTs(rowTs + 1);
+            // v1.30: advance the cursor only past CONSUMED messages.
+            // handleQueueMessage returns beforeTs unchanged when it skips
+            // (e.g. invalid URL), so a fixed row is retried, not stranded.
+            long newTs = handleQueueMessage(m, beforeTs);
+            if (newTs > beforeTs) {
+                setLastTs(newTs + 1);
             }
         } catch (Exception e) {
             log("rt: push handling failed: " + e);
@@ -720,7 +723,13 @@ public class VoiceService extends Service
         // into a doomed download of URL "null". isNull() handles it.
         String audioUrl = m.isNull("audioUrl") ? "" : m.optString("audioUrl", "");
         log("audio: audioUrl='" + audioUrl + "'");
-        if (ts > maxTs) maxTs = ts;
+        // Nick 2026-10-22 v1.30: the cursor only advances past messages we
+        // actually consume. A message skipped for an invalid/unplayable URL
+        // is NOT consumed — the old unconditional advance stranded it when
+        // the URL was fixed later (rhinoceros test 08:36: cursor jumped past
+        // a $AUDIOURL placeholder row, the fixed row never played). An
+        // unconsumed message is refetched until it's playable.
+        boolean consumed = false;
         // Nick 2026-10-18 v1.13: two-phase server delivery dedupe.
         // The server queues TEXT immediately, then queues the SAME
         // text with an MP3 audioUrl seconds later when TTS finishes.
@@ -730,11 +739,13 @@ public class VoiceService extends Service
         // mode holding a text-only message must NOT consume the
         // entry the MP3 version still needs.
         if (text.isEmpty()) {
+            if (ts > maxTs) maxTs = ts;
             return maxTs;
         }
         synchronized (spokenTexts) {
             if (spokenTexts.contains(text)) {
                 log("dedupe: skipping duplicate text");
+                if (ts > maxTs) maxTs = ts;
                 return maxTs;
             }
             // Nick 2026-10-19 v1.17: no-auto-readout toggle. The message
@@ -747,6 +758,7 @@ public class VoiceService extends Service
                 broadcastMessage(text);
                 MessageHistory.add(text, null);
                 log("readout skipped (no-auto-readout on)");
+                if (ts > maxTs) maxTs = ts;
                 return maxTs;
             }
             if (isPhoneVoiceMode()) {
@@ -774,10 +786,13 @@ public class VoiceService extends Service
                         }
                     }).start();
                 }
+                consumed = true;
             } else if (!audioUrl.isEmpty()) {
                 // ARIA QUALITY MODE. Download and play the server's MP3.
                 if (!audioUrl.startsWith("http")) {
                     log("audio: skipping invalid URL: " + audioUrl);
+                    // v1.30: NOT consumed — the cursor holds so a fixed URL
+                    // is retried instead of stranded.
                 } else {
                     // Playback is strictly queue-only: only Selena's
                     // replies (with server-generated audioUrl MP3s) are
@@ -795,6 +810,7 @@ public class VoiceService extends Service
                     } catch (Exception e) {
                         log("audio download failed: " + audioUrl + ": " + e);
                     }
+                    consumed = true;
                 }
             } else {
                 // Aria quality mode with no audioUrl yet — the Aria MP3
@@ -803,8 +819,10 @@ public class VoiceService extends Service
                 // here; the MP3 phase will mark it when it plays.
                 broadcastMessage(text);
                 log("tts: text-only message held for Aria MP3 (quality mode)");
+                consumed = true;
             }
         }
+        if (consumed && ts > maxTs) maxTs = ts;
         return maxTs;
     }
 
