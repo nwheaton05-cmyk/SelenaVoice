@@ -208,6 +208,13 @@ public class VoiceService extends Service
     private boolean ttsReady = false;
     private final Queue<String> ttsQueue = new LinkedList<>();
     private boolean ttsSpeaking = false;
+    // Nick 2026-10-22 v1.27: pause/resume for phone (on-device TTS) mode.
+    // Android TTS has no pause API — pause = tts.stop(), resume = re-speak
+    // from the last word boundary reported by onRangeStart.
+    private String ttsCurrentText = null;
+    private int ttsResumeAtChar = 0;
+    private boolean ttsPaused = false;
+    private boolean ttsPauseRequested = false;
     // Nick 2026-10-18 v1.13: dedupe set for two-phase server delivery.
     // The server queues TEXT immediately, then queues the SAME text with an
     // MP3 audioUrl seconds later. Texts are added only when actually
@@ -1086,6 +1093,48 @@ public class VoiceService extends Service
         handler.post(this::onTtsDone);
     }
 
+    @Override
+    public void onTtsRangeStart(int startChar) {
+        // Binder thread — just record the offset; the main thread reads it
+        // on pause. Snap back to the nearest word start so resume never
+        // begins mid-word.
+        final String text = ttsCurrentText;
+        final int at = startChar;
+        handler.post(() -> {
+            if (text != null && text == ttsCurrentText) {
+                ttsResumeAtChar = snapToWordStart(text, at);
+            }
+        });
+    }
+
+    @Override
+    public void onTtsStopped() {
+        // Binder thread — marshal to main thread.
+        handler.post(() -> {
+            if (!ttsPauseRequested) {
+                // Not our pause (shouldn't happen) — treat as finished.
+                onTtsDone();
+                return;
+            }
+            ttsPauseRequested = false;
+            ttsSpeaking = false;
+            // Mic can listen again while paused; the boost/focus stays so
+            // resume is instant.
+            setPlayingAudio(false);
+            log("tts: paused at char " + ttsResumeAtChar + " of "
+                    + (ttsCurrentText != null ? ttsCurrentText.length() : 0));
+            broadcastPlaybackState();
+        });
+    }
+
+    /** Snap a character offset back to the start of its word. */
+    private int snapToWordStart(String text, int at) {
+        if (text == null) return 0;
+        int i = Math.max(0, Math.min(at, text.length()));
+        while (i > 0 && !Character.isWhitespace(text.charAt(i - 1))) i--;
+        return i;
+    }
+
     /** Runs on main thread: queue text for on-device speech. */
     private void enqueueTts(String text) {
         synchronized (ttsQueue) {
@@ -1096,23 +1145,31 @@ public class VoiceService extends Service
 
     /** Runs on main thread: speak the next queued text if nothing is playing. */
     private void pumpTtsQueue() {
-        if (ttsSpeaking || playing) return;
+        // Nick 2026-10-22 v1.27: ttsPaused blocks the pump — a paused
+        // message holds its place until resume.
+        if (ttsSpeaking || playing || ttsPaused) return;
         String text;
         synchronized (ttsQueue) {
             text = ttsQueue.poll();
         }
         if (text == null) return;
         ttsSpeaking = true;
-        speakOnDevice(text);
+        speakOnDevice(text, false);
     }
 
     /** Runs on main thread: speak text with Android's built-in TTS. */
     @SuppressWarnings("deprecation") // setSpeakerphoneOn, see playFileNow
-    private void speakOnDevice(String text) {
+    private void speakOnDevice(String text, boolean isResume) {
         if (tts == null || !ttsReady) {
             log("tts: on-device not ready, dropping text");
             onTtsDone();
             return;
+        }
+        if (!isResume) {
+            // Fresh utterance — this is the text pause/resume tracks.
+            ttsCurrentText = text;
+            ttsResumeAtChar = 0;
+            ttsPaused = false;
         }
         String preview = text.length() > 30 ? text.substring(0, 30) + "…" : text;
         log("tts: on-device speak '" + preview + "'");
@@ -1130,6 +1187,7 @@ public class VoiceService extends Service
         boostMusicVolume();
         isPlayingAudio = true;
         log("tts: echo guard on");
+        broadcastPlaybackState();
         try {
             // minSdk is 26, so the API-21+ speak() with utterance ID is
             // always available.
@@ -1156,11 +1214,15 @@ public class VoiceService extends Service
         abandonAudioFocus();
         restoreMusicVolume(); // Nick 2026-10-19 v1.17: undo the speech boost
         ttsSpeaking = false;
+        ttsPaused = false;
+        ttsCurrentText = null;
+        ttsResumeAtChar = 0;
         isPlayingAudio = false;
         // Put the speakerphone back the way we found it, same as MP3.
         // No-op when Bluetooth handled the routing.
         restoreAudioRouting();
         log("tts: echo guard off");
+        broadcastPlaybackState();
         pumpTtsQueue();
         pumpAudioQueue();
     }
@@ -1187,6 +1249,7 @@ public class VoiceService extends Service
     private boolean playbackPaused = false;
 
     private void pausePlayback() {
+        // MP3 path (Aria/quality mode).
         if (player != null && player.isPlaying()) {
             try {
                 player.pause();
@@ -1196,10 +1259,38 @@ public class VoiceService extends Service
             } catch (Exception e) {
                 log("playback: pause failed: " + e.getMessage());
             }
+            return;
+        }
+        // Nick 2026-10-22 v1.27: phone (on-device TTS) path. Android TTS
+        // has no pause API — stop() it and resume from the last word
+        // boundary tracked via onRangeStart. onTtsStopped confirms the
+        // stop; the watchdog below covers engines that never call onStop.
+        if (ttsSpeaking && tts != null && !ttsPaused) {
+            ttsPauseRequested = true;
+            try {
+                tts.stop();
+                log("tts: pause requested");
+            } catch (Exception e) {
+                ttsPauseRequested = false;
+                log("tts: pause failed: " + e.getMessage());
+                return;
+            }
+            handler.postDelayed(() -> {
+                if (ttsPauseRequested) {
+                    ttsPauseRequested = false;
+                    ttsSpeaking = false;
+                    ttsPaused = true;
+                    setPlayingAudio(false);
+                    log("tts: paused (watchdog, no onStop) at char "
+                            + ttsResumeAtChar);
+                    broadcastPlaybackState();
+                }
+            }, 1500);
         }
     }
 
     private void resumePlayback() {
+        // MP3 path (Aria/quality mode).
         if (player != null && playbackPaused) {
             try {
                 player.start();
@@ -1209,13 +1300,31 @@ public class VoiceService extends Service
             } catch (Exception e) {
                 log("playback: resume failed: " + e.getMessage());
             }
+            return;
+        }
+        // Nick 2026-10-22 v1.27: phone (on-device TTS) path — re-speak
+        // from the last word boundary before the pause.
+        if (ttsPaused && ttsCurrentText != null) {
+            ttsPaused = false;
+            String rest = ttsCurrentText.substring(
+                    Math.min(ttsResumeAtChar, ttsCurrentText.length()));
+            if (rest.trim().isEmpty()) {
+                // Paused at the very end — nothing left to say.
+                ttsCurrentText = null;
+                onTtsDone();
+                return;
+            }
+            ttsSpeaking = true;
+            log("tts: resuming from char " + ttsResumeAtChar);
+            speakOnDevice(rest, true);
         }
     }
 
     private void broadcastPlaybackState() {
         Intent i = new Intent(ACTION_PLAYBACK_STATE);
-        i.putExtra("playing", player != null && player.isPlaying());
-        i.putExtra("paused", playbackPaused);
+        boolean mp3Playing = player != null && player.isPlaying();
+        i.putExtra("playing", mp3Playing || ttsSpeaking);
+        i.putExtra("paused", playbackPaused || ttsPaused);
         sendBroadcast(i);
     }
 
