@@ -116,6 +116,19 @@ public class MessageHistory {
         }
     }
 
+    /**
+     * Nick 2026-10-22 v1.28: true when a message card still points at this
+     * MP3 for replay. Playback cleanup must not delete referenced files —
+     * that was killing replay after the first play (v1.24 replay cache).
+     */
+    public static synchronized boolean isAudioReferenced(String absPath) {
+        if (absPath == null) return false;
+        for (Entry e : entries) {
+            if (absPath.equals(e.audioPath)) return true;
+        }
+        return false;
+    }
+
     private static void load() {
         entries.clear();
         if (appContext == null) return;

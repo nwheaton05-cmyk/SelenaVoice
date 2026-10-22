@@ -319,6 +319,8 @@ public class VoiceService extends Service
                 broadcastPlaybackState();
             } else if (ACTION_REPLAY.equals(intent.getAction())) {
                 // Nick 2026-10-21 v1.24: replay a cached message MP3.
+                // v1.28: toast when the file is gone instead of failing
+                // silently.
                 String path = intent.getStringExtra(EXTRA_FILE_PATH);
                 if (path != null) {
                     java.io.File f = new java.io.File(path);
@@ -327,6 +329,7 @@ public class VoiceService extends Service
                         handler.post(() -> enqueueAudio(f));
                     } else {
                         log("replay: file gone: " + path);
+                        toast("Replay audio expired");
                     }
                 }
             }
@@ -600,8 +603,12 @@ public class VoiceService extends Service
         synchronized (audioQueue) {
             File f;
             while ((f = audioQueue.poll()) != null) {
-                //noinspection ResultOfMethodCallIgnored
-                f.delete();
+                // Nick 2026-10-22 v1.28: keep replay-cached MP3s — only
+                // drop files no message card references.
+                if (!MessageHistory.isAudioReferenced(f.getAbsolutePath())) {
+                    //noinspection ResultOfMethodCallIgnored
+                    f.delete();
+                }
             }
         }
         playing = false;
@@ -1031,8 +1038,18 @@ public class VoiceService extends Service
         restoreAudioRouting();
         log("playback done (echo guard off)");
         if (currentAudioFile != null) {
-            //noinspection ResultOfMethodCallIgnored
-            currentAudioFile.delete();
+            // Nick 2026-10-22 v1.28: DON'T delete MP3s a message card still
+            // references for replay — deleting after every play is what
+            // broke replay after the first listen (v1.24 cache). Unreferenced
+            // one-shot files are still cleaned up; expired entries' MP3s go
+            // via purgeExpired.
+            String path = currentAudioFile.getAbsolutePath();
+            if (MessageHistory.isAudioReferenced(path)) {
+                log("playback: keeping replay-cached file");
+            } else {
+                //noinspection ResultOfMethodCallIgnored
+                currentAudioFile.delete();
+            }
             currentAudioFile = null;
         }
         pumpAudioQueue();
