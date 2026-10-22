@@ -79,6 +79,10 @@ public class VoiceService extends Service
     public static final String ACTION_POLL_STATUS = "com.selena.voice.POLL_STATUS";
     // Nick 2026-10-21: playback pause/resume state for the pause button.
     public static final String ACTION_PLAYBACK_STATE = "com.selena.voice.PLAYBACK_STATE";
+    // Nick 2026-10-21 v1.24: replay a cached message MP3 from the UI.
+    public static final String ACTION_REPLAY = "com.selena.voice.REPLAY";
+    public static final String ACTION_REQUEST_STATUS = "com.selena.voice.REQUEST_STATUS";
+    public static final String EXTRA_FILE_PATH = "file_path";
     public static final String EXTRA_POLL_STATUS = "poll_status";
     public static final String EXTRA_TEXT = "text";
     public static final String EXTRA_STATE = "listening";
@@ -236,6 +240,8 @@ public class VoiceService extends Service
         // uses setWakeMode per-playback.)
         acquireWakeLock();
         initOnDeviceTts();
+        // Nick 2026-10-21 v1.24: persistent 3-day message history.
+        MessageHistory.init(this);
         // Nick 2026-10-19 v1.16: outbound moved back here from MainActivity
         // — the service now works with the screen locked / app backgrounded.
         startPolling();
@@ -286,6 +292,23 @@ public class VoiceService extends Service
             } else if ("RESUME_PLAYBACK".equals(intent.getAction())) {
                 // Nick 2026-10-21: resume from the paused position.
                 resumePlayback();
+            } else if (ACTION_REQUEST_STATUS.equals(intent.getAction())) {
+                // Nick 2026-10-22 v1.25: activity re-opened — send it the
+                // current state instead of leaving stale layout defaults.
+                broadcastPollStatus(lastPollStatus);
+                broadcastPlaybackState();
+            } else if (ACTION_REPLAY.equals(intent.getAction())) {
+                // Nick 2026-10-21 v1.24: replay a cached message MP3.
+                String path = intent.getStringExtra(EXTRA_FILE_PATH);
+                if (path != null) {
+                    java.io.File f = new java.io.File(path);
+                    if (f.exists()) {
+                        log("replay: " + f.getName());
+                        handler.post(() -> enqueueAudio(f));
+                    } else {
+                        log("replay: file gone: " + path);
+                    }
+                }
             }
         }
         return START_STICKY;
@@ -695,18 +718,35 @@ public class VoiceService extends Service
             if (isNoAutoReadout()) {
                 markSpokenLocked(text);
                 broadcastMessage(text);
+                MessageHistory.add(text, null);
                 log("readout skipped (no-auto-readout on)");
                 return maxTs;
             }
             if (isPhoneVoiceMode()) {
                 // SPEED MODE. Phone voice mode speaks the text
-                // IMMEDIATELY with on-device TTS and ignores audioUrl
-                // entirely — no download, no wait for a server Aria MP3.
-                // Mark spoken FIRST so the second (MP3) phase dedupes.
+                // IMMEDIATELY with on-device TTS — no wait for a server
+                // Aria MP3. Mark spoken FIRST so the second (MP3) phase
+                // dedupes.
                 markSpokenLocked(text);
                 broadcastMessage(text);
+                final MessageHistory.Entry histEntry = MessageHistory.add(text, null);
                 final String speakText = text;
                 handler.post(() -> enqueueTts(speakText));
+                // Nick 2026-10-22 v1.25: still fetch the server MP3 in the
+                // background so the message card grows a replay button.
+                if (!audioUrl.isEmpty() && audioUrl.startsWith("http")) {
+                    final String dlUrl = audioUrl;
+                    new Thread(() -> {
+                        try {
+                            File f = downloadToCache(dlUrl);
+                            MessageHistory.setAudioPath(histEntry.id, f);
+                            log("replay cached for phone-mode message");
+                            broadcastMessage(speakText);
+                        } catch (Exception e) {
+                            log("replay cache download failed: " + e.getMessage());
+                        }
+                    }).start();
+                }
             } else if (!audioUrl.isEmpty()) {
                 // ARIA QUALITY MODE. Download and play the server's MP3.
                 if (!audioUrl.startsWith("http")) {
@@ -722,6 +762,8 @@ public class VoiceService extends Service
                     try {
                         File f = downloadToCache(audioUrl);
                         final File df = f;
+                        // Nick 2026-10-21 v1.24: cache for replay.
+                        MessageHistory.add(text, f);
                         handler.post(() -> enqueueAudio(df));
                     } catch (Exception e) {
                         log("audio download failed: " + audioUrl + ": " + e);
@@ -1454,7 +1496,10 @@ public class VoiceService extends Service
 
     // ------------------------------------------------------------ helpers
 
+    private String lastPollStatus = "Poll: not started";
+
     private void broadcastPollStatus(String status) {
+        lastPollStatus = status;
         Intent i = new Intent(ACTION_POLL_STATUS);
         i.putExtra(EXTRA_POLL_STATUS, status);
         sendBroadcast(i);

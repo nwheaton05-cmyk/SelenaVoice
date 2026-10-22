@@ -37,7 +37,7 @@ public class MainActivity extends Activity {
 
     private TextView statusText;
     private TextView pollStatusText;
-    private TextView logText;
+    private android.widget.LinearLayout messageList;
     private ScrollView logScroll;
     private Switch alwaysOnSwitch;
     private View pulseDot;
@@ -76,13 +76,15 @@ public class MainActivity extends Activity {
 
     /** Called by MessageReceiver when Selena has a new voice message. */
     public void onSelenaMessage(String text) {
-        appendLogHtml("Selena", text, COLOR_SELENA);
+        // Nick 2026-10-21 v1.24: history is the UI now; re-render.
+        renderHistory();
     }
 
     /** Called by MessageReceiver when Nick's voice input was accepted. */
     public void onInputSent(String text) {
         VoiceService.log("log: showing Nick's message");
-        appendLogHtml("You", text, COLOR_NICK);
+        // Nick 2026-10-21 v1.24: voice inputs aren't in history; just re-render.
+        renderHistory();
         runOnUiThread(() ->
                 Toast.makeText(this, "Sent to Selena", Toast.LENGTH_SHORT).show());
     }
@@ -105,18 +107,18 @@ public class MainActivity extends Activity {
     }
 
     /**
-     * Nick 2026-10-21: playback pause button state. The button is visible
-     * only while audio is playing or paused. Label toggles ⏸️/▶️.
+     * Nick 2026-10-21/22: playback pause button state. v1.25: the button is
+     * always visible, enabled only while audio is playing or paused.
+     * Label toggles ⏸️/▶️.
      */
     public void onPlaybackState(boolean playing, boolean paused) {
         playbackPaused = paused;
         runOnUiThread(() -> {
-            if (playing || paused) {
-                pauseButton.setVisibility(android.view.View.VISIBLE);
-                pauseButton.setText(paused ? "▶️ Resume" : "⏸️ Pause");
-            } else {
-                pauseButton.setVisibility(android.view.View.GONE);
-            }
+            // Nick 2026-10-22 v1.25: the button is always visible now —
+            // enabled only while there's something to pause/resume.
+            pauseButton.setVisibility(android.view.View.VISIBLE);
+            pauseButton.setEnabled(playing || paused);
+            pauseButton.setText(paused ? "▶️ Resume" : "⏸️ Pause");
         });
     }
 
@@ -129,12 +131,17 @@ public class MainActivity extends Activity {
         pollStatusText = findViewById(R.id.pollStatusText);
         // Nick 2026-10-19 v1.15: show the installed version so we can
         // verify which build is on the phone (kills version-guessing).
+        // Nick 2026-10-21 v1.23: include build date so identical version
+        // names across rebuilds are distinguishable.
         try {
             String vn = getPackageManager()
                     .getPackageInfo(getPackageName(), 0).versionName;
-            ((TextView) findViewById(R.id.versionText)).setText("v" + vn);
+            String buildDate = "2026-10-22";
+            ((TextView) findViewById(R.id.versionText)).setText("v" + vn + " (" + buildDate + ")");
         } catch (Exception ignored) {}
-        logText = findViewById(R.id.logText);
+        // Nick 2026-10-21 v1.24: persistent message history with replay.
+        MessageHistory.init(this);
+        messageList = findViewById(R.id.messageList);
         logScroll = findViewById(R.id.logScroll);
         alwaysOnSwitch = findViewById(R.id.alwaysOnSwitch);
         pulseDot = findViewById(R.id.pulseDot);
@@ -322,6 +329,16 @@ public class MainActivity extends Activity {
         // service was in manual-listen mode, pick up the real state.
         manualMicOn = VoiceService.isManualListening();
         updateMicButton();
+        // Nick 2026-10-21 v1.24: load persistent message history on open
+        // (catches messages that arrived while backgrounded).
+        MessageHistory.purgeExpired();
+        renderHistory();
+        // Nick 2026-10-22 v1.25: pull the service's LIVE status on open —
+        // the layout defaults ("Poll: not started") go stale when broadcasts
+        // fire while backgrounded.
+        Intent statusReq = new Intent(this, VoiceService.class);
+        statusReq.setAction(VoiceService.ACTION_REQUEST_STATUS);
+        startService(statusReq);
     }
 
     @Override
@@ -332,15 +349,90 @@ public class MainActivity extends Activity {
 
     // ------------------------------------------------------------ UI helpers
 
-    private void appendLogHtml(String who, String text, String color) {
-        final CharSequence html = Html.fromHtml(
-                "<font color=\"" + color + "\"><b>" + who + ":</b> "
-                        + TextUtils.htmlEncode(text) + "</font><br><br>",
-                Html.FROM_HTML_MODE_LEGACY);
+    // Nick 2026-10-21 v1.24: render persistent message history with
+    // replay + lock buttons. Called on resume and when new messages arrive.
+    private void renderHistory() {
         runOnUiThread(() -> {
-            logText.append(html);
-            logScroll.post(() -> logScroll.fullScroll(View.FOCUS_DOWN));
+            messageList.removeAllViews();
+            java.util.List<MessageHistory.Entry> entries = MessageHistory.getAll();
+            if (entries.isEmpty()) {
+                android.widget.TextView empty = new android.widget.TextView(this);
+                empty.setText("Waiting for messages…");
+                empty.setTextSize(14);
+                empty.setTextColor(getResources().getColor(R.color.selena_dark));
+                empty.setPadding(12, 12, 12, 12);
+                messageList.addView(empty);
+                return;
+            }
+            for (MessageHistory.Entry e : entries) {
+                messageList.addView(buildMessageCard(e));
+            }
+            logScroll.post(() -> logScroll.fullScroll(android.view.View.FOCUS_DOWN));
         });
+    }
+
+    private android.view.View buildMessageCard(MessageHistory.Entry e) {
+        android.widget.LinearLayout card = new android.widget.LinearLayout(this);
+        card.setOrientation(android.widget.LinearLayout.VERTICAL);
+        card.setPadding(12, 12, 12, 12);
+        card.setBackgroundColor(0xFFF5F5F5);
+        android.widget.LinearLayout.LayoutParams cp =
+            new android.widget.LinearLayout.LayoutParams(
+                android.widget.LinearLayout.LayoutParams.MATCH_PARENT,
+                android.widget.LinearLayout.LayoutParams.WRAP_CONTENT);
+        cp.setMargins(0, 0, 0, 12);
+        card.setLayoutParams(cp);
+
+        android.widget.TextView tv = new android.widget.TextView(this);
+        tv.setText(e.text);
+        tv.setTextSize(14);
+        tv.setTextColor(getResources().getColor(R.color.selena_dark));
+        card.addView(tv);
+
+        // Timestamp + buttons row
+        android.widget.LinearLayout row = new android.widget.LinearLayout(this);
+        row.setOrientation(android.widget.LinearLayout.HORIZONTAL);
+        row.setPadding(0, 8, 0, 0);
+
+        java.text.SimpleDateFormat fmt = new java.text.SimpleDateFormat("M/d h:mm a",
+            java.util.Locale.US);
+        android.widget.TextView ts = new android.widget.TextView(this);
+        ts.setText(fmt.format(new java.util.Date(e.timestamp)));
+        ts.setTextSize(11);
+        ts.setTextColor(0xFF888888);
+        android.widget.LinearLayout.LayoutParams tsp =
+            new android.widget.LinearLayout.LayoutParams(0,
+                android.widget.LinearLayout.LayoutParams.WRAP_CONTENT, 1f);
+        ts.setLayoutParams(tsp);
+        row.addView(ts);
+
+        // Lock toggle
+        android.widget.Button lockBtn = new android.widget.Button(this);
+        lockBtn.setText(e.locked ? "🔒" : "🔓");
+        lockBtn.setOnClickListener(v -> {
+            MessageHistory.setLocked(e.id, !e.locked);
+            renderHistory();
+        });
+        row.addView(lockBtn);
+
+        // Replay button (only if MP3 exists)
+        if (e.audioPath != null) {
+            java.io.File f = new java.io.File(e.audioPath);
+            if (f.exists()) {
+                android.widget.Button replayBtn = new android.widget.Button(this);
+                replayBtn.setText("▶ Replay");
+                replayBtn.setOnClickListener(v -> {
+                    android.content.Intent i = new android.content.Intent(this,
+                        VoiceService.class);
+                    i.setAction(VoiceService.ACTION_REPLAY);
+                    i.putExtra(VoiceService.EXTRA_FILE_PATH, e.audioPath);
+                    startService(i);
+                });
+                row.addView(replayBtn);
+            }
+        }
+        card.addView(row);
+        return card;
     }
 
     private void updateListeningUi(boolean listening) {

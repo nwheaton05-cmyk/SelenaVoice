@@ -90,7 +90,7 @@
         android:layout_gravity="center"
         android:text="⏸️ Pause"
         android:textSize="16sp"
-        android:visibility="gone" />
+        android:visibility="visible" />
 
     <TextView
         android:layout_width="match_parent"
@@ -213,13 +213,11 @@
         android:layout_weight="1"
         android:background="#FFFFFF">
 
-        <TextView
-            android:id="@+id/logText"
+        <LinearLayout
+            android:id="@+id/messageList"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:text="Waiting for messages…\n"
-            android:textSize="14sp"
-            android:textColor="@color/selena_dark"
+            android:orientation="vertical"
             android:padding="12dp" />
     </ScrollView>
 
