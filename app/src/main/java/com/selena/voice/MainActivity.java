@@ -114,6 +114,8 @@ public class MainActivity extends Activity {
      */
     public void onPlaybackState(boolean playing, boolean paused) {
         playbackPaused = paused;
+        // Nick 2026-10-22 v1.29: DIAG — prove the broadcast reached the UI.
+        VoiceService.log("ui: playbackState playing=" + playing + " paused=" + paused);
         runOnUiThread(() -> {
             // Nick 2026-10-22 v1.28: always enabled — the service decides
             // and reports back via toast.
@@ -125,10 +127,13 @@ public class MainActivity extends Activity {
 
     /** Nick 2026-10-22 v1.28: service feedback toasts (pause/resume). */
     public void onToast(String msg) {
+        // Nick 2026-10-22 v1.29: DIAG — prove the toast broadcast arrived.
+        VoiceService.log("ui: toast received: " + msg);
         runOnUiThread(() -> {
             try {
+                // v1.29: LONG so it's harder to miss.
                 android.widget.Toast.makeText(this, msg,
-                        android.widget.Toast.LENGTH_SHORT).show();
+                        android.widget.Toast.LENGTH_LONG).show();
             } catch (Exception ignored) {}
         });
     }
