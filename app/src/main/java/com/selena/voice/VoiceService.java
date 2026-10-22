@@ -1430,7 +1430,7 @@ public class VoiceService extends Service
      */
     private void sendAppBroadcast(Intent i) {
         i.setPackage(getPackageName());
-        sendAppBroadcast(i);
+        sendBroadcast(i);
     }
 
     private void broadcastPlaybackState() {
