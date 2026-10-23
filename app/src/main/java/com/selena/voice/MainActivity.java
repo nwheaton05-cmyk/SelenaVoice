@@ -38,7 +38,9 @@ public class MainActivity extends Activity {
     private TextView statusText;
     private TextView pollStatusText;
     private android.widget.LinearLayout messageList;
-    private ScrollView logScroll;
+    // Nick 2026-10-23 v1.38: was the inner message-box scroller; the box
+    // now flows in the page scroll, so this is the outer ScrollView.
+    private ScrollView outerScroll;
     private Switch alwaysOnSwitch;
     private View pulseDot;
     private ObjectAnimator pulseAnimator;
@@ -178,7 +180,7 @@ public class MainActivity extends Activity {
         // Nick 2026-10-21 v1.24: persistent message history with replay.
         MessageHistory.init(this);
         messageList = findViewById(R.id.messageList);
-        logScroll = findViewById(R.id.logScroll);
+        outerScroll = findViewById(R.id.outerScroll);
         alwaysOnSwitch = findViewById(R.id.alwaysOnSwitch);
         pulseDot = findViewById(R.id.pulseDot);
         micButton = findViewById(R.id.micButton);
@@ -672,7 +674,7 @@ public class MainActivity extends Activity {
             // Nick 2026-10-22 v1.26: only jump to the newest message when a
             // NEW message arrives — never on lock toggles or resume.
             if (scrollToNewest) {
-                logScroll.post(() -> logScroll.fullScroll(android.view.View.FOCUS_DOWN));
+                outerScroll.post(() -> outerScroll.fullScroll(android.view.View.FOCUS_DOWN));
             }
         });
     }

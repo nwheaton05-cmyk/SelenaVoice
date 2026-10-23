@@ -1,9 +1,12 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!-- Nick 2026-10-23 v1.36: the whole screen scrolls now. The Messages
      history used to sit below the fold on Nick's phone with no way to
-     reach it (root didn't scroll). The message list keeps its own
-     fixed-height scroll area inside. -->
+     reach it (root didn't scroll).
+     Nick 2026-10-23 v1.38: the inner ScrollView is GONE — a ScrollView
+     inside a ScrollView steals the touch gesture, so the message box
+     never scrolled. The message list now flows in the page scroll. -->
 <ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/outerScroll"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
     android:background="@color/selena_light"
@@ -270,21 +273,18 @@
         android:textColor="@color/selena_dark"
         android:paddingBottom="8dp" />
 
-    <!-- Nick 2026-10-23 v1.36: fixed height now — the outer screen
-         scrolls, so a weight-based fill no longer applies. -->
-    <ScrollView
-        android:id="@+id/logScroll"
+    <!-- Nick 2026-10-23 v1.38: was a nested ScrollView — the outer one
+         stole the touch gesture so the box never scrolled. Now a plain
+         list that flows in the page scroll; minHeight keeps the box
+         shape when empty. -->
+    <LinearLayout
+        android:id="@+id/messageList"
         android:layout_width="match_parent"
-        android:layout_height="280dp"
-        android:background="#FFFFFF">
-
-        <LinearLayout
-            android:id="@+id/messageList"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:orientation="vertical"
-            android:padding="12dp" />
-    </ScrollView>
+        android:layout_height="wrap_content"
+        android:minHeight="280dp"
+        android:orientation="vertical"
+        android:background="#FFFFFF"
+        android:padding="12dp" />
 
 </LinearLayout>
 </ScrollView>
