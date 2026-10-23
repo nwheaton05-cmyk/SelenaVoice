@@ -252,9 +252,11 @@ public class VoiceService extends Service
      * politely and play in order.
      *
      * Interrupted playback is a STACK: each interrupt pushes the current
-     * state; each completion pops. A priority arriving during another
-     * priority interrupts it too ("every message interrupts whatever is
-     * playing"); completion unwinds back through the stack in order.
+     * state; each completion pops. Nick 2026-10-23 v1.42: a priority
+     * arriving during another priority does NOT interrupt it — priority
+     * items form their own FIFO queue (see waitingPriority); each waits
+     * its turn and plays right after the current one finishes, before
+     * any interrupted output resumes.
      */
     private static class InterruptedState {
         // MP3/Aria path (null audioFile => TTS was playing)
@@ -275,6 +277,27 @@ public class VoiceService extends Service
     // True while a priority item is being set up or played. Suppresses
     // normal queue pumps in the completion handlers.
     private boolean priorityMode = false;
+    /**
+     * Nick 2026-10-23 v1.42: FIFO queue of high-priority items that arrived
+     * while another priority item was playing. Priority items never
+     * interrupt each other — each newcomer waits its turn and plays right
+     * after the current priority item finishes, ahead of everything
+     * non-priority. Main thread only (all writes/reads happen in posted
+     * runnables and completion handlers).
+     */
+    private static class WaitingPriority {
+        // MP3/Aria path (null audioFile => on-device TTS path)
+        final File audioFile;
+        final String text;
+        final String serverId;
+        WaitingPriority(File audioFile, String text, String serverId) {
+            this.audioFile = audioFile;
+            this.text = text;
+            this.serverId = serverId;
+        }
+    }
+    private final java.util.ArrayDeque<WaitingPriority> waitingPriority =
+            new java.util.ArrayDeque<>();
     // Set while halting TTS for an interrupt so the async onTtsStopped
     // doesn't fire onTtsDone (which would pump the queues mid-interrupt).
     private boolean suppressNextTtsDone = false;
@@ -904,36 +927,39 @@ public class VoiceService extends Service
             }
             // Nick 2026-10-23 v1.40: priority interrupt. High-priority
             // (the default — every normal message) breaks through
-            // whatever is playing, including a manual pause and the
+            // non-priority playback, including a manual pause and the
             // no-auto-readout toggle (an urgent message that never plays
-            // is a contradiction). Low-priority (segments of one long
-            // message) falls through to the normal polite queueing below.
+            // is a contradiction). Nick 2026-10-23 v1.42: it does NOT
+            // break through another priority item — those queue FIFO
+            // behind each other (see onPriorityArrivalMp3/Tts).
+            // Low-priority (segments of one long message) falls through
+            // to the normal polite queueing below.
             String priority = m.optString("priority", "high");
             if (!"low".equals(priority)) {
                 markSpokenLocked(text);
                 if (isPhoneVoiceMode()) {
                     final String speakText = text;
-                    handler.post(() -> playPriorityTts(speakText));
+                    handler.post(() -> onPriorityArrivalTts(speakText));
                 } else if (!audioUrl.isEmpty()) {
                     // Aria mode: download the MP3 on this worker thread,
-                    // then interrupt + play on the main thread.
+                    // then decide interrupt-vs-queue on the main thread.
                     try {
                         final File pf = downloadToCache(audioUrl);
                         final String ptext = text;
                         final String psid = sid;
-                        handler.post(() -> playPriorityMp3(pf, ptext, psid));
+                        handler.post(() -> onPriorityArrivalMp3(pf, ptext, psid));
                     } catch (Exception e) {
                         log("priority: MP3 download failed: "
                                 + e.getMessage() + " — TTS fallback");
                         final String speakText = text;
-                        handler.post(() -> playPriorityTts(speakText));
+                        handler.post(() -> onPriorityArrivalTts(speakText));
                     }
                 } else {
                     // Aria mode, text-only (MP3 never arrived): TTS
                     // fallback so the urgent message isn't silent. The
                     // phase-2 MP3 dedupes via spokenTexts.
                     final String speakText = text;
-                    handler.post(() -> playPriorityTts(speakText));
+                    handler.post(() -> onPriorityArrivalTts(speakText));
                 }
                 if (ts > maxTs) maxTs = ts;
                 return maxTs;
@@ -1262,6 +1288,14 @@ public class VoiceService extends Service
             }
             currentAudioFile = null;
         }
+        // Nick 2026-10-23 v1.42: priority FIFO — a priority item that just
+        // finished yields to waiting priority items first. Priority items
+        // queue behind each other and never interrupt each other;
+        // interrupted output only resumes once no priority items remain.
+        if (priorityMode && !waitingPriority.isEmpty()) {
+            playNextWaitingPriority();
+            return;
+        }
         // Nick 2026-10-23 v1.40: priority interrupt unwinding. A non-empty
         // stack means we're mid-flow — pop and resume the next interrupted
         // item instead of pumping normal queues. A priority that finished
@@ -1486,6 +1520,13 @@ public class VoiceService extends Service
         restoreAudioRouting();
         log("tts: echo guard off");
         broadcastPlaybackState();
+        // Nick 2026-10-23 v1.42: priority FIFO — a priority item that just
+        // finished yields to waiting priority items first (same rule as
+        // onPlaybackDoneNow).
+        if (priorityMode && !waitingPriority.isEmpty()) {
+            playNextWaitingPriority();
+            return;
+        }
         // Nick 2026-10-23 v1.40: priority interrupt unwinding (same as
         // onPlaybackDoneNow).
         if (!interruptStack.isEmpty()) {
@@ -1635,6 +1676,8 @@ public class VoiceService extends Service
         log("stop: halting current playback");
         // Nick 2026-10-23 v1.40: stop cancels any priority flow too.
         priorityMode = false;
+        // Nick 2026-10-23 v1.42: stop also drops queued priority items.
+        waitingPriority.clear();
         suppressNextTtsDone = false;
         interruptStack.clear();
         // Disarm the TTS pause watchdog first — with ttsPauseRequested
@@ -1754,6 +1797,62 @@ public class VoiceService extends Service
         toast("Priority message");
         ttsSpeaking = true;
         speakOnDevice(text, false);
+    }
+
+    /**
+     * Nick 2026-10-23 v1.42: priority FIFO decision point for MP3 items.
+     * Runs on the main thread. If a priority item is already playing, the
+     * newcomer does NOT interrupt it — it queues behind it and plays
+     * right after it finishes.
+     */
+    private void onPriorityArrivalMp3(final File f, final String text,
+            final String serverId) {
+        if (priorityMode) {
+            waitingPriority.offer(new WaitingPriority(f, text, serverId));
+            log("priority: queued behind playing priority ("
+                    + waitingPriority.size() + " waiting)"
+                    + (serverId != null ? " id=" + serverId : ""));
+            toast("Priority message queued");
+            return;
+        }
+        playPriorityMp3(f, text, serverId);
+    }
+
+    /**
+     * Nick 2026-10-23 v1.42: priority FIFO decision point for on-device
+     * TTS items. Runs on the main thread. Same rule as
+     * {@link #onPriorityArrivalMp3} — queue behind a playing priority
+     * item, never interrupt it.
+     */
+    private void onPriorityArrivalTts(final String text) {
+        if (priorityMode) {
+            waitingPriority.offer(new WaitingPriority(null, text, null));
+            log("priority: queued behind playing priority ("
+                    + waitingPriority.size() + " waiting)");
+            toast("Priority message queued");
+            return;
+        }
+        playPriorityTts(text);
+    }
+
+    /**
+     * Nick 2026-10-23 v1.42: play the head of the waiting-priority FIFO.
+     * Called from the completion handlers when a priority item finishes
+     * and more are waiting. Runs on the main thread; the previous
+     * priority item has already released the player, so there is nothing
+     * to interrupt — the flow simply continues with priorityMode held.
+     */
+    private void playNextWaitingPriority() {
+        WaitingPriority wp = waitingPriority.poll();
+        if (wp == null) return;
+        log("priority: playing queued priority item ("
+                + waitingPriority.size() + " still waiting)"
+                + (wp.serverId != null ? " id=" + wp.serverId : ""));
+        if (wp.audioFile != null) {
+            playPriorityMp3(wp.audioFile, wp.text, wp.serverId);
+        } else {
+            playPriorityTts(wp.text);
+        }
     }
 
     /**
