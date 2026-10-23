@@ -289,11 +289,11 @@ public class MainActivity extends Activity {
         });
 
         // Nick 2026-10-18 v1.11: voice mode toggle — Phone (fast, on-device
-        // TTS, default) vs Callirrhoe (quality, in-app Google Cloud TTS
+        // TTS, default) vs Achernar (quality, in-app Google Cloud TTS
         // synthesis since v1.43; was server-generated Aria MP3). Stored in
         // SharedPreferences so it survives restarts; the service reads the
         // same key when handling each message.
-        // Nick 2026-10-23: toggle ON = Callirrhoe active (was inverted —
+        // Nick 2026-10-23: toggle ON = Achernar active (was inverted —
         // OFF meant Chirp, which confused everyone).
         voiceModeLabel = findViewById(R.id.voiceModeLabel);
         voiceModeSwitch = findViewById(R.id.voiceModeSwitch);
@@ -576,7 +576,7 @@ public class MainActivity extends Activity {
     private void updateVoiceModeLabel() {
         final boolean phone = isPhoneVoiceMode();
         runOnUiThread(() -> voiceModeLabel.setText(
-                phone ? "Voice: Phone (fast)" : "Voice: Callirrhoe"));
+                phone ? "Voice: Phone (fast)" : "Voice: Achernar"));
     }
 
     /** Nick 2026-10-19 v1.17: reflect the mutually-exclusive output prefs
