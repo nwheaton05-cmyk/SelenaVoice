@@ -25,6 +25,7 @@ import android.os.PowerManager;
 import android.speech.RecognizerIntent;
 import android.speech.SpeechRecognizer;
 import android.speech.tts.TextToSpeech;
+import android.util.Base64;
 import android.util.Log;
 import android.widget.Toast;
 
@@ -60,7 +61,9 @@ import java.util.Queue;
  *  1. OUTBOUND (Selena -> Nick): Realtime push on selena_voice_queue
  *     INSERTs + 3s fallback poll of /api/selena-voice/queue?since=.
  *     Phone mode (default): speak text immediately with on-device TTS.
- *     Aria mode: download the server's MP3 and play it.
+ *     Aria mode: synthesize text in-app via Google Cloud TTS (Chirp HD-F,
+ *     v1.43+) and play the result. Server MP3s still play when a row
+ *     arrives carrying one whose text was never spoken (transition).
  *  2. INBOUND (Nick -> Selena): continuous SpeechRecognizer ("always
  *     listening"). On speech, transcribes and POSTs to
  *     /api/selena-voice/input. Auto-restarts on NO_MATCH / SPEECH_TIMEOUT
@@ -108,7 +111,19 @@ public class VoiceService extends Service
     // activity toggle and the service read the same value.
     public static final String KEY_VOICE_MODE = "voice_mode";
     public static final String VOICE_PHONE = "phone"; // fast, on-device TTS
-    public static final String VOICE_ARIA = "aria";   // quality, server MP3
+    public static final String VOICE_ARIA = "aria";   // quality, in-app Google Cloud TTS (Chirp HD-F).
+    // (Pref value "aria" kept for stored-prefs compat; the server-MP3 path it
+    // once meant was replaced by in-app synthesis in v1.43.)
+
+    // Nick 2026-10-23 v1.43: Google Cloud Text-to-Speech, called IN THE APP
+    // ("you send Selena Voice text, Selena Voice talks"). The API key is
+    // injected at build time by build-v143.sh — the source keeps only the
+    // placeholder below so the key never lands in git. The key is
+    // restricted to the Cloud Text-to-Speech API only.
+    private static final String GOOGLE_TTS_API_KEY = "__GOOGLE_TTS_API_KEY__";
+    private static final String GOOGLE_TTS_VOICE = "en-US-Chirp-HD-F";
+    private static final String GOOGLE_TTS_URL =
+            "https://texttospeech.googleapis.com/v1/text:synthesize";
     // Nick 2026-10-19 v1.17: no-auto-readout + output-route toggles.
     // The two output toggles are mutually exclusive.
     public static final String KEY_NO_AUTO_READOUT = "no_auto_readout";
@@ -940,9 +955,13 @@ public class VoiceService extends Service
                 if (isPhoneVoiceMode()) {
                     final String speakText = text;
                     handler.post(() -> onPriorityArrivalTts(speakText));
-                } else if (!audioUrl.isEmpty()) {
-                    // Aria mode: download the MP3 on this worker thread,
-                    // then decide interrupt-vs-queue on the main thread.
+                } else if (!audioUrl.isEmpty() && audioUrl.startsWith("http")) {
+                    // Nick 2026-10-23 v1.43: backward-compat MP3 path. The
+                    // server still renders MP3s during transition; a row
+                    // that arrives WITH an mp3 whose text was never spoken
+                    // (phase 1 missed) plays the MP3. The normal case —
+                    // phase 1 synthesized, phase 2 deduped via spokenTexts
+                    // above — never reaches here.
                     try {
                         final File pf = downloadToCache(audioUrl);
                         final String ptext = text;
@@ -955,11 +974,23 @@ public class VoiceService extends Service
                         handler.post(() -> onPriorityArrivalTts(speakText));
                     }
                 } else {
-                    // Aria mode, text-only (MP3 never arrived): TTS
-                    // fallback so the urgent message isn't silent. The
-                    // phase-2 MP3 dedupes via spokenTexts.
-                    final String speakText = text;
-                    handler.post(() -> onPriorityArrivalTts(speakText));
+                    // Nick 2026-10-23 v1.43: in-app synthesis (Chirp HD-F).
+                    // Text rows synthesize HERE via the Google Cloud TTS API
+                    // on a worker thread, then feed the unchanged v1.40/v1.42
+                    // priority machinery. Synthesis failure (after one
+                    // retry) falls back to on-device TTS — never silent.
+                    final String stext = text;
+                    final String ssid = sid;
+                    new Thread(() -> {
+                        try {
+                            final File sf = synthesizeToCache(stext);
+                            handler.post(() -> onPriorityArrivalMp3(sf, stext, ssid));
+                        } catch (Exception e) {
+                            log("priority: synthesis failed, on-device TTS "
+                                    + "fallback: " + e.getMessage());
+                            handler.post(() -> onPriorityArrivalTts(stext));
+                        }
+                    }).start();
                 }
                 if (ts > maxTs) maxTs = ts;
                 return maxTs;
@@ -1029,12 +1060,27 @@ public class VoiceService extends Service
                     consumed = true;
                 }
             } else {
-                // Aria quality mode with no audioUrl yet — the Aria MP3
-                // will arrive as its own queue message. Don't speak the
-                // text on-device; that would double up. Don't markSpoken
-                // here; the MP3 phase will mark it when it plays.
+                // Nick 2026-10-23 v1.43: text-only row — synthesize IN THE
+                // APP via Google Cloud TTS (Chirp HD-F) and enqueue for
+                // polite playback. The phase-2 server MP3 dedupes via
+                // spokenTexts. Synthesis failure falls back to the polite
+                // on-device TTS queue — never silent, never doubled.
+                markSpokenLocked(text);
                 broadcastMessage(text);
-                log("tts: text-only message held for Aria MP3 (quality mode)");
+                final MessageHistory.Entry histEntry =
+                        MessageHistory.add(text, null, sid);
+                final String stext = text;
+                new Thread(() -> {
+                    try {
+                        final File sf = synthesizeToCache(stext);
+                        MessageHistory.setAudioPath(histEntry.id, sf);
+                        handler.post(() -> enqueueAudio(sf));
+                    } catch (Exception e) {
+                        log("synth: low-priority synthesis failed, "
+                                + "on-device fallback: " + e.getMessage());
+                        handler.post(() -> enqueueTts(stext));
+                    }
+                }).start();
                 consumed = true;
             }
         }
@@ -1339,6 +1385,93 @@ public class VoiceService extends Service
         // empty/corrupt stub — silent playback with a 0-byte file looks
         // identical to the audio-routing bug in the logs.
         log("audio: downloaded " + total + " bytes to " + out.getAbsolutePath());
+        return out;
+    }
+
+    /**
+     * Nick 2026-10-23 v1.43: synthesize text IN THE APP via Google Cloud
+     * Text-to-Speech (Chirp HD-F). Runs on a worker thread — never call on
+     * the main thread. One retry, then throws; the caller falls back to
+     * on-device TTS so the message is never dropped silently.
+     */
+    private File synthesizeToCache(String text) throws Exception {
+        Exception last = null;
+        for (int attempt = 0; attempt < 2; attempt++) {
+            try {
+                return synthesizeOnce(text);
+            } catch (Exception e) {
+                last = e;
+                log("synth: attempt " + (attempt + 1) + " failed: "
+                        + e.getMessage());
+            }
+        }
+        throw last;
+    }
+
+    /** Single Google Cloud TTS request. Runs on a worker thread. */
+    private File synthesizeOnce(String text) throws Exception {
+        long t0 = System.currentTimeMillis();
+        HttpURLConnection conn = (HttpURLConnection) new URL(
+                GOOGLE_TTS_URL + "?key=" + GOOGLE_TTS_API_KEY).openConnection();
+        conn.setConnectTimeout(10000);
+        conn.setReadTimeout(20000);
+        conn.setRequestMethod("POST");
+        conn.setRequestProperty("Content-Type",
+                "application/json; charset=utf-8");
+        conn.setDoOutput(true);
+        JSONObject req = new JSONObject();
+        req.put("input", new JSONObject().put("text", text));
+        req.put("voice", new JSONObject()
+                .put("languageCode", "en-US")
+                .put("name", GOOGLE_TTS_VOICE));
+        JSONObject audioConfig = new JSONObject()
+                .put("audioEncoding", "MP3")
+                // Nick 2026-10-23: a hair slower than Google default 1.0.
+                .put("speakingRate", 0.95);
+        req.put("audioConfig", audioConfig);
+        byte[] body = req.toString().getBytes("UTF-8");
+        OutputStream os = null;
+        try {
+            os = conn.getOutputStream();
+            os.write(body);
+        } finally {
+            if (os != null) try { os.close(); } catch (Exception ignored) {}
+        }
+        int code = conn.getResponseCode();
+        InputStream in = (code >= 200 && code < 300)
+                ? conn.getInputStream() : conn.getErrorStream();
+        StringBuilder sb = new StringBuilder();
+        BufferedReader br = null;
+        try {
+            br = new BufferedReader(new InputStreamReader(in, "UTF-8"));
+            String line;
+            while ((line = br.readLine()) != null) sb.append(line);
+        } finally {
+            if (br != null) try { br.close(); } catch (Exception ignored) {}
+            conn.disconnect();
+        }
+        if (code < 200 || code >= 300) {
+            String detail = sb.length() > 200
+                    ? sb.substring(0, 200) : sb.toString();
+            throw new Exception("TTS API HTTP " + code + ": " + detail);
+        }
+        String audioB64 = new JSONObject(sb.toString())
+                .optString("audioContent", "");
+        if (audioB64.isEmpty()) {
+            throw new Exception("TTS API returned no audioContent");
+        }
+        byte[] audio = Base64.decode(audioB64, Base64.DEFAULT);
+        File out = File.createTempFile("selena-synth-", ".mp3", getCacheDir());
+        FileOutputStream fos = null;
+        try {
+            fos = new FileOutputStream(out);
+            fos.write(audio);
+        } finally {
+            if (fos != null) try { fos.close(); } catch (Exception ignored) {}
+        }
+        log("synth: " + audio.length + " bytes in "
+                + (System.currentTimeMillis() - t0) + "ms ("
+                + GOOGLE_TTS_VOICE + ")");
         return out;
     }
 
