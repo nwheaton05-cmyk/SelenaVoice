@@ -85,6 +85,8 @@ public class VoiceService extends Service
     public static final String EXTRA_TOAST = "toast_text";
     // Nick 2026-10-21 v1.24: replay a cached message MP3 from the UI.
     public static final String ACTION_REPLAY = "com.selena.voice.REPLAY";
+    // Nick 2026-10-22 v1.35: hard-stop all playback from the UI.
+    public static final String ACTION_STOP_ALL = "com.selena.voice.STOP_ALL";
     public static final String ACTION_REQUEST_STATUS = "com.selena.voice.REQUEST_STATUS";
     public static final String EXTRA_FILE_PATH = "file_path";
     public static final String EXTRA_POLL_STATUS = "poll_status";
@@ -244,6 +246,8 @@ public class VoiceService extends Service
     @Override
     public void onCreate() {
         super.onCreate();
+        // Nick 2026-10-23 v1.36: global crash reporter (service process).
+        CrashReporter.install(this);
         audioManager = (AudioManager) getSystemService(Context.AUDIO_SERVICE);
         notificationManager = getSystemService(NotificationManager.class);
         recognitionListener = new ServiceRecognitionListener(this);
@@ -332,16 +336,32 @@ public class VoiceService extends Service
                 // current state instead of leaving stale layout defaults.
                 broadcastPollStatus(lastPollStatus);
                 broadcastPlaybackState();
+            } else if (ACTION_STOP_ALL.equals(intent.getAction())) {
+                // Nick 2026-10-22 v1.35: hard stop — kill whatever is
+                // playing/speaking right now and drop unlocked queued
+                // items. His tap always wins.
+                log("intent: STOP_ALL received");
+                stopAllPlayback();
             } else if (ACTION_REPLAY.equals(intent.getAction())) {
                 // Nick 2026-10-21 v1.24: replay a cached message MP3.
                 // v1.28: toast when the file is gone instead of failing
                 // silently.
+                // v1.35: INTERRUPT — kill current playback first, then play
+                // the selected message immediately (front of queue), instead
+                // of lining it up behind whatever is playing.
                 String path = intent.getStringExtra(EXTRA_FILE_PATH);
                 if (path != null) {
                     java.io.File f = new java.io.File(path);
                     if (f.exists()) {
                         log("replay: " + f.getName());
-                        handler.post(() -> enqueueAudio(f));
+                        handler.post(() -> {
+                            stopCurrentPlayback();
+                            synchronized (audioQueue) {
+                                ((java.util.LinkedList<java.io.File>) audioQueue)
+                                        .addFirst(f);
+                            }
+                            pumpAudioQueue();
+                        });
                     } else {
                         log("replay: file gone: " + path);
                         toast("Replay audio expired");
@@ -1421,6 +1441,61 @@ public class VoiceService extends Service
             toast("Nothing paused");
         }
         broadcastPlaybackState();
+    }
+
+    /**
+     * Nick 2026-10-22 v1.35: kill whatever is currently playing or
+     * speaking (MP3 player or on-device TTS), clear the paused state.
+     * The queues are left alone — callers decide what to do with them.
+     * Runs on the main thread (called from onStartCommand).
+     */
+    private void stopCurrentPlayback() {
+        log("stop: halting current playback");
+        // Disarm the TTS pause watchdog first — with ttsPauseRequested
+        // false, the engine's onStop routes to onTtsDone(), which pumps
+        // the queues: a clean no-op when we cleared them, or continues
+        // normally when the caller re-queued.
+        ttsPauseRequested = false;
+        try {
+            if (tts != null) tts.stop();
+        } catch (Exception e) {
+            log("stop: tts.stop failed: " + e.getMessage());
+        }
+        ttsSpeaking = false;
+        ttsPaused = false;
+        ttsCurrentText = null;
+        ttsResumeAtChar = 0;
+        // Release the MP3 player (also clears playbackPaused and
+        // broadcasts state).
+        releasePlayer();
+        playing = false;
+        isPlayingAudio = false;
+        setPlayingAudio(false);
+        broadcastPlaybackState();
+    }
+
+    /**
+     * Nick 2026-10-22 v1.35: STOP_ALL — stopCurrentPlayback plus drop
+     * every unlocked item waiting in the queues (locked ones keep their
+     * place, per the v1.34 rule). Runs on the main thread.
+     */
+    private void stopAllPlayback() {
+        stopCurrentPlayback();
+        synchronized (audioQueue) {
+            File f;
+            while ((f = audioQueue.poll()) != null) {
+                if (!MessageHistory.isAudioReferenced(f.getAbsolutePath())) {
+                    //noinspection ResultOfMethodCallIgnored
+                    f.delete();
+                }
+            }
+        }
+        synchronized (ttsQueue) {
+            ttsQueue.clear();
+        }
+        broadcastPlaybackState();
+        toast("⏹ Stopped");
+        log("stop: queues cleared (unlocked only)");
     }
 
     /**

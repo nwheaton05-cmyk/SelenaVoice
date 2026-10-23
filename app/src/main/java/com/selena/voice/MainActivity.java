@@ -58,6 +58,10 @@ public class MainActivity extends Activity {
     // and play the newest queued one.
     private Button skipButton;
 
+    // Nick 2026-10-22 v1.35: hard stop — kill all playback/speech now,
+    // drop unlocked queued items.
+    private Button stopButton;
+
     // Nick 2026-10-22 v1.34: delete unlocked — wipe the server queue and
     // local history except for locked messages.
     private Button deleteUnlockedButton;
@@ -154,6 +158,9 @@ public class MainActivity extends Activity {
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+        // Nick 2026-10-23 v1.36: global crash reporter — the 07:43 crash
+        // died with no server report. Next time we get the stack trace.
+        CrashReporter.install(this);
         setContentView(R.layout.activity_main);
 
         statusText = findViewById(R.id.statusText);
@@ -186,6 +193,18 @@ public class MainActivity extends Activity {
         pauseButton.setOnClickListener(v -> {
             Intent i = new Intent(this, VoiceService.class);
             i.setAction("PAUSE_PLAYBACK");
+            startForegroundService(i);
+        });
+
+        // Nick 2026-10-22 v1.35: stop button. Sends STOP_ALL — the service
+        // kills whatever is playing/speaking and drops unlocked queued
+        // items. Always enabled; the service toasts so a tap never dies
+        // silently.
+        stopButton = findViewById(R.id.stopButton);
+        stopButton.setEnabled(true);
+        stopButton.setOnClickListener(v -> {
+            Intent i = new Intent(this, VoiceService.class);
+            i.setAction(VoiceService.ACTION_STOP_ALL);
             startForegroundService(i);
         });
 

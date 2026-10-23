@@ -1,9 +1,18 @@
 <?xml version="1.0" encoding="utf-8"?>
-<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+<!-- Nick 2026-10-23 v1.36: the whole screen scrolls now. The Messages
+     history used to sit below the fold on Nick's phone with no way to
+     reach it (root didn't scroll). The message list keeps its own
+     fixed-height scroll area inside. -->
+<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
-    android:orientation="vertical"
     android:background="@color/selena_light"
+    android:fillViewport="true">
+
+<LinearLayout
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content"
+    android:orientation="vertical"
     android:padding="16dp">
 
     <!-- Status indicator -->
@@ -94,9 +103,9 @@
         android:textSize="40sp"
         android:backgroundTint="@color/selena_purple" />
 
-    <!-- Playback controls (Nick 2026-10-21 pause; Nick 2026-10-22 v1.33
-         skip-to-newest): pause halts the current message, skip abandons
-         it and plays the newest queued message. -->
+    <!-- Playback controls, TWO ROWS (Nick 2026-10-23 v1.36: his pick).
+         Four buttons in one row overflowed his screen and squeezed
+         Delete off the edge. Row 1: pause/stop. Row 2: newest/delete. -->
     <LinearLayout
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
@@ -113,10 +122,26 @@
             android:visibility="visible" />
 
         <Button
-            android:id="@+id/skipButton"
+            android:id="@+id/stopButton"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
             android:layout_marginStart="12dp"
+            android:text="⏹️ Stop"
+            android:textSize="16sp"
+            android:visibility="visible" />
+    </LinearLayout>
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="horizontal"
+        android:gravity="center"
+        android:paddingBottom="4dp">
+
+        <Button
+            android:id="@+id/skipButton"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
             android:text="⏭️ Newest"
             android:textSize="16sp"
             android:visibility="visible" />
@@ -126,7 +151,7 @@
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
             android:layout_marginStart="12dp"
-            android:text="🗑️ Delete unlocked"
+            android:text="🗑️ Delete"
             android:textSize="16sp"
             android:visibility="visible" />
     </LinearLayout>
@@ -245,11 +270,12 @@
         android:textColor="@color/selena_dark"
         android:paddingBottom="8dp" />
 
+    <!-- Nick 2026-10-23 v1.36: fixed height now — the outer screen
+         scrolls, so a weight-based fill no longer applies. -->
     <ScrollView
         android:id="@+id/logScroll"
         android:layout_width="match_parent"
-        android:layout_height="0dp"
-        android:layout_weight="1"
+        android:layout_height="280dp"
         android:background="#FFFFFF">
 
         <LinearLayout
@@ -261,3 +287,4 @@
     </ScrollView>
 
 </LinearLayout>
+</ScrollView>
