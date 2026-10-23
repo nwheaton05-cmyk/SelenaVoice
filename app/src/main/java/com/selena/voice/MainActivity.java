@@ -289,21 +289,23 @@ public class MainActivity extends Activity {
         });
 
         // Nick 2026-10-18 v1.11: voice mode toggle — Phone (fast, on-device
-        // TTS, default) vs Chirp HD-F (quality, in-app Google Cloud TTS
+        // TTS, default) vs Callirrhoe (quality, in-app Google Cloud TTS
         // synthesis since v1.43; was server-generated Aria MP3). Stored in
         // SharedPreferences so it survives restarts; the service reads the
         // same key when handling each message.
+        // Nick 2026-10-23: toggle ON = Callirrhoe active (was inverted —
+        // OFF meant Chirp, which confused everyone).
         voiceModeLabel = findViewById(R.id.voiceModeLabel);
         voiceModeSwitch = findViewById(R.id.voiceModeSwitch);
-        voiceModeSwitch.setChecked(isPhoneVoiceMode());
+        voiceModeSwitch.setChecked(!isPhoneVoiceMode());
         updateVoiceModeLabel();
-        voiceModeSwitch.setOnCheckedChangeListener((v, phone) -> {
+        voiceModeSwitch.setOnCheckedChangeListener((v, chirp) -> {
             getSharedPreferences("selena_voice", MODE_PRIVATE).edit()
                     .putString(VoiceService.KEY_VOICE_MODE,
-                            phone ? VoiceService.VOICE_PHONE : VoiceService.VOICE_ARIA)
+                            chirp ? VoiceService.VOICE_ARIA : VoiceService.VOICE_PHONE)
                     .apply();
             updateVoiceModeLabel();
-            VoiceService.log("voice: mode=" + (phone ? "phone (fast)" : "chirp-hd-f (in-app)"));
+            VoiceService.log("voice: mode=" + (chirp ? "callirrhoe (in-app)" : "phone (fast)"));
         });
 
         // Nick 2026-10-19 v1.17: no-auto-readout — messages land in the
@@ -574,7 +576,7 @@ public class MainActivity extends Activity {
     private void updateVoiceModeLabel() {
         final boolean phone = isPhoneVoiceMode();
         runOnUiThread(() -> voiceModeLabel.setText(
-                phone ? "Voice: Phone (fast)" : "Voice: Chirp HD-F"));
+                phone ? "Voice: Phone (fast)" : "Voice: Callirrhoe"));
     }
 
     /** Nick 2026-10-19 v1.17: reflect the mutually-exclusive output prefs

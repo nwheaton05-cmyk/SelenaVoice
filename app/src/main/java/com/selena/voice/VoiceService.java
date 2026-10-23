@@ -61,7 +61,7 @@ import java.util.Queue;
  *  1. OUTBOUND (Selena -> Nick): Realtime push on selena_voice_queue
  *     INSERTs + 3s fallback poll of /api/selena-voice/queue?since=.
  *     Phone mode (default): speak text immediately with on-device TTS.
- *     Aria mode: synthesize text in-app via Google Cloud TTS (Chirp HD-F,
+ *     Aria mode: synthesize text in-app via Google Cloud TTS (Callirrhoe,
  *     v1.43+) and play the result. Server MP3s still play when a row
  *     arrives carrying one whose text was never spoken (transition).
  *  2. INBOUND (Nick -> Selena): continuous SpeechRecognizer ("always
@@ -111,7 +111,7 @@ public class VoiceService extends Service
     // activity toggle and the service read the same value.
     public static final String KEY_VOICE_MODE = "voice_mode";
     public static final String VOICE_PHONE = "phone"; // fast, on-device TTS
-    public static final String VOICE_ARIA = "aria";   // quality, in-app Google Cloud TTS (Chirp HD-F).
+    public static final String VOICE_ARIA = "aria";   // quality, in-app Google Cloud TTS (Callirrhoe).
     // (Pref value "aria" kept for stored-prefs compat; the server-MP3 path it
     // once meant was replaced by in-app synthesis in v1.43.)
 
@@ -121,7 +121,7 @@ public class VoiceService extends Service
     // placeholder below so the key never lands in git. The key is
     // restricted to the Cloud Text-to-Speech API only.
     private static final String GOOGLE_TTS_API_KEY = "__GOOGLE_TTS_API_KEY__";
-    private static final String GOOGLE_TTS_VOICE = "en-US-Chirp-HD-F";
+    private static final String GOOGLE_TTS_VOICE = "en-US-Chirp3-HD-Callirrhoe";
     private static final String GOOGLE_TTS_URL =
             "https://texttospeech.googleapis.com/v1/text:synthesize";
     // Nick 2026-10-19 v1.17: no-auto-readout + output-route toggles.
@@ -974,7 +974,7 @@ public class VoiceService extends Service
                         handler.post(() -> onPriorityArrivalTts(speakText));
                     }
                 } else {
-                    // Nick 2026-10-23 v1.43: in-app synthesis (Chirp HD-F).
+                    // Nick 2026-10-23 v1.43: in-app synthesis (Callirrhoe since v1.44).
                     // Text rows synthesize HERE via the Google Cloud TTS API
                     // on a worker thread, then feed the unchanged v1.40/v1.42
                     // priority machinery. Synthesis failure (after one
@@ -1061,7 +1061,7 @@ public class VoiceService extends Service
                 }
             } else {
                 // Nick 2026-10-23 v1.43: text-only row — synthesize IN THE
-                // APP via Google Cloud TTS (Chirp HD-F) and enqueue for
+                // APP via Google Cloud TTS (Callirrhoe) and enqueue for
                 // polite playback. The phase-2 server MP3 dedupes via
                 // spokenTexts. Synthesis failure falls back to the polite
                 // on-device TTS queue — never silent, never doubled.
@@ -1390,7 +1390,7 @@ public class VoiceService extends Service
 
     /**
      * Nick 2026-10-23 v1.43: synthesize text IN THE APP via Google Cloud
-     * Text-to-Speech (Chirp HD-F). Runs on a worker thread — never call on
+     * Text-to-Speech (Callirrhoe). Runs on a worker thread — never call on
      * the main thread. One retry, then throws; the caller falls back to
      * on-device TTS so the message is never dropped silently.
      */
