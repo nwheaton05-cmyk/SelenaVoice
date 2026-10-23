@@ -54,6 +54,11 @@ public class MainActivity extends Activity {
     private Button micButton;
     private boolean manualMicOn = false;
 
+    // Nick 2026-10-23 v1.46: live dictation popup — shows exactly what
+    // Nick is dictating in real time (one-shot mic, or always-listening).
+    private android.app.Dialog dictationDialog;
+    private TextView dictationTextView;
+
     // Nick 2026-10-21: pause/resume button for playback.
     private Button pauseButton;
     private boolean playbackPaused = false;
@@ -106,9 +111,100 @@ public class MainActivity extends Activity {
     public void onInputSent(String text) {
         VoiceService.log("log: showing Nick's message");
         // Nick 2026-10-21 v1.24: voice inputs aren't in history; just re-render.
+        // Nick 2026-10-23 v1.46: they ARE now — from-Nick history entries.
+        // The sentence landed below: clear the popup for the next one.
+        // Toast only for one-shot; always-listening would spam it per sentence.
+        clearDictationPopup();
         renderHistory();
-        runOnUiThread(() ->
-                Toast.makeText(this, "Sent to Selena", Toast.LENGTH_SHORT).show());
+        if (manualMicOn) {
+            runOnUiThread(() ->
+                    Toast.makeText(this, "Sent to Selena", Toast.LENGTH_SHORT).show());
+        }
+    }
+
+    /**
+     * Nick 2026-10-23 v1.46: live dictation text from the service
+     * (partial results + in-progress sentence). Shows/updates the popup.
+     */
+    public void onPartialInput(String text) {
+        if (text == null) return;
+        // One-shot: the popup was shown on mic-ON. Always-listening: pop
+        // it up on first live dictation so it doesn't sit empty while idle.
+        if (dictationDialog == null && VoiceService.getAlwaysListening(this)) {
+            showDictationPopup();
+        }
+        updateDictationPopup(text);
+    }
+
+    /** Nick 2026-10-23 v1.46: show the live dictation popup. */
+    private void showDictationPopup() {
+        if (dictationDialog != null || isFinishing()) return;
+        runOnUiThread(() -> {
+            if (dictationDialog != null || isFinishing()) return;
+            android.widget.LinearLayout layout = new android.widget.LinearLayout(this);
+            layout.setOrientation(android.widget.LinearLayout.VERTICAL);
+            int pad = (int) (24 * getResources().getDisplayMetrics().density);
+            layout.setPadding(pad, pad, pad, pad);
+
+            TextView status = new TextView(this);
+            status.setText("🎙️ Listening…");
+            status.setTextSize(14);
+            status.setTextColor(0xFF888888);
+            layout.addView(status);
+
+            dictationTextView = new TextView(this);
+            dictationTextView.setText("");
+            dictationTextView.setTextSize(22);
+            dictationTextView.setTextColor(getResources().getColor(R.color.selena_dark));
+            dictationTextView.setPadding(0, pad / 2, 0, 0);
+            layout.addView(dictationTextView);
+
+            android.app.AlertDialog dialog =
+                    new android.app.AlertDialog.Builder(this)
+                            .setTitle("Dictation")
+                            .setView(layout)
+                            .create();
+            dialog.setCanceledOnTouchOutside(true);
+            dialog.setOnDismissListener(d -> {
+                dictationDialog = null;
+                dictationTextView = null;
+            });
+            dictationDialog = dialog;
+            dialog.show();
+            // Wide popup — dictation text needs room.
+            android.view.Window w = dialog.getWindow();
+            if (w != null) {
+                w.setLayout(android.view.WindowManager.LayoutParams.MATCH_PARENT,
+                        android.view.WindowManager.LayoutParams.WRAP_CONTENT);
+            }
+        });
+    }
+
+    /** Nick 2026-10-23 v1.46: update the popup's live text. */
+    private void updateDictationPopup(String text) {
+        runOnUiThread(() -> {
+            if (dictationTextView != null) {
+                dictationTextView.setText(text);
+            }
+        });
+    }
+
+    /** Nick 2026-10-23 v1.46: blank the popup for the next sentence. */
+    private void clearDictationPopup() {
+        updateDictationPopup("");
+    }
+
+    /** Nick 2026-10-23 v1.46: take the popup down. */
+    private void dismissDictationPopup() {
+        runOnUiThread(() -> {
+            if (dictationDialog != null) {
+                try {
+                    dictationDialog.dismiss();
+                } catch (Exception ignored) {}
+                dictationDialog = null;
+                dictationTextView = null;
+            }
+        });
     }
 
     /** Called by MessageReceiver when speech is detected (pulse the dot). */
@@ -252,6 +348,9 @@ public class MainActivity extends Activity {
             if (on) {
                 // The switch owns the mic now — drop any manual toggle state.
                 manualMicOn = false;
+            } else {
+                // Nick 2026-10-23 v1.46: always-listening off — popup down.
+                dismissDictationPopup();
             }
             updateMicButton();
         });
@@ -275,6 +374,8 @@ public class MainActivity extends Activity {
                 startForegroundService(i);
                 manualMicOn = true;
                 VoiceService.log("mic: manual toggle ON");
+                // Nick 2026-10-23 v1.46: live dictation popup.
+                showDictationPopup();
                 Toast.makeText(this, "Listening… tap mic again to stop",
                         Toast.LENGTH_SHORT).show();
             } else {
@@ -283,6 +384,10 @@ public class MainActivity extends Activity {
                 startForegroundService(i);
                 manualMicOn = false;
                 VoiceService.log("mic: manual toggle OFF");
+                // Nick 2026-10-23 v1.46: dictation done — popup down. Any
+                // in-progress sentence still flushes to history via the
+                // service's sentence timer.
+                dismissDictationPopup();
                 Toast.makeText(this, "Mic off", Toast.LENGTH_SHORT).show();
             }
             updateMicButton();
@@ -641,6 +746,8 @@ public class MainActivity extends Activity {
             i.setAction("MANUAL_LISTEN");
             startForegroundService(i);
             manualMicOn = true;
+            // Nick 2026-10-23 v1.46: permission-grant path — popup too.
+            showDictationPopup();
             updateMicButton();
         }
     }
@@ -699,6 +806,8 @@ public class MainActivity extends Activity {
         f.addAction(VoiceService.ACTION_INPUT_SENT);
         f.addAction(VoiceService.ACTION_SPEECH_DETECTED);
         f.addAction(VoiceService.ACTION_LISTENING_STATE);
+        // Nick 2026-10-23 v1.46: live dictation popup text.
+        f.addAction(VoiceService.ACTION_PARTIAL_INPUT);
         // Nick 2026-10-23 v1.41: service asks the activity to prompt for mic.
         f.addAction(VoiceService.ACTION_REQUEST_MIC_PERMISSION);
         f.addAction(VoiceService.ACTION_POLL_STATUS);
@@ -716,6 +825,12 @@ public class MainActivity extends Activity {
         // service was in manual-listen mode, pick up the real state.
         manualMicOn = VoiceService.isManualListening();
         updateMicButton();
+        // Nick 2026-10-23 v1.46: recreate the dictation popup if a manual
+        // session was already running (the service's sentence buffer and
+        // partials will refill it).
+        if (manualMicOn) {
+            showDictationPopup();
+        }
         // Nick 2026-10-21 v1.24: load persistent message history on open
         // (catches messages that arrived while backgrounded).
         MessageHistory.purgeExpired();
@@ -731,6 +846,9 @@ public class MainActivity extends Activity {
     @Override
     protected void onPause() {
         super.onPause();
+        // Nick 2026-10-23 v1.46: popup is activity-scoped — take it down
+        // to avoid a window leak. Re-shown on resume if still listening.
+        dismissDictationPopup();
         try { unregisterReceiver(receiver); } catch (Exception ignored) {}
     }
 
@@ -770,7 +888,10 @@ public class MainActivity extends Activity {
         android.widget.LinearLayout card = new android.widget.LinearLayout(this);
         card.setOrientation(android.widget.LinearLayout.VERTICAL);
         card.setPadding(12, 12, 12, 12);
-        card.setBackgroundColor(e.locked ? 0xFFFFF3D6 : 0xFFF5F5F5);
+        // Nick 2026-10-23 v1.46: his dictations are visually distinct —
+        // light purple card with a "you said" header. Locked tint wins.
+        card.setBackgroundColor(e.locked ? 0xFFFFF3D6
+                : (e.fromNick ? 0xFFF2E9FF : 0xFFF5F5F5));
         android.widget.LinearLayout.LayoutParams cp =
             new android.widget.LinearLayout.LayoutParams(
                 android.widget.LinearLayout.LayoutParams.MATCH_PARENT,
@@ -783,6 +904,17 @@ public class MainActivity extends Activity {
         tv.setTextSize(14);
         tv.setTextColor(getResources().getColor(R.color.selena_dark));
         card.addView(tv);
+
+        // Nick 2026-10-23 v1.46: sender header — his dictations read as
+        // "🎤 You said:" in purple, clearly distinct from her replies.
+        if (e.fromNick) {
+            android.widget.TextView sender = new android.widget.TextView(this);
+            sender.setText("🎤 You said:");
+            sender.setTextSize(12);
+            sender.setTypeface(null, android.graphics.Typeface.BOLD);
+            sender.setTextColor(0xFF6B4FA1); // selena_purple
+            card.addView(sender, 0);
+        }
 
         // Timestamp + buttons row
         android.widget.LinearLayout row = new android.widget.LinearLayout(this);

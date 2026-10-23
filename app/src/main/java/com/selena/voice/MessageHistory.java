@@ -32,14 +32,19 @@ public class MessageHistory {
         public boolean locked;
         /** Server-side selena_voice_queue row ID (for delete-unlocked). Null for local-only entries. */
         public final String serverId;
+        /** Nick 2026-10-23 v1.46: true when this entry is Nick's own
+         * dictation (not Selena's reply) — rendered distinctly. */
+        public final boolean fromNick;
 
-        Entry(String id, String text, String audioPath, long timestamp, boolean locked, String serverId) {
+        Entry(String id, String text, String audioPath, long timestamp, boolean locked,
+                String serverId, boolean fromNick) {
             this.id = id;
             this.text = text;
             this.audioPath = audioPath;
             this.timestamp = timestamp;
             this.locked = locked;
             this.serverId = serverId;
+            this.fromNick = fromNick;
         }
     }
 
@@ -60,10 +65,21 @@ public class MessageHistory {
      * selena_voice_queue row, so delete-unlocked can preserve locked
      * messages server-side. */
     public static synchronized Entry add(String text, File audioFile, String serverId) {
+        return add(text, audioFile, serverId, false);
+    }
+
+    /** Nick 2026-10-23 v1.46: Nick's dictation — a from-Nick entry in the
+     * same history list as Selena's replies. No audio, no server row. */
+    public static synchronized Entry addNick(String text) {
+        return add(text, null, null, true);
+    }
+
+    private static synchronized Entry add(String text, File audioFile, String serverId,
+            boolean fromNick) {
         String id = "msg-" + System.currentTimeMillis() + "-" + (int)(Math.random() * 10000);
         Entry e = new Entry(id, text,
             audioFile != null ? audioFile.getAbsolutePath() : null,
-            System.currentTimeMillis(), false, serverId);
+            System.currentTimeMillis(), false, serverId, fromNick);
         // Nick 2026-10-22 v1.26: chat order — newest at the bottom.
         entries.add(e);
         while (entries.size() > MAX_ENTRIES) {
@@ -229,7 +245,10 @@ public class MessageHistory {
                     o.isNull("audioPath") ? null : o.getString("audioPath"),
                     o.getLong("timestamp"),
                     o.optBoolean("locked", false),
-                    o.isNull("serverId") ? null : o.optString("serverId", null)));
+                    o.isNull("serverId") ? null : o.optString("serverId", null),
+                    // Nick 2026-10-23 v1.46: pre-v1.46 entries have no
+                    // fromNick key — they were all Selena's replies.
+                    o.optBoolean("fromNick", false)));
             }
             // Nick 2026-10-22 v1.26: v1.24/v1.25 saved newest-first.
             // Detect by timestamp order; flip only when needed.
@@ -254,6 +273,8 @@ public class MessageHistory {
                 o.put("timestamp", e.timestamp);
                 o.put("locked", e.locked);
                 o.put("serverId", e.serverId != null ? e.serverId : JSONObject.NULL);
+                // Nick 2026-10-23 v1.46: sender flag for Nick's dictations.
+                o.put("fromNick", e.fromNick);
                 arr.put(o);
             }
             File f = new File(appContext.getFilesDir(), FILE_NAME);

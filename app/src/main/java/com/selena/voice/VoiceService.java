@@ -103,6 +103,9 @@ public class VoiceService extends Service
     public static final String EXTRA_POLL_STATUS = "poll_status";
     public static final String EXTRA_TEXT = "text";
     public static final String EXTRA_STATE = "listening";
+    // Nick 2026-10-23 v1.46: live dictation — the recognizer's partial
+    // (in-progress) transcription, broadcast for the dictation popup.
+    public static final String ACTION_PARTIAL_INPUT = "com.selena.voice.PARTIAL_INPUT";
 
     private static final String PREFS = "selena_voice";
     private static final String KEY_LAST_TS = "last_ts";
@@ -230,6 +233,14 @@ public class VoiceService extends Service
     private NotificationManager notificationManager;
     private ServiceRecognitionListener recognitionListener;
     private PowerManager.WakeLock wakeLock;
+
+    // Nick 2026-10-23 v1.46: polite interruption — true between the
+    // recognizer's onBeginningOfSpeech and onEndOfSpeech. Entirely
+    // on-device: the app holds Selena's playback while this is true and
+    // releases it on his pause. Never stuck: reset in onSpeechEnd and
+    // onRecognizerDone (every utterance ends in one of those, onResults,
+    // or onError).
+    private volatile boolean nickSpeaking = false;
 
     // Nick 2026-10-19 v1.16: outbound (moved from MainActivity).
     private RealtimeClient realtimeClient;
@@ -1107,6 +1118,13 @@ public class VoiceService extends Service
     /** Runs on main thread: start the next queued file if idle. */
     private void pumpAudioQueue() {
         if (playing) return;
+        // Nick 2026-10-23 v1.46: polite interruption — hold while Nick
+        // speaks in always-listening mode. Stays queued; released on his
+        // pause via releasePoliteHold().
+        if (politeHoldActive()) {
+            log("polite: holding MP3 playback for Nick's pause");
+            return;
+        }
         File f;
         synchronized (audioQueue) {
             f = audioQueue.poll();
@@ -1578,6 +1596,13 @@ public class VoiceService extends Service
         // Nick 2026-10-22 v1.27: ttsPaused blocks the pump — a paused
         // message holds its place until resume.
         if (ttsSpeaking || playing || ttsPaused) return;
+        // Nick 2026-10-23 v1.46: polite interruption — hold while Nick
+        // speaks in always-listening mode. Stays queued; released on his
+        // pause via releasePoliteHold().
+        if (politeHoldActive()) {
+            log("polite: holding TTS playback for Nick's pause");
+            return;
+        }
         String text;
         synchronized (ttsQueue) {
             text = ttsQueue.poll();
@@ -1948,6 +1973,16 @@ public class VoiceService extends Service
             toast("Priority message queued");
             return;
         }
+        // Nick 2026-10-23 v1.46: polite interruption — park behind the
+        // gate instead of breaking in over Nick's voice. Released on his
+        // pause via releasePoliteHold().
+        if (politeHoldActive()) {
+            waitingPriority.offer(new WaitingPriority(f, text, serverId));
+            log("priority: held for Nick's pause ("
+                    + waitingPriority.size() + " waiting)");
+            toast("Priority message queued");
+            return;
+        }
         playPriorityMp3(f, text, serverId);
     }
 
@@ -1965,6 +2000,16 @@ public class VoiceService extends Service
             toast("Priority message queued");
             return;
         }
+        // Nick 2026-10-23 v1.46: polite interruption — park behind the
+        // gate instead of breaking in over Nick's voice. Released on his
+        // pause via releasePoliteHold().
+        if (politeHoldActive()) {
+            waitingPriority.offer(new WaitingPriority(null, text, null));
+            log("priority: held for Nick's pause ("
+                    + waitingPriority.size() + " waiting)");
+            toast("Priority message queued");
+            return;
+        }
         playPriorityTts(text);
     }
 
@@ -1976,6 +2021,13 @@ public class VoiceService extends Service
      * to interrupt — the flow simply continues with priorityMode held.
      */
     private void playNextWaitingPriority() {
+        // Nick 2026-10-23 v1.46: polite interruption — never start a
+        // queued priority item over Nick's voice. It stays queued; the
+        // hold releases on his pause.
+        if (politeHoldActive()) {
+            log("priority: holding queued item for Nick's pause");
+            return;
+        }
         WaitingPriority wp = waitingPriority.poll();
         if (wp == null) return;
         log("priority: playing queued priority item ("
@@ -2637,27 +2689,159 @@ public class VoiceService extends Service
     // Callbacks from ServiceRecognitionListener (main thread):
 
     public void onSpeechDetected() {
+        // Nick 2026-10-23 v1.46: polite interruption — Nick started
+        // talking; Selena holds any pending playback until his pause.
+        nickSpeaking = true;
         sendBroadcast(new Intent(ACTION_SPEECH_DETECTED));
     }
 
     public void onSpeechEnd() {
+        nickSpeaking = false;
         unmuteBeep();
+        // Nick 2026-10-23 v1.46: polite interruption — Nick just paused.
+        // onResults (with his chunk) usually lands within ~1s; delay the
+        // release so the chunk is POSTed first — otherwise the echo guard
+        // would discard it as "during playback". Also the fallback for
+        // chunks the filters discard. The gate is re-checked at play
+        // time, so a re-started utterance re-holds.
+        handler.postDelayed(() -> releasePoliteHold(), 2000);
     }
 
     public void onRecognizerDone() {
+        // Nick 2026-10-23 v1.46: the recognizer session ended (results or
+        // error) — the utterance is over, so the speech flag must not
+        // stick. Safety-net release for error paths where onEndOfSpeech
+        // never fired; harmless otherwise (pumps are idempotent).
+        nickSpeaking = false;
         unmuteBeep();
         scheduleRecognizerRestart();
+        handler.postDelayed(() -> releasePoliteHold(), 2000);
     }
 
+    /**
+     * Nick 2026-10-23 v1.46: live dictation popup. Called by
+     * ServiceRecognitionListener.onPartialResults on the main thread.
+     * The popup shows the in-progress sentence = buffered chunks plus
+     * the live partial. Unfiltered by design — the final accept/reject
+     * still happens in onResults.
+     */
+    public void onPartialVoiceInput(String text) {
+        String display = sentenceBuffer.length() > 0
+                ? sentenceBuffer.toString() + " " + text
+                : text;
+        Intent i = new Intent(ACTION_PARTIAL_INPUT);
+        i.putExtra(EXTRA_TEXT, display);
+        sendAppBroadcast(i);
+    }
+
+    /**
+     * Nick 2026-10-23 v1.46: polite interruption, decided ENTIRELY
+     * ON-DEVICE (no cloud round-trip — by the time the cloud answered,
+     * Nick would be talking again). In always-listening mode Selena never
+     * STARTS speaking while Nick is talking: neither on the utterance
+     * flag from the recognizer's real-time speech detector, nor on a hot
+     * live mic RMS (covers the detector's lag). Callers keep the message
+     * queued; the hold releases on his pause.
+     */
+    private boolean politeHoldActive() {
+        if (!isAlwaysListening()) return false;
+        if (nickSpeaking) return true;
+        return recognitionListener != null && recognitionListener.isMicHot();
+    }
+
+    /**
+     * Nick 2026-10-23 v1.46: polite interruption — Nick paused, so play
+     * anything held. Priority items first (they were parked in the
+     * waiting FIFO), then the normal queues. Every start point re-checks
+     * the gate, so a re-started utterance re-holds. Never starts over
+     * active playback — completion handlers drive the next item there.
+     */
+    private void releasePoliteHold() {
+        if (playing || ttsSpeaking) return;
+        playNextWaitingPriority(); // no-op when empty; gate re-checked inside
+        pumpAudioQueue();
+        pumpTtsQueue();
+    }
+
+    // Nick 2026-10-23 v1.46: sentence buffering — a 0.5s "collecting my
+    // thought" pause is NOT a sentence end. Chunks arriving within
+    // SENTENCE_GAP_MS of the previous chunk are mid-thought pauses:
+    // appended to the in-progress sentence, not sent. A longer gap (or
+    // the flush timer below) means the sentence ended — POST it as one
+    // clean batch. 1.0s is a starting point; tune if it feels wrong.
+    private final StringBuilder sentenceBuffer = new StringBuilder();
+    private long lastChunkMs = 0;
+    private static final long SENTENCE_GAP_MS = 1000;
+    private Runnable sentenceFlushTask = null;
+
+    /**
+     * Nick 2026-10-23 v1.46: called per ACCEPTED chunk (post-filter).
+     * Buffers mid-thought pauses into the in-progress sentence; the
+     * sentence is sent by flushSentence() once a real pause lands.
+     * Runs on the main thread (recognizer callback).
+     */
     public void onVoiceInput(String text) {
-        // Nick 2026-10-18 v1.9: tell the UI BEFORE the network POST so
-        // Nick's words appear in the message log instantly, even if the
-        // POST later fails (offline, timeout). His inputs are never spoken
-        // aloud — playback only plays Selena's reply MP3s from the queue.
+        // Nick 2026-10-18 v1.9: Nick's words reach the UI instantly, even
+        // if the POST later fails (offline, timeout). His inputs are never
+        // spoken aloud — playback only plays Selena's reply MP3s.
+        long now = android.os.SystemClock.uptimeMillis();
+        long gap = now - lastChunkMs;
+        // A long gap means the buffered chunks were a complete sentence —
+        // flush them before starting the new one. (The flush timer
+        // normally beats us here; this covers the deferred-while-speaking
+        // case where the buffer went stale.)
+        if (sentenceBuffer.length() > 0 && gap >= SENTENCE_GAP_MS) {
+            flushSentence();
+        }
+        if (sentenceBuffer.length() > 0) sentenceBuffer.append(' ');
+        sentenceBuffer.append(text);
+        lastChunkMs = now;
+        // Popup shows the in-progress sentence.
+        broadcastInProgressSentence();
+        // (Re)arm the flush: a full SENTENCE_GAP_MS with no new chunk ends
+        // the sentence. Firing is deferred while he's still speaking.
+        if (sentenceFlushTask != null) handler.removeCallbacks(sentenceFlushTask);
+        sentenceFlushTask = () -> flushSentence();
+        handler.postDelayed(sentenceFlushTask, SENTENCE_GAP_MS);
+    }
+
+    /**
+     * Nick 2026-10-23 v1.46: send the buffered sentence to Selena as one
+     * clean batch — POST to /api/selena-voice/input plus a from-Nick
+     * history entry. Deferred while Nick is still speaking; never cut
+     * him off mid-thought. After sending, the polite hold releases so
+     * Selena may speak into the silence.
+     */
+    private void flushSentence() {
+        sentenceFlushTask = null;
+        if (sentenceBuffer.length() == 0) return;
+        if (nickSpeaking) {
+            // Still mid-utterance — wait for a real pause. The next chunk
+            // re-arms; re-arm here as a backstop.
+            sentenceFlushTask = () -> flushSentence();
+            handler.postDelayed(sentenceFlushTask, SENTENCE_GAP_MS);
+            return;
+        }
+        String sentence = sentenceBuffer.toString();
+        sentenceBuffer.setLength(0);
+        // Nick 2026-10-23 v1.46: his dictations live in the message
+        // history as from-Nick entries, in the same list as her replies.
+        MessageHistory.addNick(sentence);
         Intent sent = new Intent(ACTION_INPUT_SENT);
-        sent.putExtra(EXTRA_TEXT, text);
+        sent.putExtra(EXTRA_TEXT, sentence);
         sendBroadcast(sent);
-        new Thread(new InputPostTask(this, text)).start();
+        final String toPost = sentence;
+        new Thread(new InputPostTask(this, toPost)).start();
+        // Nick 2026-10-23 v1.46: polite interruption — the sentence is
+        // complete and he's silent; play anything Selena had held.
+        releasePoliteHold();
+    }
+
+    /** Nick 2026-10-23 v1.46: popup shows the in-progress sentence. */
+    private void broadcastInProgressSentence() {
+        Intent i = new Intent(ACTION_PARTIAL_INPUT);
+        i.putExtra(EXTRA_TEXT, sentenceBuffer.toString());
+        sendAppBroadcast(i);
     }
 
     /** Called by InputPostTask on background thread. */

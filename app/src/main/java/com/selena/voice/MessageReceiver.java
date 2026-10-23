@@ -23,6 +23,9 @@ public class MessageReceiver extends BroadcastReceiver {
             activity.onSelenaMessage(intent.getStringExtra(VoiceService.EXTRA_TEXT));
         } else if (action.equals(VoiceService.ACTION_INPUT_SENT)) {
             activity.onInputSent(intent.getStringExtra(VoiceService.EXTRA_TEXT));
+        } else if (action.equals(VoiceService.ACTION_PARTIAL_INPUT)) {
+            // Nick 2026-10-23 v1.46: live dictation popup text.
+            activity.onPartialInput(intent.getStringExtra(VoiceService.EXTRA_TEXT));
         } else if (action.equals(VoiceService.ACTION_SPEECH_DETECTED)) {
             activity.onSpeechDetected();
         } else if (action.equals(VoiceService.ACTION_LISTENING_STATE)) {

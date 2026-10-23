@@ -22,6 +22,14 @@ public class ServiceRecognitionListener implements RecognitionListener {
     private static final float RMS_THRESHOLD_DB = -8.0f;
     private float maxRmsThisUtterance = -100.0f;
 
+    // Nick 2026-10-23 v1.46: polite interruption — track the LIVE mic
+    // level so VoiceService can tell, entirely on-device, whether Nick
+    // is speaking right now. Stale readings (recognizer between quiet
+    // restarts) don't count — isMicHot() expires them.
+    private volatile float lastRmsDb = -100.0f;
+    private volatile long lastRmsMs = 0;
+    private static final long RMS_STALE_MS = 2000;
+
     // Nick 2026-10-18 v1.3: minimum recognizer confidence. Below this,
     // the transcription is a guess — discard instead of sending garbage.
     private static final float CONFIDENCE_THRESHOLD = 0.5f;
@@ -38,6 +46,24 @@ public class ServiceRecognitionListener implements RecognitionListener {
         if (rmsdB > maxRmsThisUtterance) {
             maxRmsThisUtterance = rmsdB;
         }
+        // Nick 2026-10-23 v1.46: live level for the polite-interruption
+        // gate (see isMicHot).
+        lastRmsDb = rmsdB;
+        lastRmsMs = android.os.SystemClock.uptimeMillis();
+    }
+
+    /**
+     * Nick 2026-10-23 v1.46: true when the mic level RIGHT NOW looks
+     * like active speech rather than background. The polite-interruption
+     * gate in VoiceService uses this (with the utterance-level speech
+     * flag) to decide, entirely on-device, whether Selena may start
+     * speaking or must hold for Nick's pause.
+     */
+    public boolean isMicHot() {
+        if (android.os.SystemClock.uptimeMillis() - lastRmsMs > RMS_STALE_MS) {
+            return false;
+        }
+        return lastRmsDb >= RMS_THRESHOLD_DB;
     }
 
     @Override
@@ -114,6 +140,19 @@ public class ServiceRecognitionListener implements RecognitionListener {
         return -1.0f;
     }
 
-    @Override public void onPartialResults(Bundle partialResults) {}
+    @Override
+    public void onPartialResults(Bundle partialResults) {
+        // Nick 2026-10-23 v1.46: live dictation popup — forward the
+        // in-progress transcription so the UI shows exactly what Nick is
+        // dictating in real time. No confidence/RMS filtering here: this
+        // is a live view, not an accepted input. The final accept/reject
+        // still happens in onResults.
+        ArrayList<String> matches = partialResults.getStringArrayList(
+                SpeechRecognizer.RESULTS_RECOGNITION);
+        String text = (matches != null && !matches.isEmpty()) ? matches.get(0) : "";
+        if (!text.isEmpty()) {
+            service.onPartialVoiceInput(text);
+        }
+    }
     @Override public void onEvent(int eventType, Bundle params) {}
 }
