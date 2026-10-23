@@ -663,19 +663,10 @@ public class VoiceService extends Service
     // duck at the same time. Called AFTER unmuteBeep() so the saved value
     // is the user's real volume, not a zeroed beep stream.
     private void boostMusicVolume() {
-        try {
-            int max = audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC);
-            int cur = audioManager.getStreamVolume(AudioManager.STREAM_MUSIC);
-            if (cur >= max) {
-                log("audio: music already at max, no boost");
-                return; // savedMusicVolume stays -1: nothing to restore
-            }
-            savedMusicVolume = cur;
-            audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, max, 0);
-            log("audio: music boosted " + cur + " -> " + max);
-        } catch (Exception e) {
-            log("audio: boost failed: " + e);
-        }
+        // Nick 2026-10-23 v1.48: DISABLED — Nick turns the volume down
+        // deliberately (earbuds) and the boost was overriding him,
+        // blowing out his eardrums. Selena now plays at whatever volume
+        // he set. Method kept as no-op so restore logic stays intact.
     }
 
     // Nick 2026-10-19 v1.17: undo boostMusicVolume(). Only restores when
@@ -1288,32 +1279,10 @@ public class VoiceService extends Service
             // (<100ms).
             player.prepare();
             log("audio: MediaPlayer prepared, duration=" + player.getDuration() + "ms");
-            // Nick 2026-10-19 v1.18: LoudnessEnhancer on this player's audio
-            // session — pushes her past max stream volume for a wider
-            // margin over Spotify. MP3/Aria path only; TTS has no session.
-            // Nick 2026-10-19 v1.19: gain raised to +600mB (the cap); he
-            // asked for a little more margin.
-            try {
-                if (loudnessEnhancer != null) {
-                    try { loudnessEnhancer.release(); } catch (Exception ignored) {}
-                    loudnessEnhancer = null;
-                }
-                int sessionId = player.getAudioSessionId();
-                if (sessionId == 0) {
-                    // Session 0 = global output mix: attaching here would boost
-                    // Spotify too. Skip rather than widen the effect.
-                    log("audio: LoudnessEnhancer skipped (session 0)");
-                } else {
-                    loudnessEnhancer = new LoudnessEnhancer(sessionId);
-                    loudnessEnhancer.setEnabled(true);
-                    loudnessEnhancer.setTargetGain(600); // +6dB (cap)
-                    log("audio: LoudnessEnhancer +600mB on session " + sessionId);
-                }
-            } catch (Exception e) {
-                log("audio: LoudnessEnhancer failed: " + e);
-                loudnessEnhancer = null;
-            }
-            ensureMaxMusic(); // Nick 2026-10-19 v1.18: re-assert before start()
+            // Nick 2026-10-23 v1.48: LoudnessEnhancer DISABLED — Nick turns
+            // the volume down deliberately (earbuds) and the +6dB boost
+            // was overriding him. Selena now plays at his set volume.
+            // (Was v1.18/v1.19: pushed her past max for margin over Spotify.)
             // Nick 2026-10-23 v1.47: stop the mic BEFORE her voice
             // comes out, so it can't be transcribed as Nick's input.
             muteMicForPlayback();
@@ -1666,7 +1635,7 @@ public class VoiceService extends Service
             String utteranceId = "selena-" + System.currentTimeMillis();
             params.putString(TextToSpeech.Engine.KEY_PARAM_UTTERANCE_ID,
                     utteranceId);
-            ensureMaxMusic(); // Nick 2026-10-19 v1.18: re-assert before speak()
+            // Nick 2026-10-23 v1.48: ensureMaxMusic DISABLED (volume raiser).
             int rc = tts.speak(text, TextToSpeech.QUEUE_FLUSH, params,
                     utteranceId);
             if (rc != TextToSpeech.SUCCESS) {
