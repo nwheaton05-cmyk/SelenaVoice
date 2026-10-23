@@ -233,6 +233,43 @@ public class VoiceService extends Service
     // v1.16: guarded — handleQueueMessage can now run on the poll worker
     // thread OR the Realtime reader thread.
     private final LinkedList<String> spokenTexts = new LinkedList<>();
+
+    /**
+     * Nick 2026-10-23 v1.40: priority interrupt. High-priority messages
+     * (the default — every normal message) break through whatever is
+     * playing: the current output is paused with its exact position saved,
+     * the priority plays immediately, then the interrupted output resumes
+     * from where it left off and the queue continues. Low-priority
+     * messages (segments of one long message) never interrupt — they queue
+     * politely and play in order.
+     *
+     * Interrupted playback is a STACK: each interrupt pushes the current
+     * state; each completion pops. A priority arriving during another
+     * priority interrupts it too ("every message interrupts whatever is
+     * playing"); completion unwinds back through the stack in order.
+     */
+    private static class InterruptedState {
+        // MP3/Aria path (null audioFile => TTS was playing)
+        File audioFile;
+        int audioPositionMs;
+        // On-device TTS/phone path (null ttsText => MP3 was playing)
+        String ttsText;
+        int ttsChar;
+        // True if it was manually paused when interrupted — after the
+        // priority, restore the paused state instead of autoplaying.
+        boolean wasPaused;
+        String serverId;
+    }
+    // LIFO stack of interrupted playbacks. Non-empty only during an
+    // interrupt/resume flow; the completion handlers check it.
+    private final java.util.ArrayDeque<InterruptedState> interruptStack =
+            new java.util.ArrayDeque<>();
+    // True while a priority item is being set up or played. Suppresses
+    // normal queue pumps in the completion handlers.
+    private boolean priorityMode = false;
+    // Set while halting TTS for an interrupt so the async onTtsStopped
+    // doesn't fire onTtsDone (which would pump the queues mid-interrupt).
+    private boolean suppressNextTtsDone = false;
     // Nick 2026-10-18 v1.7: remember the speakerphone state so we can put
     // it back after playback — leaving it forced on would make Nick's next
     // real phone call blast out of the speaker.
@@ -599,6 +636,9 @@ public class VoiceService extends Service
             // not the clock — advance past this row's timestamp only.
             long rowTs = parseRowTimestamp(record.optString("created_at", ""));
             m.put("timestamp", rowTs > 0 ? rowTs : System.currentTimeMillis());
+            // Nick 2026-10-23 v1.40: carry the priority for interrupt
+            // handling (defaults to 'high' like the server).
+            m.put("priority", record.optString("priority", "high"));
             long beforeTs = getLastTs();
             // v1.30: advance the cursor only past CONSUMED messages.
             // handleQueueMessage returns beforeTs unchanged when it skips
@@ -796,6 +836,42 @@ public class VoiceService extends Service
         synchronized (spokenTexts) {
             if (spokenTexts.contains(text)) {
                 log("dedupe: skipping duplicate text");
+                if (ts > maxTs) maxTs = ts;
+                return maxTs;
+            }
+            // Nick 2026-10-23 v1.40: priority interrupt. High-priority
+            // (the default — every normal message) breaks through
+            // whatever is playing, including a manual pause and the
+            // no-auto-readout toggle (an urgent message that never plays
+            // is a contradiction). Low-priority (segments of one long
+            // message) falls through to the normal polite queueing below.
+            String priority = m.optString("priority", "high");
+            if (!"low".equals(priority)) {
+                markSpokenLocked(text);
+                if (isPhoneVoiceMode()) {
+                    final String speakText = text;
+                    handler.post(() -> playPriorityTts(speakText));
+                } else if (!audioUrl.isEmpty()) {
+                    // Aria mode: download the MP3 on this worker thread,
+                    // then interrupt + play on the main thread.
+                    try {
+                        final File pf = downloadToCache(audioUrl);
+                        final String ptext = text;
+                        final String psid = sid;
+                        handler.post(() -> playPriorityMp3(pf, ptext, psid));
+                    } catch (Exception e) {
+                        log("priority: MP3 download failed: "
+                                + e.getMessage() + " — TTS fallback");
+                        final String speakText = text;
+                        handler.post(() -> playPriorityTts(speakText));
+                    }
+                } else {
+                    // Aria mode, text-only (MP3 never arrived): TTS
+                    // fallback so the urgent message isn't silent. The
+                    // phase-2 MP3 dedupes via spokenTexts.
+                    final String speakText = text;
+                    handler.post(() -> playPriorityTts(speakText));
+                }
                 if (ts > maxTs) maxTs = ts;
                 return maxTs;
             }
@@ -1123,6 +1199,21 @@ public class VoiceService extends Service
             }
             currentAudioFile = null;
         }
+        // Nick 2026-10-23 v1.40: priority interrupt unwinding. A non-empty
+        // stack means we're mid-flow — pop and resume the next interrupted
+        // item instead of pumping normal queues. A priority that finished
+        // with an empty stack falls through to the normal pumps.
+        if (!interruptStack.isEmpty()) {
+            log("priority: MP3 completion, unwinding interrupt stack ("
+                    + interruptStack.size() + " left)");
+            priorityMode = false;
+            resumeNextInterrupted();
+            return;
+        }
+        if (priorityMode) {
+            priorityMode = false;
+            log("priority: flow done, resuming normal queues");
+        }
         pumpAudioQueue();
         pumpTtsQueue();
     }
@@ -1212,6 +1303,14 @@ public class VoiceService extends Service
     public void onTtsStopped() {
         // Binder thread — marshal to main thread.
         handler.post(() -> {
+            if (suppressNextTtsDone) {
+                // Nick 2026-10-23 v1.40: TTS was halted for a priority
+                // interrupt — swallow the completion so the normal queues
+                // don't pump mid-interrupt.
+                suppressNextTtsDone = false;
+                log("priority: suppressed halted-TTS completion");
+                return;
+            }
             if (!ttsPauseRequested) {
                 // Not our pause (shouldn't happen) — treat as finished.
                 onTtsDone();
@@ -1324,6 +1423,19 @@ public class VoiceService extends Service
         restoreAudioRouting();
         log("tts: echo guard off");
         broadcastPlaybackState();
+        // Nick 2026-10-23 v1.40: priority interrupt unwinding (same as
+        // onPlaybackDoneNow).
+        if (!interruptStack.isEmpty()) {
+            log("priority: TTS completion, unwinding interrupt stack ("
+                    + interruptStack.size() + " left)");
+            priorityMode = false;
+            resumeNextInterrupted();
+            return;
+        }
+        if (priorityMode) {
+            priorityMode = false;
+            log("priority: flow done, resuming normal queues");
+        }
         pumpTtsQueue();
         pumpAudioQueue();
     }
@@ -1458,6 +1570,10 @@ public class VoiceService extends Service
      */
     private void stopCurrentPlayback() {
         log("stop: halting current playback");
+        // Nick 2026-10-23 v1.40: stop cancels any priority flow too.
+        priorityMode = false;
+        suppressNextTtsDone = false;
+        interruptStack.clear();
         // Disarm the TTS pause watchdog first — with ttsPauseRequested
         // false, the engine's onStop routes to onTtsDone(), which pumps
         // the queues: a clean no-op when we cleared them, or continues
@@ -1479,6 +1595,223 @@ public class VoiceService extends Service
         isPlayingAudio = false;
         setPlayingAudio(false);
         broadcastPlaybackState();
+    }
+
+    // ------------------------------------------------------------ v1.40 priority interrupt
+
+    /**
+     * Nick 2026-10-23 v1.40: save the current playback state onto the
+     * interrupt stack and halt output quietly (no toast, no queue pumps).
+     * Runs on the main thread. After this returns, the caller plays the
+     * priority item immediately.
+     */
+    private void interruptCurrentPlayback() {
+        InterruptedState st = new InterruptedState();
+        st.wasPaused = playbackPaused || ttsPaused;
+        boolean something = false;
+        // MP3/Aria path: save file + position.
+        if (player != null && (safeIsPlaying() || playbackPaused)
+                && currentAudioFile != null) {
+            st.audioFile = currentAudioFile;
+            try {
+                st.audioPositionMs = player.getCurrentPosition();
+            } catch (Exception e) {
+                st.audioPositionMs = 0;
+            }
+            something = true;
+            log("priority: interrupting MP3 at " + st.audioPositionMs + "ms"
+                    + (st.wasPaused ? " (was paused)" : ""));
+        }
+        // On-device TTS/phone path: save text + char offset.
+        if ((ttsSpeaking || ttsPaused) && ttsCurrentText != null) {
+            st.ttsText = ttsCurrentText;
+            st.ttsChar = ttsResumeAtChar;
+            something = true;
+            log("priority: interrupting TTS at char " + st.ttsChar
+                    + (st.wasPaused ? " (was paused)" : ""));
+        }
+        if (something) {
+            interruptStack.push(st);
+        } else {
+            log("priority: nothing playing to interrupt");
+        }
+        // Halt output without firing completion pumps. For TTS, suppress
+        // the async onTtsStopped -> onTtsDone chain; for MP3, a synchronous
+        // release fires no completion callback.
+        if (ttsSpeaking) {
+            suppressNextTtsDone = true;
+            try {
+                if (tts != null) tts.stop();
+            } catch (Exception e) {
+                log("priority: tts.stop failed: " + e.getMessage());
+            }
+            ttsSpeaking = false;
+        }
+        ttsPaused = false;
+        ttsCurrentText = null;
+        ttsResumeAtChar = 0;
+        ttsPauseRequested = false;
+        releasePlayer();
+        playing = false;
+        isPlayingAudio = false;
+        setPlayingAudio(false);
+        broadcastPlaybackState();
+    }
+
+    /**
+     * Nick 2026-10-23 v1.40: play a high-priority MP3 item immediately,
+     * interrupting whatever is playing. Runs on the main thread; the file
+     * must already be downloaded.
+     */
+    private void playPriorityMp3(final File f, final String text,
+            final String serverId) {
+        log("priority: playing high-priority MP3"
+                + (serverId != null ? " id=" + serverId : ""));
+        priorityMode = true;
+        interruptCurrentPlayback();
+        markSpokenLocked(text);
+        // MessageHistory entry so the card exists for replay.
+        MessageHistory.add(text, f, serverId);
+        broadcastMessage(text);
+        toast("Priority message");
+        playFileNow(f);
+    }
+
+    /**
+     * Nick 2026-10-23 v1.40: speak a high-priority text immediately via
+     * on-device TTS, interrupting whatever is playing. Runs on main thread.
+     */
+    private void playPriorityTts(final String text) {
+        log("priority: speaking high-priority text via on-device TTS");
+        priorityMode = true;
+        interruptCurrentPlayback();
+        markSpokenLocked(text);
+        broadcastMessage(text);
+        MessageHistory.add(text, null, null);
+        toast("Priority message");
+        ttsSpeaking = true;
+        speakOnDevice(text, false);
+    }
+
+    /**
+     * Nick 2026-10-23 v1.40: called from onPlaybackDoneNow/onTtsDone when
+     * priorityMode is true. Returns true if the priority flow handled the
+     * completion (caller must NOT pump normal queues).
+     */
+    private boolean onPriorityPlaybackDone() {
+        if (!priorityMode) return false;
+        priorityMode = false;
+        if (!interruptStack.isEmpty()) {
+            resumeNextInterrupted();
+        } else {
+            log("priority: flow done, nothing was interrupted");
+            pumpAudioQueue();
+            pumpTtsQueue();
+        }
+        return true;
+    }
+
+    /**
+     * Nick 2026-10-23 v1.40: pop the next interrupted state and resume it.
+     * If it was manually paused, restore the paused state (no autoplay —
+     * Nick: "let it resume from where I paused", i.e. HE resumes).
+     * Runs on the main thread.
+     */
+    private void resumeNextInterrupted() {
+        InterruptedState st = interruptStack.poll();
+        if (st == null) {
+            pumpAudioQueue();
+            pumpTtsQueue();
+            return;
+        }
+        if (st.wasPaused) {
+            restorePausedState(st);
+            toast("Priority done — paused where you left off");
+            log("priority: restored paused state"
+                    + (st.serverId != null ? " id=" + st.serverId : ""));
+            broadcastPlaybackState();
+            // Stack may hold more, but the user took manual control —
+            // the chain continues when THEY resume (completion handlers
+            // check the non-empty stack).
+            return;
+        }
+        toast("Resuming where you left off");
+        if (st.audioFile != null) {
+            resumeInterruptedMp3(st);
+        } else if (st.ttsText != null) {
+            resumeInterruptedTts(st);
+        } else {
+            // Nothing to resume (shouldn't happen) — continue chain.
+            resumeNextInterrupted();
+        }
+    }
+
+    /** Rebuild the MP3 player for the interrupted file at saved position. */
+    private void resumeInterruptedMp3(InterruptedState st) {
+        File f = st.audioFile;
+        if (f == null || !f.exists()) {
+            log("priority: interrupted MP3 file gone, skipping resume");
+            resumeNextInterrupted();
+            return;
+        }
+        log("priority: resuming MP3 at " + st.audioPositionMs + "ms");
+        // Same setup as playFileNow, then seek before start.
+        playFileNow(f);
+        if (player != null && st.audioPositionMs > 0) {
+            try {
+                player.seekTo(st.audioPositionMs);
+            } catch (Exception e) {
+                log("priority: seek failed: " + e.getMessage());
+            }
+        }
+    }
+
+    /** Re-speak the interrupted TTS text from the saved char offset. */
+    private void resumeInterruptedTts(InterruptedState st) {
+        String text = st.ttsText;
+        if (text == null || text.isEmpty()) {
+            resumeNextInterrupted();
+            return;
+        }
+        int at = Math.min(st.ttsChar, text.length());
+        String rest = text.substring(at);
+        if (rest.trim().isEmpty()) {
+            log("priority: interrupted TTS was at end, skipping resume");
+            resumeNextInterrupted();
+            return;
+        }
+        log("priority: resuming TTS from char " + at);
+        ttsCurrentText = text;
+        ttsResumeAtChar = at;
+        ttsSpeaking = true;
+        speakOnDevice(rest, true);
+    }
+
+    /**
+     * Restore the exact paused state after a priority that broke through
+     * a manual pause. MP3: rebuild paused at position. TTS: restore
+     * paused-at-char. No autoplay.
+     */
+    private void restorePausedState(InterruptedState st) {
+        if (st.audioFile != null && st.audioFile.exists()) {
+            // Rebuild the player paused at the saved position.
+            playFileNow(st.audioFile);
+            if (player != null) {
+                try {
+                    if (st.audioPositionMs > 0) {
+                        player.seekTo(st.audioPositionMs);
+                    }
+                    player.pause();
+                    playbackPaused = true;
+                } catch (Exception e) {
+                    log("priority: restore-paused MP3 failed: " + e.getMessage());
+                }
+            }
+        } else if (st.ttsText != null) {
+            ttsCurrentText = st.ttsText;
+            ttsResumeAtChar = Math.min(st.ttsChar, st.ttsText.length());
+            ttsPaused = true;
+        }
     }
 
     /**
@@ -1512,6 +1845,11 @@ public class VoiceService extends Service
      */
     private void skipToNewest() {
         log("skip: abandoning current playback, clearing queues");
+        // Nick 2026-10-23 v1.40: skip takes manual control — cancel any
+        // priority interrupt flow and drop the saved resume stack.
+        priorityMode = false;
+        suppressNextTtsDone = false;
+        interruptStack.clear();
         // Disarm the TTS pause watchdog first — with ttsPauseRequested
         // false, the engine's onStop routes to onTtsDone(), which pumps
         // the (now empty) queues: a clean no-op.
