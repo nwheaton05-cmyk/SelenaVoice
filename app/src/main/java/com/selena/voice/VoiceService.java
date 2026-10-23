@@ -2829,7 +2829,7 @@ public class VoiceService extends Service
         MessageHistory.addNick(sentence);
         Intent sent = new Intent(ACTION_INPUT_SENT);
         sent.putExtra(EXTRA_TEXT, sentence);
-        sendBroadcast(sent);
+        sendAppBroadcast(sent);
         final String toPost = sentence;
         new Thread(new InputPostTask(this, toPost)).start();
         // Nick 2026-10-23 v1.46: polite interruption — the sentence is
