@@ -216,6 +216,13 @@ public class VoiceService extends Service
     private SpeechRecognizer recognizer;
     private boolean recognizerActive = false;
     private boolean destroyed = false;
+    // Nick 2026-10-23 v1.47: mic mute during Selena playback — true
+    // between muteMicForPlayback() (playback starting) and
+    // unmuteMicAfterPlayback() (playback fully done). While true the
+    // recognizer is stopped entirely so her voice can't be transcribed
+    // as Nick's input. Inverse of the v1.46 polite-interruption hold
+    // (which holds PLAYBACK while Nick speaks).
+    private boolean micMutedForPlayback = false;
     private MediaPlayer player;
     // Nick 2026-10-22 v1.34: path of the MP3 currently loaded in the
     // player (null when idle). Lets CLEAR_UNLOCKED stop playback only
@@ -1307,6 +1314,9 @@ public class VoiceService extends Service
                 loudnessEnhancer = null;
             }
             ensureMaxMusic(); // Nick 2026-10-19 v1.18: re-assert before start()
+            // Nick 2026-10-23 v1.47: stop the mic BEFORE her voice
+            // comes out, so it can't be transcribed as Nick's input.
+            muteMicForPlayback();
             player.start();
             isPlayingAudio = true;
             playbackPaused = false;
@@ -1377,6 +1387,9 @@ public class VoiceService extends Service
         }
         pumpAudioQueue();
         pumpTtsQueue();
+        // Nick 2026-10-23 v1.47: if the pumps didn't start new
+        // playback, she's fully done — restart the mic if we muted it.
+        if (!isPlayingAudio) unmuteMicAfterPlayback();
     }
 
     /** Runs on a worker thread: download one audio file to the cache dir. */
@@ -1640,6 +1653,9 @@ public class VoiceService extends Service
         log("tts: stream=MUSIC");
         requestAudioFocus();
         boostMusicVolume();
+        // Nick 2026-10-23 v1.47: stop the mic BEFORE she speaks, so
+        // her voice can't be transcribed as Nick's input.
+        muteMicForPlayback();
         isPlayingAudio = true;
         log("tts: echo guard on");
         broadcastPlaybackState();
@@ -1700,6 +1716,9 @@ public class VoiceService extends Service
         }
         pumpTtsQueue();
         pumpAudioQueue();
+        // Nick 2026-10-23 v1.47: if the pumps didn't start new
+        // playback, she's fully done — restart the mic if we muted it.
+        if (!isPlayingAudio) unmuteMicAfterPlayback();
     }
 
     private void releasePlayer() {
@@ -1776,6 +1795,9 @@ public class VoiceService extends Service
         }
         if (didPause) {
             toast("Paused");
+            // Nick 2026-10-23 v1.47: paused = she's not speaking —
+            // the mic should be live so Nick can talk.
+            unmuteMicAfterPlayback();
         } else {
             log("pause: nothing was playing");
             toast("Nothing playing to pause");
@@ -1817,6 +1839,11 @@ public class VoiceService extends Service
         }
         if (didResume) {
             toast("Resumed");
+            // Nick 2026-10-23 v1.47: resuming = she's speaking again —
+            // stop the mic so her voice isn't transcribed. (TTS resume
+            // goes through speakOnDevice which mutes; this covers the
+            // MP3 player.start() path.)
+            muteMicForPlayback();
         } else {
             log("resume: nothing was paused");
             toast("Nothing paused");
@@ -1858,6 +1885,9 @@ public class VoiceService extends Service
         playing = false;
         isPlayingAudio = false;
         setPlayingAudio(false);
+        // Nick 2026-10-23 v1.47: stopped = she's not speaking —
+        // restart the mic if we muted it.
+        unmuteMicAfterPlayback();
         broadcastPlaybackState();
     }
 
@@ -2632,6 +2662,9 @@ public class VoiceService extends Service
             return;
         }
         if (!recognizerActive || recognizer == null || destroyed) return;
+        // Nick 2026-10-23 v1.47: never start listening while muted for
+        // Selena playback — unmuteMicAfterPlayback() restarts when done.
+        if (micMutedForPlayback) return;
         try {
             muteBeep();
             Intent intent = new Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH);
@@ -2656,7 +2689,9 @@ public class VoiceService extends Service
     }
 
     private void scheduleRecognizerRestart() {
-        if (destroyed || !recognizerActive) return;
+        // Nick 2026-10-23 v1.47: never restart while muted for Selena
+        // playback — the unmute path restarts when she's done.
+        if (destroyed || !recognizerActive || micMutedForPlayback) return;
         handler.postDelayed(new RecognizerRestartTask(this), RESTART_DELAY_MS);
     }
 
@@ -2667,14 +2702,16 @@ public class VoiceService extends Service
      * launchRecognizer() will re-mute (no-op) before startListening().
      */
     public void scheduleQuietRestart() {
-        if (destroyed || !recognizerActive) return;
+        // Nick 2026-10-23 v1.47: never restart while muted for Selena
+        // playback — the unmute path restarts when she's done.
+        if (destroyed || !recognizerActive || micMutedForPlayback) return;
         Log.d(TAG, "quiet restart scheduled (" + RESTART_DELAY_MS + "ms)");
         handler.postDelayed(new RecognizerRestartTask(this), RESTART_DELAY_MS);
     }
 
     /** Called by RecognizerRestartTask on main thread. */
     public void restartRecognizerNow() {
-        if (destroyed || !recognizerActive) return;
+        if (destroyed || !recognizerActive || micMutedForPlayback) return;
         destroyRecognizer();
         try {
             recognizer = SpeechRecognizer.createSpeechRecognizer(this);
@@ -2684,6 +2721,55 @@ public class VoiceService extends Service
             Log.w(TAG, "restart failed", e);
             scheduleRecognizerRestart();
         }
+    }
+
+    /**
+     * Nick 2026-10-23 v1.47: true while the mic is muted for Selena
+     * playback. Used by ServiceRecognitionListener to swallow the
+     * cancel() error without scheduling a restart.
+     */
+    public boolean isMicMutedForPlayback() {
+        return micMutedForPlayback;
+    }
+
+    /**
+     * Nick 2026-10-23 v1.47: stop the recognizer entirely when Selena
+     * starts speaking, so her voice can't be transcribed as Nick's
+     * input. Uses cancel() (not stopListening()) so no partial result
+     * fires. The onError(ERROR_CLIENT) this triggers is swallowed by
+     * the micMutedForPlayback guards — no restart is scheduled.
+     * Idempotent: safe to call when already muted or not listening.
+     */
+    private void muteMicForPlayback() {
+        if (micMutedForPlayback) return;
+        if (!recognizerActive || recognizer == null) return;
+        micMutedForPlayback = true;
+        log("mic: muted for Selena playback");
+        try {
+            recognizer.cancel();
+        } catch (Exception e) {
+            Log.w(TAG, "mic mute cancel failed", e);
+        }
+        broadcastListeningState();
+    }
+
+    /**
+     * Nick 2026-10-23 v1.47: restart the recognizer after Selena
+     * finishes speaking, if we muted it. Uses the existing clean
+     * restart path (destroy + recreate) since cancel() can leave
+     * the recognizer in an uncertain state. No-op if not muted or
+     * the listening mode was turned off while she spoke.
+     */
+    private void unmuteMicAfterPlayback() {
+        if (!micMutedForPlayback) return;
+        micMutedForPlayback = false;
+        if (destroyed || !recognizerActive) {
+            log("mic: unmute skipped (not listening anymore)");
+            broadcastListeningState();
+            return;
+        }
+        log("mic: unmuted after Selena playback, restarting recognizer");
+        restartRecognizerNow();
     }
 
     // Callbacks from ServiceRecognitionListener (main thread):

@@ -79,6 +79,10 @@ public class ServiceRecognitionListener implements RecognitionListener {
     @Override
     public void onError(int error) {
         Log.d(TAG, "recognizer error: " + error);
+        // Nick 2026-10-23 v1.47: if the mic is muted for Selena
+        // playback, swallow the error (cancel() triggers ERROR_CLIENT)
+        // — the unmute path restarts the recognizer when she's done.
+        if (service.isMicMutedForPlayback()) return;
         if (error == SpeechRecognizer.ERROR_NO_MATCH
                 || error == SpeechRecognizer.ERROR_SPEECH_TIMEOUT) {
             // Nick 2026-10-18 v1.3: routine silence, not a real error.
