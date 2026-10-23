@@ -246,13 +246,20 @@ public class VoiceService extends Service
     @Override
     public void onCreate() {
         super.onCreate();
+        // FOREGROUND FIRST (Nick 2026-10-23): Android 12+ kills the service
+        // with ForegroundServiceDidNotStartInTimeException if startForeground()
+        // doesn't land within seconds of startForegroundService(). Everything
+        // else in onCreate must trail this call — nothing may ever be inserted
+        // above it. (Escalation 2026-10-23: one such crash on Operator 2's
+        // phone under v1.37; the old order was fast too, but belt and
+        // suspenders — this ordering is the platform's stated requirement.)
+        notificationManager = getSystemService(NotificationManager.class);
+        createChannel();
+        startForeground(NOTIF_ID, buildNotification("Listening for Selena…"));
         // Nick 2026-10-23 v1.36: global crash reporter (service process).
         CrashReporter.install(this);
         audioManager = (AudioManager) getSystemService(Context.AUDIO_SERVICE);
-        notificationManager = getSystemService(NotificationManager.class);
         recognitionListener = new ServiceRecognitionListener(this);
-        createChannel();
-        startForeground(NOTIF_ID, buildNotification("Listening for Selena…"));
         // Nick 2026-10-19 v1.16: hold a partial wake lock for the service's
         // lifetime so the poll loop, Realtime socket, recognizer, and TTS
         // keep running with the screen locked. (MediaPlayer additionally
