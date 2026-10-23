@@ -7,8 +7,10 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
 import android.content.pm.PackageManager;
+import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
+import android.provider.Settings;
 import android.text.Html;
 import android.text.TextUtils;
 import android.util.Log;
@@ -238,6 +240,14 @@ public class MainActivity extends Activity {
 
         alwaysOnSwitch.setChecked(VoiceService.getAlwaysListening(this));
         alwaysOnSwitch.setOnCheckedChangeListener((v, on) -> {
+            // Nick 2026-10-23 v1.41: don't auto-start mic listening until
+            // RECORD_AUDIO is granted. Revert the flip, prompt, retry on grant.
+            if (on && !hasMicPermission()) {
+                alwaysOnSwitch.setChecked(false);
+                pendingMicAction = "always";
+                ensureMicPermission();
+                return;
+            }
             VoiceService.setAlwaysListening(this, on);
             if (on) {
                 // The switch owns the mic now — drop any manual toggle state.
@@ -250,6 +260,13 @@ public class MainActivity extends Activity {
             if (alwaysOnSwitch.isChecked()) {
                 Toast.makeText(this, "Already always listening — mic is live",
                         Toast.LENGTH_SHORT).show();
+                return;
+            }
+            // Nick 2026-10-23 v1.41: no mic without RECORD_AUDIO — prompt
+            // first, engage on grant.
+            if (!hasMicPermission()) {
+                pendingMicAction = "manual";
+                ensureMicPermission();
                 return;
             }
             if (!manualMicOn) {
@@ -315,11 +332,11 @@ public class MainActivity extends Activity {
         });
 
         requestPermissions();
-        // Service starts after permission grant (see onRequestPermissionsResult).
-        // If already granted, start now.
-        if (hasAllPermissions()) {
-            startVoiceService();
-        }
+        // Nick 2026-10-23 v1.41: the service starts as mediaPlayback, which
+        // needs NO runtime permission — playback, polling, and the queue
+        // work with the mic denied. Mic listening only engages after
+        // RECORD_AUDIO is granted (the service refuses otherwise).
+        startVoiceService();
     }
 
     // ------------------------------------------------------------ in-app updater
@@ -567,25 +584,86 @@ public class MainActivity extends Activity {
         spkSwitch.setChecked(VoiceService.getForceSpeaker(this));
     }
 
-    private boolean hasAllPermissions() {
-        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO)
-                != PackageManager.PERMISSION_GRANTED) return false;
-        if (Build.VERSION.SDK_INT >= 33
-                && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS)
-                != PackageManager.PERMISSION_GRANTED) return false;
-        return true;
+    private static final int REQ_MIC = 1;
+    // Nick 2026-10-23 v1.41: a mic action the user tapped while RECORD_AUDIO
+    // was missing — retried once the permission is granted ("always" =
+    // the always-listen switch, "manual" = the mic button).
+    private String pendingMicAction = null;
+
+    private boolean hasMicPermission() {
+        return checkSelfPermission(Manifest.permission.RECORD_AUDIO)
+                == PackageManager.PERMISSION_GRANTED;
+    }
+
+    private boolean micAskedBefore() {
+        return getPreferences(MODE_PRIVATE).getBoolean("mic_asked", false);
+    }
+
+    private void setMicAskedBefore() {
+        getPreferences(MODE_PRIVATE).edit().putBoolean("mic_asked", true).apply();
     }
 
     @Override
     public void onRequestPermissionsResult(int requestCode, String[] permissions,
                                            int[] grantResults) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults);
-        if (hasAllPermissions()) {
-            startVoiceService();
+        // Nick 2026-10-23 v1.41: the service is already running (started in
+        // onCreate as mediaPlayback — no permission needed). Mic features
+        // engage only if granted; a denial never crashes anything.
+        if (hasMicPermission()) {
+            if (pendingMicAction != null) {
+                String a = pendingMicAction;
+                pendingMicAction = null;
+                engageMicAction(a);
+            } else if (alwaysOnSwitch.isChecked()) {
+                // Service-side auto-start refused while denied; user intent
+                // (switch on) stands, so engage now that it's granted.
+                VoiceService.setAlwaysListening(this, true);
+            }
         } else {
             Toast.makeText(this,
-                    "Selena Voice needs mic + notification permissions to work",
+                    "Mic permission denied — voice input stays off. "
+                            + "Enable it in Settings > Apps > Selena Voice > Permissions.",
                     Toast.LENGTH_LONG).show();
+        }
+    }
+
+    /** Retry a mic action the user tapped before the permission arrived. */
+    private void engageMicAction(String action) {
+        if ("always".equals(action)) {
+            // Fires the switch listener -> setAlwaysListening(true) -> service.
+            alwaysOnSwitch.setChecked(true);
+        } else {
+            Intent i = new Intent(this, VoiceService.class);
+            i.setAction("MANUAL_LISTEN");
+            startForegroundService(i);
+            manualMicOn = true;
+            updateMicButton();
+        }
+    }
+
+    /**
+     * Nick 2026-10-23 v1.41: surface the RECORD_AUDIO prompt. First ask goes
+     * through the system dialog; after a denial we explain and ask again;
+     * once the user has blocked it ("don't ask again" / Settings revoke),
+     * only Settings can fix it — take them there.
+     */
+    public void ensureMicPermission() {
+        if (hasMicPermission()) return;
+        if (shouldShowRequestPermissionRationale(Manifest.permission.RECORD_AUDIO)) {
+            Toast.makeText(this,
+                    "Selena Voice needs the mic to hear you — please allow it",
+                    Toast.LENGTH_LONG).show();
+            requestPermissions(new String[]{Manifest.permission.RECORD_AUDIO}, REQ_MIC);
+        } else if (!micAskedBefore()) {
+            setMicAskedBefore();
+            requestPermissions(new String[]{Manifest.permission.RECORD_AUDIO}, REQ_MIC);
+        } else {
+            Toast.makeText(this,
+                    "Mic is blocked — enable it in Settings > Apps > Selena Voice > Permissions",
+                    Toast.LENGTH_LONG).show();
+            startActivity(new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                    Uri.parse("package:" + getPackageName())));
         }
     }
 
@@ -618,6 +696,8 @@ public class MainActivity extends Activity {
         f.addAction(VoiceService.ACTION_INPUT_SENT);
         f.addAction(VoiceService.ACTION_SPEECH_DETECTED);
         f.addAction(VoiceService.ACTION_LISTENING_STATE);
+        // Nick 2026-10-23 v1.41: service asks the activity to prompt for mic.
+        f.addAction(VoiceService.ACTION_REQUEST_MIC_PERMISSION);
         f.addAction(VoiceService.ACTION_POLL_STATUS);
         f.addAction(VoiceService.ACTION_PLAYBACK_STATE);
         f.addAction(VoiceService.ACTION_TOAST);

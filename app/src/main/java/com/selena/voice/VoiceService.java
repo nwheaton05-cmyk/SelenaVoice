@@ -1,5 +1,6 @@
 package com.selena.voice;
 
+import android.Manifest;
 import android.app.Notification;
 import android.app.NotificationChannel;
 import android.app.NotificationManager;
@@ -7,12 +8,15 @@ import android.app.PendingIntent;
 import android.app.Service;
 import android.content.Context;
 import android.content.Intent;
+import android.content.pm.PackageManager;
+import android.content.pm.ServiceInfo;
 import android.media.AudioAttributes;
 import android.media.AudioDeviceInfo;
 import android.media.AudioFocusRequest;
 import android.media.AudioManager;
 import android.media.MediaPlayer;
 import android.media.audiofx.LoudnessEnhancer;
+import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.IBinder;
@@ -22,6 +26,7 @@ import android.speech.RecognizerIntent;
 import android.speech.SpeechRecognizer;
 import android.speech.tts.TextToSpeech;
 import android.util.Log;
+import android.widget.Toast;
 
 import org.json.JSONArray;
 import org.json.JSONObject;
@@ -88,6 +93,9 @@ public class VoiceService extends Service
     // Nick 2026-10-22 v1.35: hard-stop all playback from the UI.
     public static final String ACTION_STOP_ALL = "com.selena.voice.STOP_ALL";
     public static final String ACTION_REQUEST_STATUS = "com.selena.voice.REQUEST_STATUS";
+    // Nick 2026-10-23 v1.41: service -> activity request to surface the
+    // RECORD_AUDIO permission prompt (system dialog or Settings).
+    public static final String ACTION_REQUEST_MIC_PERMISSION = "com.selena.voice.REQUEST_MIC_PERMISSION";
     public static final String EXTRA_FILE_PATH = "file_path";
     public static final String EXTRA_POLL_STATUS = "poll_status";
     public static final String EXTRA_TEXT = "text";
@@ -292,7 +300,13 @@ public class VoiceService extends Service
         // suspenders — this ordering is the platform's stated requirement.)
         notificationManager = getSystemService(NotificationManager.class);
         createChannel();
-        startForeground(NOTIF_ID, buildNotification("Listening for Selena…"));
+        // Nick 2026-10-23 v1.41: start as MEDIA_PLAYBACK only (explicit type).
+        // mediaPlayback needs no runtime permission, so the service can
+        // always start — even with RECORD_AUDIO denied or never granted.
+        // The microphone type is claimed ONLY while a listening session is
+        // live (see upgradeToMicrophone/downgradeToMediaPlayback).
+        startForegroundAs("Selena Voice ready",
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK);
         // Nick 2026-10-23 v1.36: global crash reporter (service process).
         CrashReporter.install(this);
         audioManager = (AudioManager) getSystemService(Context.AUDIO_SERVICE);
@@ -492,6 +506,55 @@ public class VoiceService extends Service
         try {
             notificationManager.notify(NOTIF_ID, buildNotification(text));
         } catch (Exception ignored) {}
+    }
+
+    // ------------------------------------------------------------ foreground service type mgmt
+    // Nick 2026-10-23 v1.41 (mic-permission crash fix): the manifest declares
+    // microphone|mediaPlayback, but the 2-arg startForeground() implies ALL
+    // declared types — on Android 14 (targetSdk 34) a foreground service
+    // started with the microphone type dies without RECORD_AUDIO granted.
+    // So: start (and live) as MEDIA_PLAYBACK, which needs no permission.
+    // The microphone type is claimed only while actually listening, right
+    // before SpeechRecognizer.startListening(), and dropped the moment the
+    // last listening session stops. A missing/denied mic can never again
+    // kill the service at startup.
+
+    private void startForegroundAs(String text, int type) {
+        Notification n = buildNotification(text);
+        if (Build.VERSION.SDK_INT >= 29) {
+            startForeground(NOTIF_ID, n, type);
+        } else {
+            startForeground(NOTIF_ID, n);
+        }
+    }
+
+    private void upgradeToMicrophone() {
+        startForegroundAs("🎤 Listening…",
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
+                        | ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK);
+    }
+
+    private void downgradeToMediaPlayback() {
+        startForegroundAs("Selena Voice ready",
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK);
+    }
+
+    private boolean hasMicPermission() {
+        return checkSelfPermission(Manifest.permission.RECORD_AUDIO)
+                == PackageManager.PERMISSION_GRANTED;
+    }
+
+    // Listening was refused for lack of RECORD_AUDIO: tell the user and
+    // ask the activity to surface the permission prompt (system dialog or
+    // Settings). Never start the recognizer, never touch the mic type.
+    private void micDeniedFeedback() {
+        Log.w(TAG, "listening refused: RECORD_AUDIO not granted");
+        try {
+            handler.post(() -> Toast.makeText(getApplicationContext(),
+                    "Mic permission needed — grant it in Settings > Apps > Selena Voice",
+                    Toast.LENGTH_LONG).show());
+        } catch (Exception ignored) {}
+        sendAppBroadcast(new Intent(ACTION_REQUEST_MIC_PERMISSION));
     }
 
     // ------------------------------------------------------------ beep suppression
@@ -2235,11 +2298,20 @@ public class VoiceService extends Service
 
     private void startContinuousListening() {
         if (recognizerActive || destroyed) return;
+        // Nick 2026-10-23 v1.41: never claim the mic (recognizer or FGS
+        // type) without RECORD_AUDIO. Refuse loudly instead of crashing.
+        if (!hasMicPermission()) {
+            micDeniedFeedback();
+            broadcastListeningState();
+            return;
+        }
         if (!SpeechRecognizer.isRecognitionAvailable(this)) {
             log("speech recognition not available");
             return;
         }
         try {
+            // v1.41: claim the microphone FGS type BEFORE startListening().
+            upgradeToMicrophone();
             recognizer = SpeechRecognizer.createSpeechRecognizer(this);
             recognizer.setRecognitionListener(recognitionListener);
             recognizerActive = true;
@@ -2254,6 +2326,9 @@ public class VoiceService extends Service
 
     private void stopContinuousListening() {
         recognizerActive = false;
+        // Nick 2026-10-23 v1.41: last listening session ended — drop the
+        // microphone FGS type immediately; live on mediaPlayback only.
+        downgradeToMediaPlayback();
         unmuteBeep();
         destroyRecognizer();
         updateNotification("⏸️ Paused");
@@ -2261,6 +2336,17 @@ public class VoiceService extends Service
     }
 
     private void launchRecognizer() {
+        // Nick 2026-10-23 v1.41: belt and suspenders — no permission, no
+        // recognizer, ever. Refuse rather than risk a SecurityException from
+        // any path that reaches startListening() unguarded.
+        if (!hasMicPermission()) {
+            Log.w(TAG, "launchRecognizer refused: RECORD_AUDIO not granted");
+            recognizerActive = false;
+            destroyRecognizer();
+            downgradeToMediaPlayback();
+            broadcastListeningState();
+            return;
+        }
         if (!recognizerActive || recognizer == null || destroyed) return;
         try {
             muteBeep();

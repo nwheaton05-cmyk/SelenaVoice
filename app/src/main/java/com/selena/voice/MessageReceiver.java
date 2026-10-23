@@ -38,6 +38,10 @@ public class MessageReceiver extends BroadcastReceiver {
             // Nick 2026-10-22 v1.28: pause/resume feedback.
             String msg = intent.getStringExtra(VoiceService.EXTRA_TOAST);
             if (msg != null) activity.onToast(msg);
+        } else if (action.equals(VoiceService.ACTION_REQUEST_MIC_PERMISSION)) {
+            // Nick 2026-10-23 v1.41: service refused to listen — surface
+            // the mic permission prompt (dialog or Settings).
+            activity.ensureMicPermission();
         }
     }
 }
