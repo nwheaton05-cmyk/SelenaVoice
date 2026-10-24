@@ -2871,7 +2871,7 @@ public class VoiceService extends Service
         // chunks the filters discard. The gate is re-checked at play
         // time, so a re-started utterance re-holds.
         // Nick 2026-10-23 v1.48: 3s to match SENTENCE_GAP_MS.
-        handler.postDelayed(() -> releasePoliteHold(), 3000);
+        handler.postDelayed(() -> releasePoliteHold(), 4000);
     }
 
     public void onRecognizerDone() {
@@ -2886,7 +2886,7 @@ public class VoiceService extends Service
         // ~10s (3s gap + 5s restart + init) for dictation to resume.
         handler.postDelayed(new RecognizerRestartTask(this), 500);
         // Nick 2026-10-23 v1.48: 3s to match SENTENCE_GAP_MS.
-        handler.postDelayed(() -> releasePoliteHold(), 3000);
+        handler.postDelayed(() -> releasePoliteHold(), 4000);
     }
 
     /**
@@ -2944,7 +2944,7 @@ public class VoiceService extends Service
     private long lastChunkMs = 0;
     // Nick 2026-10-23 v1.48: 3-second gap — Nick speaks, 3s of quiet =
     // batch end. (Was 1.0s in v1.46; Nick found 1s cut him off mid-thought.)
-    private static final long SENTENCE_GAP_MS = 3000;
+    private static final long SENTENCE_GAP_MS = 4000; // Nick 2026-10-23: 4s silence before batch (was 3s)
     private Runnable sentenceFlushTask = null;
 
     /**
