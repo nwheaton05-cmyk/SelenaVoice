@@ -263,6 +263,16 @@ public class MainActivity extends Activity {
         CrashReporter.install(this);
         setContentView(R.layout.activity_main);
 
+        // Nick 2026-10-23 v1.48: tap-anywhere to pause her. During Selena's
+        // playback (tap-interrupt mode, or as backup in voice-interrupt
+        // mode), tapping anywhere on the screen pauses her voice. The
+        // service ignores it when nothing is playing (toasts).
+        findViewById(android.R.id.content).setOnClickListener(v -> {
+            Intent pause = new Intent(this, VoiceService.class);
+            pause.setAction("PAUSE_PLAYBACK");
+            startForegroundService(pause);
+        });
+
         statusText = findViewById(R.id.statusText);
         pollStatusText = findViewById(R.id.pollStatusText);
         // Nick 2026-10-19 v1.15: show the installed version so we can
@@ -275,6 +285,12 @@ public class MainActivity extends Activity {
             String buildDate = "2026-10-22";
             ((TextView) findViewById(R.id.versionText)).setText("v" + vn + " (" + buildDate + ")");
         } catch (Exception ignored) {}
+        // Nick 2026-10-23 v1.48: long-press version text to set earbuds
+        // BT device name (one-time setup for voice-interrupt mode).
+        findViewById(R.id.versionText).setOnLongClickListener(v -> {
+            showEarbudsSetupDialog();
+            return true;
+        });
         // Nick 2026-10-21 v1.24: persistent message history with replay.
         MessageHistory.init(this);
         messageList = findViewById(R.id.messageList);
@@ -994,5 +1010,41 @@ public class MainActivity extends Activity {
             pulseAnimator.setDuration(600);
             pulseAnimator.start();
         });
+    }
+
+    /**
+     * Nick 2026-10-23 v1.48: one-time earbuds setup. Long-press the
+     * version text to open this. Enter the Bluetooth name of Nick's
+     * earbuds (as shown in Android BT settings). When this device is
+     * connected, Selena uses voice-interrupt (mic stays on during her
+     * speech); otherwise tap-to-interrupt.
+     */
+    private void showEarbudsSetupDialog() {
+        android.widget.EditText input = new android.widget.EditText(this);
+        input.setHint("Earbuds Bluetooth name");
+        // Pre-fill with current saved value, if any.
+        try {
+            android.content.SharedPreferences prefs =
+                    getSharedPreferences("selena_voice_prefs", MODE_PRIVATE);
+            String cur = prefs.getString("earbuds_device_name", "");
+            if (cur != null) input.setText(cur);
+        } catch (Exception ignored) {}
+        new android.app.AlertDialog.Builder(this)
+                .setTitle("Earbuds device")
+                .setMessage("Enter the Bluetooth name of your earbuds "
+                        + "(as shown in Android Bluetooth settings). "
+                        + "When connected, you can interrupt Selena by voice.")
+                .setView(input)
+                .setPositiveButton("Save", (d, w) -> {
+                    String name = input.getText().toString().trim();
+                    getSharedPreferences("selena_voice_prefs", MODE_PRIVATE)
+                            .edit().putString("earbuds_device_name", name).apply();
+                    android.widget.Toast.makeText(this,
+                            name.isEmpty() ? "Earbuds cleared"
+                                    : "Earbuds set: " + name,
+                            android.widget.Toast.LENGTH_SHORT).show();
+                })
+                .setNegativeButton("Cancel", null)
+                .show();
     }
 }

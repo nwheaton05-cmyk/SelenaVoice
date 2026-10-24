@@ -6,8 +6,13 @@ import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.app.PendingIntent;
 import android.app.Service;
+import android.bluetooth.BluetoothA2dp;
+import android.bluetooth.BluetoothAdapter;
+import android.bluetooth.BluetoothDevice;
+import android.bluetooth.BluetoothProfile;
 import android.content.Context;
 import android.content.Intent;
+import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
 import android.content.pm.ServiceInfo;
 import android.media.AudioAttributes;
@@ -2701,6 +2706,83 @@ public class VoiceService extends Service
         return micMutedForPlayback;
     }
 
+    // Nick 2026-10-23 v1.48: Bluetooth-aware interrupt mode. Nick marks
+    // which BT device is his earbuds (one-time, in SharedPreferences).
+    // During Selena's playback:
+    // - Earbuds connected → VOICE INTERRUPT: recognizer stays ON,
+    //   onBeginningOfSpeech pauses her, results discarded (VAD ignores
+    //   mower/engine noise, only human speech triggers).
+    // - Anything else (truck radio, phone speaker, no BT) → TAP INTERRUPT:
+    //   recognizer OFF (v1.47 mic-mute), tap screen to pause.
+    private static final String PREFS_NAME = "selena_voice_prefs";
+    private static final String PREF_EARBUDS_NAME = "earbuds_device_name";
+
+    /** Nick 2026-10-23 v1.48: true while in voice-interrupt mode. */
+    private volatile boolean voiceInterruptMode = false;
+
+    public boolean isVoiceInterruptMode() {
+        return voiceInterruptMode;
+    }
+
+    /** Nick 2026-10-23 v1.48: save Nick's earbuds BT device name. */
+    public void setEarbudsDeviceName(String name) {
+        getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+                .edit().putString(PREF_EARBUDS_NAME, name).apply();
+        log("bt: earbuds device set to '" + name + "'");
+    }
+
+    /** Nick 2026-10-23 v1.48: get the saved earbuds name (or null). */
+    public String getEarbudsDeviceName() {
+        return getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+                .getString(PREF_EARBUDS_NAME, null);
+    }
+
+    /**
+     * Nick 2026-10-23 v1.48: get the name of the currently connected
+     * Bluetooth A2DP (audio) device, or null if none. Uses
+     * AudioManager.getDevices() — synchronous, no profile proxy needed.
+     */
+    private String getConnectedBtAudioDeviceName() {
+        try {
+            BluetoothAdapter adapter = BluetoothAdapter.getDefaultAdapter();
+            if (adapter == null || !adapter.isEnabled()) return null;
+            android.media.AudioManager am =
+                    (android.media.AudioManager) getSystemService(AUDIO_SERVICE);
+            if (am == null) return null;
+            android.media.AudioDeviceInfo[] devices =
+                    am.getDevices(android.media.AudioManager.GET_DEVICES_OUTPUTS);
+            for (android.media.AudioDeviceInfo d : devices) {
+                int type = d.getType();
+                if (type == android.media.AudioDeviceInfo.TYPE_BLUETOOTH_A2DP
+                        || type == android.media.AudioDeviceInfo.TYPE_BLUETOOTH_SCO) {
+                    CharSequence name = d.getProductName();
+                    if (name != null && name.length() > 0) {
+                        return name.toString();
+                    }
+                }
+            }
+        } catch (Exception e) {
+            log("bt: device query failed: " + e);
+        }
+        return null;
+    }
+
+    /**
+     * Nick 2026-10-23 v1.48: true if the connected BT audio device
+     * matches Nick's saved earbuds name. Null-safe: no device or no
+     * saved name → false (tap interrupt mode).
+     */
+    private boolean isEarbudsConnected() {
+        String saved = getEarbudsDeviceName();
+        if (saved == null || saved.isEmpty()) return false;
+        String connected = getConnectedBtAudioDeviceName();
+        if (connected == null) return false;
+        // Fuzzy match: either contains the other (handles "Nick's
+        // AirPods" vs "AirPods" etc.)
+        return connected.toLowerCase().contains(saved.toLowerCase())
+                || saved.toLowerCase().contains(connected.toLowerCase());
+    }
+
     /**
      * Nick 2026-10-23 v1.47: stop the recognizer entirely when Selena
      * starts speaking, so her voice can't be transcribed as Nick's
@@ -2708,12 +2790,26 @@ public class VoiceService extends Service
      * fires. The onError(ERROR_CLIENT) this triggers is swallowed by
      * the micMutedForPlayback guards — no restart is scheduled.
      * Idempotent: safe to call when already muted or not listening.
+     *
+     * Nick 2026-10-23 v1.48: Bluetooth-aware. If Nick's earbuds are
+     * connected → VOICE INTERRUPT mode: recognizer stays ON, but
+     * onBeginningOfSpeech pauses her playback (results discarded —
+     * the VAD ignores mower/engine noise). Otherwise → TAP INTERRUPT:
+     * full mute as in v1.47, tap the screen to pause her.
      */
     private void muteMicForPlayback() {
-        if (micMutedForPlayback) return;
+        if (micMutedForPlayback || voiceInterruptMode) return;
         if (!recognizerActive || recognizer == null) return;
+        // Nick 2026-10-23 v1.48: check BT before muting.
+        if (isEarbudsConnected()) {
+            voiceInterruptMode = true;
+            log("mic: voice-interrupt mode (earbuds) — recognizer stays on, "
+                    + "speech pauses playback, results discarded");
+            broadcastListeningState();
+            return;
+        }
         micMutedForPlayback = true;
-        log("mic: muted for Selena playback");
+        log("mic: muted for Selena playback (tap-interrupt mode)");
         try {
             recognizer.cancel();
         } catch (Exception e) {
@@ -2730,6 +2826,12 @@ public class VoiceService extends Service
      * the listening mode was turned off while she spoke.
      */
     private void unmuteMicAfterPlayback() {
+        // Nick 2026-10-23 v1.48: clear voice-interrupt mode too.
+        if (voiceInterruptMode) {
+            voiceInterruptMode = false;
+            log("mic: voice-interrupt mode cleared");
+            broadcastListeningState();
+        }
         if (!micMutedForPlayback) return;
         micMutedForPlayback = false;
         if (destroyed || !recognizerActive) {
@@ -2744,6 +2846,15 @@ public class VoiceService extends Service
     // Callbacks from ServiceRecognitionListener (main thread):
 
     public void onSpeechDetected() {
+        // Nick 2026-10-23 v1.48: voice-interrupt mode — Nick started
+        // talking while Selena was speaking. Pause her immediately.
+        // Results are discarded (ServiceRecognitionListener checks
+        // isPlayingAudio), so this never becomes an input.
+        if (voiceInterruptMode && isPlayingAudio()) {
+            log("interrupt: Nick speaking during playback — pausing her");
+            pausePlayback();
+            return;
+        }
         // Nick 2026-10-23 v1.46: polite interruption — Nick started
         // talking; Selena holds any pending playback until his pause.
         nickSpeaking = true;
@@ -2759,7 +2870,8 @@ public class VoiceService extends Service
         // would discard it as "during playback". Also the fallback for
         // chunks the filters discard. The gate is re-checked at play
         // time, so a re-started utterance re-holds.
-        handler.postDelayed(() -> releasePoliteHold(), 2000);
+        // Nick 2026-10-23 v1.48: 3s to match SENTENCE_GAP_MS.
+        handler.postDelayed(() -> releasePoliteHold(), 3000);
     }
 
     public void onRecognizerDone() {
@@ -2770,7 +2882,8 @@ public class VoiceService extends Service
         nickSpeaking = false;
         unmuteBeep();
         scheduleRecognizerRestart();
-        handler.postDelayed(() -> releasePoliteHold(), 2000);
+        // Nick 2026-10-23 v1.48: 3s to match SENTENCE_GAP_MS.
+        handler.postDelayed(() -> releasePoliteHold(), 3000);
     }
 
     /**
@@ -2826,7 +2939,9 @@ public class VoiceService extends Service
     // clean batch. 1.0s is a starting point; tune if it feels wrong.
     private final StringBuilder sentenceBuffer = new StringBuilder();
     private long lastChunkMs = 0;
-    private static final long SENTENCE_GAP_MS = 1000;
+    // Nick 2026-10-23 v1.48: 3-second gap — Nick speaks, 3s of quiet =
+    // batch end. (Was 1.0s in v1.46; Nick found 1s cut him off mid-thought.)
+    private static final long SENTENCE_GAP_MS = 3000;
     private Runnable sentenceFlushTask = null;
 
     /**
