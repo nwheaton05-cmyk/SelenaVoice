@@ -2881,7 +2881,10 @@ public class VoiceService extends Service
         // never fired; harmless otherwise (pumps are idempotent).
         nickSpeaking = false;
         unmuteBeep();
-        scheduleRecognizerRestart();
+        // Nick 2026-10-23 v1.48: FAST restart (500ms) after normal utterance
+        // end — the 5s delay is for error cases only. Nick was waiting
+        // ~10s (3s gap + 5s restart + init) for dictation to resume.
+        handler.postDelayed(new RecognizerRestartTask(this), 500);
         // Nick 2026-10-23 v1.48: 3s to match SENTENCE_GAP_MS.
         handler.postDelayed(() -> releasePoliteHold(), 3000);
     }
