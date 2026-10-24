@@ -635,9 +635,13 @@ public class VoiceService extends Service
                 }
                 savedVolumes[i] = audioManager.getStreamVolume(BEEP_STREAMS[i]);
                 audioManager.setStreamVolume(BEEP_STREAMS[i], 0, 0);
+                // Nick 2026-10-23 v1.48: also hard-mute — Samsung's beep
+                // ignores volume-zero on some streams. setStreamMute is
+                // stronger. Nick wants the beep GONE.
+                try { audioManager.setStreamMute(BEEP_STREAMS[i], true); } catch (Exception ignored) {}
             }
             beepMuted = true;
-            Log.d(TAG, "beep streams zeroed");
+            Log.d(TAG, "beep streams zeroed+muted");
         } catch (Exception e) {
             Log.w(TAG, "muteBeep failed", e);
         }
@@ -647,6 +651,8 @@ public class VoiceService extends Service
         if (!beepMuted) return;
         try {
             for (int i = 0; i < BEEP_STREAMS.length; i++) {
+                // Nick 2026-10-23 v1.48: undo the hard-mute from muteBeep().
+                try { audioManager.setStreamMute(BEEP_STREAMS[i], false); } catch (Exception ignored) {}
                 // Nick 2026-10-18 v1.10: only restore a stream we actually
                 // zeroed. If Nick changed the volume himself while the
                 // streams were zeroed, his new setting stays — we never
