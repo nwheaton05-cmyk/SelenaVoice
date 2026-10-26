@@ -36,8 +36,8 @@ public class CrashReporter implements Thread.UncaughtExceptionHandler {
     private static final long MAX_FILE_BYTES = 256 * 1024;
 
     // Same project/key the service already uses for queue polling.
-    private static final String SUPABASE_HOST = "pqkfqzioimkobuhcjwdk.supabase.co";
-    private static final String SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBxa2ZxemlvaW1rb2J1aGNqd2RrIiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTEzMjg2NTIsImV4cCI6MjEwNjkwNDY1Mn0.eNem2zAIA4_MPtWMI0tiErtu7tGNAtkLTnsCA5lSPVw";
+    private static final String SUPABASE_HOST = "siteview-api.duckdns.org";
+    private static final String SUPABASE_ANON_KEY = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJzdXBhYmFzZSIsImlhdCI6MTc5Mjg1Njk0MCwiZXhwIjo0OTQ4NTMwNTQwLCJyb2xlIjoiYW5vbiJ9.tHuj64aAawXs_4dl-TVdgfxOUcmyKloh204BfEc60mk";
 
     private final Context appContext;
     private final Thread.UncaughtExceptionHandler prev;

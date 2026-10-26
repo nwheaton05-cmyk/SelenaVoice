@@ -470,7 +470,7 @@ public class MainActivity extends Activity {
     // tap downloads the APK and fires the system installer.
 
     private static final String VERSION_URL =
-            "https://siteview-pi.vercel.app/api/selena-voice/version";
+            "https://siteview.duckdns.org/api/selena-voice/version";
 
     private int getInstalledVersionCode() {
         try {
@@ -536,7 +536,7 @@ public class MainActivity extends Activity {
     // ones via keep_ids; local history drops unlocked entries (and MP3s).
     // Always toasts the outcome so a tap never dies silently.
     private static final String QUEUE_DELETE_URL =
-            "https://siteview-pi.vercel.app/api/selena-voice/queue";
+            "https://siteview.duckdns.org/api/selena-voice/queue";
 
     private void deleteUnlocked() {
         deleteUnlockedButton.setEnabled(false);

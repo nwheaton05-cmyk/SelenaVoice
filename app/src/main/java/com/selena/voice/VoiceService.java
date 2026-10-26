@@ -138,12 +138,12 @@ public class VoiceService extends Service
     public static final String KEY_FORCE_BLUETOOTH = "force_bluetooth";
     public static final String KEY_FORCE_SPEAKER = "force_speaker";
 
-    private static final String BASE_URL = "https://siteview-pi.vercel.app";
+    private static final String BASE_URL = "https://siteview.duckdns.org";
     // Nick 2026-10-18 v1.14: Supabase Realtime push (LEG 1). The anon
     // key is public by design; RLS limits it to SELECT on the voice
     // queue only (Nick's voice inputs stay service-role-only).
-    private static final String SUPABASE_HOST = "pqkfqzioimkobuhcjwdk.supabase.co";
-    private static final String SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBxa2ZxemlvaW1rb2J1aGNqd2RrIiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTEzMjg2NTIsImV4cCI6MjEwNjkwNDY1Mn0.eNem2zAIA4_MPtWMI0tiErtu7tGNAtkLTnsCA5lSPVw";
+    private static final String SUPABASE_HOST = "siteview-api.duckdns.org";
+    private static final String SUPABASE_ANON_KEY = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJzdXBhYmFzZSIsImlhdCI6MTc5Mjg1Njk0MCwiZXhwIjo0OTQ4NTMwNTQwLCJyb2xlIjoiYW5vbiJ9.tHuj64aAawXs_4dl-TVdgfxOUcmyKloh204BfEc60mk";
     private static final long POLL_MS = 3000;
     private static final long HEARTBEAT_MS = 30000;
     // Nick 2026-10-18 v1.3: was 500ms — the Samsung A17 plays a system
