@@ -37,11 +37,22 @@ public class RealtimeClient {
         void onStatus(String msg);
     }
 
+    /**
+     * Supplies a fresh user access token for each (re)connect
+     * (v1.50, 2026-10-26). Realtime authorizes postgres_changes
+     * against the token's role — the queue's anon SELECT policy is
+     * gone, so joins must carry a signed-in user's JWT.
+     */
+    public interface AccessTokenProvider {
+        String getAccessToken();
+    }
+
     private final String host;
     private final String apiKey;
     private final String topic;
     private final String table;
     private final Listener listener;
+    private final AccessTokenProvider tokenProvider;
 
     private volatile boolean running;
     private Thread worker;
@@ -49,11 +60,17 @@ public class RealtimeClient {
 
     public RealtimeClient(String host, String apiKey, String topic, String table,
                           Listener listener) {
+        this(host, apiKey, topic, table, listener, null);
+    }
+
+    public RealtimeClient(String host, String apiKey, String topic, String table,
+                          Listener listener, AccessTokenProvider tokenProvider) {
         this.host = host;
         this.apiKey = apiKey;
         this.topic = topic;
         this.table = table;
         this.listener = listener;
+        this.tokenProvider = tokenProvider;
     }
 
     public synchronized void start() {
@@ -139,6 +156,18 @@ public class RealtimeClient {
         config.put("postgres_changes", changes);
         JSONObject payload = new JSONObject();
         payload.put("config", config);
+        // v1.50: authorize the channel as the signed-in user. Without
+        // this the join rides the anon key and RLS delivers nothing
+        // (anon SELECT on the queue was removed 2026-10-26).
+        if (tokenProvider != null) {
+            try {
+                String tok = tokenProvider.getAccessToken();
+                if (tok != null && !tok.isEmpty()) {
+                    payload.put("access_token", tok);
+                }
+            } catch (Exception ignored) {
+            }
+        }
         JSONObject join = new JSONObject();
         join.put("topic", topic);
         join.put("event", "phx_join");

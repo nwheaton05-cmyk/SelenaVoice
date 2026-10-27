@@ -75,6 +75,14 @@ public class MainActivity extends Activity {
     // local history except for locked messages.
     private Button deleteUnlockedButton;
 
+    // v1.50 (2026-10-26): account sign-in + delete-key settings. The
+    // queue's anon SELECT policy is gone, so Realtime needs a real
+    // user token (SupabaseAuth); the DELETE route needs the
+    // x-voice-delete-key header, whose value is stored on-device via
+    // the delete-key dialog — never hardcoded.
+    private Button signInButton;
+    private Button deleteKeyButton;
+
     // Nick 2026-10-22 v1.33: in-app auto-updater banner. Hidden until the
     // version check finds a newer APK; tap downloads + installs it.
     private Button updateBanner;
@@ -343,6 +351,15 @@ public class MainActivity extends Activity {
         deleteUnlockedButton.setEnabled(true);
         deleteUnlockedButton.setOnClickListener(v -> deleteUnlocked());
 
+        // v1.50 (2026-10-26): sign-in + delete-key settings buttons.
+        signInButton = findViewById(R.id.signInButton);
+        signInButton.setEnabled(true);
+        signInButton.setOnClickListener(v -> showSignInDialog());
+        deleteKeyButton = findViewById(R.id.deleteKeyButton);
+        deleteKeyButton.setEnabled(true);
+        deleteKeyButton.setOnClickListener(v -> showDeleteKeyDialog());
+        refreshSignInButton();
+
         // Nick 2026-10-22 v1.33: in-app auto-updater. Hidden until the
         // version check finds a newer APK — v1.33 is the last manual
         // install.
@@ -470,7 +487,7 @@ public class MainActivity extends Activity {
     // tap downloads the APK and fires the system installer.
 
     private static final String VERSION_URL =
-            "https://siteview.duckdns.org/api/selena-voice/version";
+            "https://siteviewoperations.com/api/selena-voice/version";
 
     private int getInstalledVersionCode() {
         try {
@@ -536,7 +553,7 @@ public class MainActivity extends Activity {
     // ones via keep_ids; local history drops unlocked entries (and MP3s).
     // Always toasts the outcome so a tap never dies silently.
     private static final String QUEUE_DELETE_URL =
-            "https://siteview.duckdns.org/api/selena-voice/queue";
+            "https://siteviewoperations.com/api/selena-voice/queue";
 
     private void deleteUnlocked() {
         deleteUnlockedButton.setEnabled(false);
@@ -564,6 +581,16 @@ public class MainActivity extends Activity {
                 conn.setConnectTimeout(10000);
                 conn.setReadTimeout(10000);
                 conn.setRequestProperty("Content-Type", "application/json");
+                // v1.50 (2026-10-26): the DELETE route requires the
+                // dedicated x-voice-delete-key credential and fails
+                // closed without it. The value is entered in-app
+                // (Delete key button) and stored on-device only.
+                String deleteKey = getSharedPreferences(
+                        "selena_voice", MODE_PRIVATE)
+                        .getString("voice_delete_key", "");
+                if (deleteKey != null && !deleteKey.isEmpty()) {
+                    conn.setRequestProperty("x-voice-delete-key", deleteKey);
+                }
                 byte[] bytes = body.toString().getBytes("UTF-8");
                 conn.getOutputStream().write(bytes);
                 int code = conn.getResponseCode();
@@ -623,6 +650,108 @@ public class MainActivity extends Activity {
                         + (fErr != null ? " err=" + fErr : ""));
             });
         }).start();
+    }
+
+    // ------------------------------------------------------------ v1.50 account + delete key
+    // 2026-10-26 (OVH batch): the queue's anon SELECT policy was
+    // removed — Realtime now authorizes as the signed-in user, so the
+    // app needs a real Supabase Auth login. Credentials are entered
+    // here and stored on-device only (SupabaseAuth). The delete key
+    // for the DELETE route's x-voice-delete-key header is likewise
+    // entered here, never hardcoded (the server env VOICE_DELETE_KEY
+    // is the matching half, set in the deployment env).
+
+    private void refreshSignInButton() {
+        if (signInButton == null) return;
+        if (SupabaseAuth.isLoggedIn(this)) {
+            signInButton.setText("👤 " + SupabaseAuth.savedEmail(this));
+        } else {
+            signInButton.setText("👤 Sign in");
+        }
+    }
+
+    private void showSignInDialog() {
+        android.widget.LinearLayout box =
+                new android.widget.LinearLayout(this);
+        box.setOrientation(android.widget.LinearLayout.VERTICAL);
+        box.setPadding(48, 24, 48, 8);
+        final android.widget.EditText emailIn =
+                new android.widget.EditText(this);
+        emailIn.setHint("Email");
+        emailIn.setInputType(android.text.InputType.TYPE_CLASS_TEXT
+                | android.text.InputType.TYPE_TEXT_VARIATION_EMAIL_ADDRESS);
+        emailIn.setText(SupabaseAuth.savedEmail(this));
+        final android.widget.EditText passIn =
+                new android.widget.EditText(this);
+        passIn.setHint("Password");
+        passIn.setInputType(android.text.InputType.TYPE_CLASS_TEXT
+                | android.text.InputType.TYPE_TEXT_VARIATION_PASSWORD);
+        box.addView(emailIn);
+        box.addView(passIn);
+        new android.app.AlertDialog.Builder(this)
+                .setTitle("Sign in (queue access)")
+                .setView(box)
+                .setPositiveButton("Sign in", (d, w) -> {
+                    final String email =
+                            emailIn.getText().toString().trim();
+                    final String pass = passIn.getText().toString();
+                    new Thread(() -> {
+                        String err = SupabaseAuth.login(
+                                MainActivity.this, email, pass);
+                        runOnUiThread(() -> {
+                            refreshSignInButton();
+                            android.widget.Toast.makeText(
+                                    MainActivity.this,
+                                    err == null
+                                            ? "Signed in as " + email
+                                            : "Sign-in failed: " + err,
+                                    android.widget.Toast.LENGTH_LONG)
+                                    .show();
+                            if (err == null) {
+                                // Rejoin Realtime with the user token.
+                                Intent ri = new Intent(
+                                        MainActivity.this, VoiceService.class);
+                                ri.setAction("RESTART_REALTIME");
+                                startForegroundService(ri);
+                            }
+                        });
+                    }).start();
+                })
+                .setNegativeButton("Cancel", null)
+                .setNeutralButton("Sign out", (d, w) -> {
+                    SupabaseAuth.logout(MainActivity.this);
+                    refreshSignInButton();
+                    Intent ri = new Intent(
+                            MainActivity.this, VoiceService.class);
+                    ri.setAction("RESTART_REALTIME");
+                    startForegroundService(ri);
+                })
+                .show();
+    }
+
+    private void showDeleteKeyDialog() {
+        final android.widget.EditText keyIn =
+                new android.widget.EditText(this);
+        keyIn.setHint("Voice delete key");
+        keyIn.setInputType(android.text.InputType.TYPE_CLASS_TEXT
+                | android.text.InputType.TYPE_TEXT_VARIATION_PASSWORD);
+        keyIn.setText(getSharedPreferences("selena_voice", MODE_PRIVATE)
+                .getString("voice_delete_key", ""));
+        new android.app.AlertDialog.Builder(this)
+                .setTitle("Delete key (server DELETE credential)")
+                .setView(keyIn)
+                .setPositiveButton("Save", (d, w) -> {
+                    getSharedPreferences("selena_voice", MODE_PRIVATE)
+                            .edit()
+                            .putString("voice_delete_key",
+                                    keyIn.getText().toString().trim())
+                            .apply();
+                    android.widget.Toast.makeText(MainActivity.this,
+                            "Delete key saved",
+                            android.widget.Toast.LENGTH_SHORT).show();
+                })
+                .setNegativeButton("Cancel", null)
+                .show();
     }
 
     private void downloadAndInstallApk(String apkUrl) {

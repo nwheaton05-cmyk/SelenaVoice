@@ -138,11 +138,16 @@ public class VoiceService extends Service
     public static final String KEY_FORCE_BLUETOOTH = "force_bluetooth";
     public static final String KEY_FORCE_SPEAKER = "force_speaker";
 
-    private static final String BASE_URL = "https://siteview.duckdns.org";
-    // Nick 2026-10-18 v1.14: Supabase Realtime push (LEG 1). The anon
-    // key is public by design; RLS limits it to SELECT on the voice
-    // queue only (Nick's voice inputs stay service-role-only).
-    private static final String SUPABASE_HOST = "siteview-api.duckdns.org";
+    // v1.50 (2026-10-26, OVH batch): owned-domain addresses replace
+    // the DuckDNS bridge names (same OVH server, permanent names).
+    private static final String BASE_URL = "https://siteviewoperations.com";
+    // Nick 2026-10-18 v1.14: Supabase Realtime push (LEG 1).
+    // v1.50: the anon key is now ONLY the gateway/apikey value — the
+    // queue's anon SELECT policy was removed 2026-10-26, so Realtime
+    // joins also carry the signed-in user's access token (see
+    // SupabaseAuth + VoiceAuthTokenProvider). Authenticated SELECT on
+    // the queue is what authorizes row delivery.
+    private static final String SUPABASE_HOST = "api.siteviewoperations.com";
     private static final String SUPABASE_ANON_KEY = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJzdXBhYmFzZSIsImlhdCI6MTc5Mjg1Njk0MCwiZXhwIjo0OTQ4NTMwNTQwLCJyb2xlIjoiYW5vbiJ9.tHuj64aAawXs_4dl-TVdgfxOUcmyKloh204BfEc60mk";
     private static final long POLL_MS = 3000;
     private static final long HEARTBEAT_MS = 30000;
@@ -450,6 +455,13 @@ public class VoiceService extends Service
                 // service playback queues (locked ones keep playing/queued).
                 log("intent: CLEAR_UNLOCKED received");
                 clearUnlockedQueues();
+            } else if ("RESTART_REALTIME".equals(intent.getAction())) {
+                // v1.50 (2026-10-26): after an in-app sign-in, rejoin
+                // Realtime so the channel picks up the user access
+                // token immediately instead of on the next reconnect.
+                log("intent: RESTART_REALTIME received");
+                stopRealtime();
+                startRealtime();
             } else if (ACTION_REQUEST_STATUS.equals(intent.getAction())) {
                 // Nick 2026-10-22 v1.25: activity re-opened — send it the
                 // current state instead of leaving stale layout defaults.
@@ -781,7 +793,7 @@ public class VoiceService extends Service
         realtimeClient = new RealtimeClient(
                 SUPABASE_HOST, SUPABASE_ANON_KEY,
                 "realtime:public:selena_voice_queue", "selena_voice_queue",
-                this);
+                this, new VoiceAuthTokenProvider(this));
         realtimeClient.start();
         log("realtime push started");
     }
@@ -862,6 +874,16 @@ public class VoiceService extends Service
             conn = (HttpURLConnection) new URL(urlStr).openConnection();
             conn.setConnectTimeout(8000);
             conn.setReadTimeout(8000);
+            // v1.50: present the signed-in user's token when we have
+            // one. The queue route is service-role server-side today;
+            // the header keeps the read path honest if it ever moves
+            // behind the authenticated policy like Realtime did.
+            try {
+                String tok = SupabaseAuth.validAccessToken(this);
+                if (tok != null) {
+                    conn.setRequestProperty("Authorization", "Bearer " + tok);
+                }
+            } catch (Exception ignored) {}
             int code = conn.getResponseCode();
             log("poll: HTTP " + code + " (since=" + since + ")");
             if (code != 200) {
