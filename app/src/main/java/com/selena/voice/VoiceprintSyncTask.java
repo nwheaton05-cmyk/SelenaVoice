@@ -44,8 +44,10 @@ import java.util.List;
  */
 public class VoiceprintSyncTask implements Runnable {
     private static final String TAG = "SelenaVoice";
+    // The assistant brain and its routes live on the AR deployment
+    // (apk-ar branch); the main domain's build does not carry them.
     private static final String ENDPOINT =
-            "https://siteviewoperations.com/api/selena-voice/voiceprint";
+            "https://ar.siteviewoperations.com/api/selena-voice/voiceprint";
     private static final String PREFS = "voiceprint_sync";
     private static final String K_LAST = "last_attempt_ms";
     private static final long THROTTLE_MS = 6 * 3600 * 1000L;
