@@ -43,6 +43,21 @@
             android:exported="false"
             android:foregroundServiceType="microphone|mediaPlayback" />
 
+        <!-- Nick 2026-10-28 v1.51: earbud/headset media-button taps.
+             Before v1.51 the app registered NOTHING for media buttons,
+             so earbud taps were never delivered to it. This receiver is
+             the legacy broadcast path (pattern ported from Siteview's
+             EarbudButtonReceiver); the framework MediaSession created in
+             VoiceService is the primary path. VoiceService debounces a
+             press that arrives via both. -->
+        <receiver
+            android:name=".EarbudButtonReceiver"
+            android:exported="true">
+            <intent-filter android:priority="100">
+                <action android:name="android.intent.action.MEDIA_BUTTON" />
+            </intent-filter>
+        </receiver>
+
         <!-- Nick 2026-10-22 v1.33: serves the downloaded update APK to the
              package installer. Minimal ContentProvider (no androidx on the
              manual build classpath, so FileProvider isn't available). Only

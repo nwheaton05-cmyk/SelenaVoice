@@ -21,6 +21,8 @@ import android.media.AudioFocusRequest;
 import android.media.AudioManager;
 import android.media.MediaPlayer;
 import android.media.audiofx.LoudnessEnhancer;
+import android.media.session.MediaSession;
+import android.media.session.PlaybackState;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
@@ -234,6 +236,15 @@ public class VoiceService extends Service
     // (which holds PLAYBACK while Nick speaks).
     private boolean micMutedForPlayback = false;
     private MediaPlayer player;
+    // Nick 2026-10-28 v1.51: media session for earbud/headset buttons.
+    // Before v1.51 the app had NO MediaSession and NO media-button
+    // receiver, so earbud taps were never delivered to it at all (Nick:
+    // "tap earbud has never worked"). The session is the modern delivery
+    // path; EarbudButtonReceiver (manifest) is the legacy second path;
+    // onEarbudAction debounces a press arriving via both.
+    private MediaSession mediaSession;
+    private String lastEarbudAction = null;
+    private long lastEarbudActionMs = 0;
     // Nick 2026-10-22 v1.34: path of the MP3 currently loaded in the
     // player (null when idle). Lets CLEAR_UNLOCKED stop playback only
     // when the playing message is unlocked.
@@ -377,6 +388,9 @@ public class VoiceService extends Service
         CrashReporter.install(this);
         audioManager = (AudioManager) getSystemService(Context.AUDIO_SERVICE);
         recognitionListener = new ServiceRecognitionListener(this);
+        // Nick 2026-10-28 v1.51: register the media session so Bluetooth
+        // earbud/headset button presses are delivered to this app.
+        initMediaSession();
         // Nick 2026-10-19 v1.16: hold a partial wake lock for the service's
         // lifetime so the poll loop, Realtime socket, recognizer, and TTS
         // keep running with the screen locked. (MediaPlayer additionally
@@ -410,6 +424,15 @@ public class VoiceService extends Service
                     stopContinuousListening();
                 }
                 broadcastListeningState();
+            } else if ("EARBUD_TAP".equals(intent.getAction())) {
+                // Nick 2026-10-28 v1.51: forwarded by EarbudButtonReceiver
+                // (manifest MEDIA_BUTTON path). The MediaSession callback
+                // lands in onEarbudAction directly; both paths debounce
+                // against each other there.
+                String earbudAction = intent.getStringExtra(
+                        EarbudButtonReceiver.EXTRA_EARBUD_ACTION);
+                log("intent: EARBUD_TAP received (" + earbudAction + ")");
+                if (earbudAction != null) onEarbudAction(earbudAction);
             } else if ("MANUAL_LISTEN".equals(intent.getAction())) {
                 if (!recognizerActive) {
                     manualListening = true;
@@ -516,6 +539,14 @@ public class VoiceService extends Service
         recognizerActive = false;
         destroyRecognizer();
         releasePlayer();
+        // Nick 2026-10-28 v1.51: release the media session.
+        try {
+            if (mediaSession != null) {
+                mediaSession.setActive(false);
+                mediaSession.release();
+                mediaSession = null;
+            }
+        } catch (Exception ignored) {}
         try {
             if (tts != null) {
                 tts.stop();
@@ -2477,6 +2508,142 @@ public class VoiceService extends Service
         i.putExtra("playing", mp3Playing || ttsSpeaking);
         i.putExtra("paused", playbackPaused || ttsPaused);
         sendAppBroadcast(i);
+        // Nick 2026-10-28 v1.51: keep the media session's state in sync —
+        // Bluetooth devices decide which transport command (play vs pause)
+        // to send from the state we publish.
+        updateMediaSessionState();
+    }
+
+    // ------------------------------------------------------------ v1.51 earbud buttons
+
+    /**
+     * Nick 2026-10-28 v1.51: create + activate the media session.
+     * Framework android.media.session (no androidx in this build). The
+     * session must be ACTIVE for Android to route media-button presses
+     * to its callback; it stays active for the service's lifetime so a
+     * tap works while idle (start dictation) as well as during playback
+     * (pause the readout).
+     */
+    private void initMediaSession() {
+        try {
+            mediaSession = new MediaSession(this, TAG);
+            mediaSession.setCallback(new ServiceMediaSessionCallback(this));
+            mediaSession.setFlags(MediaSession.FLAG_HANDLES_MEDIA_BUTTONS
+                    | MediaSession.FLAG_HANDLES_TRANSPORT_CONTROLS);
+            mediaSession.setActive(true);
+            updateMediaSessionState();
+            log("earbud: media session active");
+        } catch (Exception e) {
+            // The manifest broadcast receiver still covers button presses
+            // on the legacy path — a session failure must not kill the
+            // service.
+            log("earbud: media session init failed: " + e);
+            mediaSession = null;
+        }
+    }
+
+    /** Nick 2026-10-28 v1.51: publish current playback state to the session. */
+    private void updateMediaSessionState() {
+        if (mediaSession == null) return;
+        try {
+            boolean isPlaying = safeIsPlaying() || ttsSpeaking;
+            boolean isPaused = playbackPaused || ttsPaused;
+            int state = isPlaying ? PlaybackState.STATE_PLAYING
+                    : isPaused ? PlaybackState.STATE_PAUSED
+                    : PlaybackState.STATE_STOPPED;
+            long actions = PlaybackState.ACTION_PLAY
+                    | PlaybackState.ACTION_PAUSE
+                    | PlaybackState.ACTION_PLAY_PAUSE
+                    | PlaybackState.ACTION_SKIP_TO_NEXT
+                    | PlaybackState.ACTION_SKIP_TO_PREVIOUS
+                    | PlaybackState.ACTION_STOP;
+            long pos = (state == PlaybackState.STATE_PLAYING
+                    || state == PlaybackState.STATE_PAUSED)
+                    ? safePosition() : 0;
+            mediaSession.setPlaybackState(new PlaybackState.Builder()
+                    .setState(state, pos, isPlaying ? 1.0f : 0.0f)
+                    .setActions(actions)
+                    .build());
+        } catch (Exception e) {
+            log("earbud: session state update failed: " + e);
+        }
+    }
+
+    /**
+     * Nick 2026-10-28 v1.51: one earbud/headset button action, from the
+     * MediaSession callback or the manifest broadcast receiver.
+     * Semantics (Nick's ask: "pause the readout / start dictation"):
+     *   toggle — playing -> pause; paused -> resume; idle -> dictation.
+     *   play   — paused -> resume; idle -> dictation.
+     *   pause  — playing -> pause.
+     *   next   — skip to newest queued message.
+     *   stop   — stop all playback.
+     *   previous — not mapped yet (no replay-last transport in the app);
+     *              logged so the press never vanishes silently.
+     * The same physical press can arrive via BOTH delivery paths within
+     * milliseconds — identical actions inside 1s are debounced, or a
+     * pause would instantly resume itself.
+     */
+    public void onEarbudAction(String action) {
+        long now = android.os.SystemClock.uptimeMillis();
+        if (action.equals(lastEarbudAction)
+                && now - lastEarbudActionMs < 1000) {
+            log("earbud: duplicate " + action + " debounced");
+            return;
+        }
+        lastEarbudAction = action;
+        lastEarbudActionMs = now;
+        log("earbud: action=" + action
+                + " mp3Playing=" + safeIsPlaying()
+                + " ttsSpeaking=" + ttsSpeaking
+                + " paused=" + (playbackPaused || ttsPaused)
+                + " recognizerActive=" + recognizerActive);
+        switch (action) {
+            case "toggle":
+                if (playbackPaused || ttsPaused) resumePlayback();
+                else if (safeIsPlaying() || ttsSpeaking) pausePlayback();
+                else startDictationFromEarbud();
+                break;
+            case "play":
+                if (playbackPaused || ttsPaused) resumePlayback();
+                else if (!safeIsPlaying() && !ttsSpeaking) {
+                    startDictationFromEarbud();
+                }
+                break;
+            case "pause":
+                if (safeIsPlaying() || ttsSpeaking) pausePlayback();
+                break;
+            case "next":
+                skipToNewest();
+                break;
+            case "stop":
+                stopAllPlayback();
+                break;
+            case "previous":
+                log("earbud: previous not mapped yet");
+                toast("Previous isn't set up yet");
+                break;
+            default:
+                log("earbud: unknown action " + action);
+                break;
+        }
+        updateMediaSessionState();
+    }
+
+    /**
+     * Nick 2026-10-28 v1.51: earbud tap while idle = start dictating.
+     * If always-listening already has the recognizer running there is
+     * nothing to start — say so instead of silently doing nothing.
+     */
+    private void startDictationFromEarbud() {
+        if (recognizerActive) {
+            log("earbud: dictation requested, already listening");
+            toast("Already listening");
+            return;
+        }
+        manualListening = true;
+        startContinuousListening();
+        toast("Listening");
     }
 
     private void requestAudioFocus() {
