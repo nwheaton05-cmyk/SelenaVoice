@@ -283,6 +283,23 @@ public class VoiceService extends Service
     private boolean playing = false;
     private AudioManager audioManager;
     private AudioFocusRequest focusRequest;
+    // Nick 2026-10-29 v1.59 (ducking rule): a SECOND, independent focus
+    // request held only while a dictation is actively being captured,
+    // so other audio (Spotify/Pandora) fades DOWN while Nick talks and
+    // fades back when he stops — it never hard-pauses. Independent of
+    // the playback request above: either can be held without the
+    // other, and the music only un-ducks once BOTH are gone. Release
+    // is driven by the dictation lifecycle (sentence flush,
+    // recognizer-done, held-sentence send) plus a staleness watchdog —
+    // a stuck hold that leaves music ducked forever is the failure
+    // this design refuses.
+    private AudioFocusRequest dictationFocusRequest;
+    private volatile boolean dictationDuckHeld = false;
+    private volatile long lastDictationActivityMs = 0;
+    private Runnable dictationDuckWatchdog = null;
+    private static final long DICTATION_DUCK_GRACE_MS = 3000;
+    private static final long DICTATION_DUCK_STALE_MS = 20000;
+    private static final long DICTATION_DUCK_WATCHDOG_MS = 5000;
     private NotificationManager notificationManager;
     private ServiceRecognitionListener recognitionListener;
     private PowerManager.WakeLock wakeLock;
@@ -707,6 +724,7 @@ public class VoiceService extends Service
         handler.removeCallbacksAndMessages(null);
         restoreMusicVolume(); // Nick 2026-10-19 v1.17: safety net — never
         // leave the music stream stuck at the boosted max.
+        releaseDictationDuck("service destroyed"); // v1.59 safety net
         unmuteBeep();
         recognizerActive = false;
         destroyRecognizer();
@@ -3325,12 +3343,20 @@ public class VoiceService extends Service
         try {
             // Nick 2026-10-18 v1.7: match the playback usage (USAGE_MEDIA)
             // so focus is requested for the music stream, not voice-call.
+            // Nick 2026-10-29 v1.59 (ducking rule): the type is now
+            // AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK — the old
+            // GAIN_TRANSIENT made well-behaved media apps PAUSE
+            // outright; MAY_DUCK fades them down and keeps them playing
+            // while she speaks, and they fade back when she finishes.
+            // (The v1.17-era comments always said "duck"; the type now
+            // matches.) The STREAM_MUSIC boost stays disabled (v1.48) —
+            // she plays at Nick's set volume over the ducked music.
             AudioAttributes attrs = new AudioAttributes.Builder()
                     .setUsage(AudioAttributes.USAGE_MEDIA)
                     .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
                     .build();
             focusRequest = new AudioFocusRequest.Builder(
-                    AudioManager.AUDIOFOCUS_GAIN_TRANSIENT)
+                    AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK)
                     .setAudioAttributes(attrs)
                     .build();
             // Nick 2026-10-19 v1.18: capture the result and retry once on
@@ -3340,7 +3366,7 @@ public class VoiceService extends Service
             if (rc == AudioManager.AUDIOFOCUS_REQUEST_FAILED) {
                 try { Thread.sleep(500); } catch (InterruptedException ignored) {}
                 focusRequest = new AudioFocusRequest.Builder(
-                        AudioManager.AUDIOFOCUS_GAIN_TRANSIENT)
+                        AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK)
                         .setAudioAttributes(attrs)
                         .build();
                 rc = audioManager.requestAudioFocus(focusRequest);
@@ -3355,6 +3381,111 @@ public class VoiceService extends Service
         try {
             if (focusRequest != null) audioManager.abandonAudioFocusRequest(focusRequest);
         } catch (Exception ignored) {}
+    }
+
+    // ------------------------------------------------------------ v1.59 dictation duck
+
+    /**
+     * Nick 2026-10-29 v1.59 (ducking rule): Nick started dictating —
+     * fade other audio down for the capture. Called from the
+     * recognizer's real speech onset (onSpeechDetected), NOT for the
+     * whole always-listening idle wait (music would sit ducked
+     * forever). Re-entry while held only refreshes activity and the
+     * watchdog. The batching window stays ducked because chunks and
+     * partials keep refreshing activity and the release requires an
+     * empty sentence buffer — mid-thought pauses between sentences
+     * of one dictation never pop the music back up.
+     */
+    private void acquireDictationDuck() {
+        lastDictationActivityMs = android.os.SystemClock.uptimeMillis();
+        armDictationDuckWatchdog();
+        if (dictationDuckHeld) return;
+        try {
+            AudioAttributes attrs = new AudioAttributes.Builder()
+                    .setUsage(AudioAttributes.USAGE_MEDIA)
+                    .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                    .build();
+            dictationFocusRequest = new AudioFocusRequest.Builder(
+                    AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK)
+                    .setAudioAttributes(attrs)
+                    .build();
+            int rc = audioManager.requestAudioFocus(dictationFocusRequest);
+            dictationDuckHeld = rc == AudioManager.AUDIOFOCUS_REQUEST_GRANTED;
+            log("duck: dictation focus " + (dictationDuckHeld
+                    ? "held — other audio fades down" : "NOT granted rc=" + rc));
+        } catch (Exception e) {
+            log("duck: dictation focus request failed: " + e);
+        }
+    }
+
+    /** Partials/chunks/speech-end while the duck is held = still capturing. */
+    private void noteDictationActivity() {
+        if (dictationDuckHeld) {
+            lastDictationActivityMs = android.os.SystemClock.uptimeMillis();
+        }
+    }
+
+    /**
+     * Release the dictation duck when the dictation is truly over:
+     * he's not speaking, nothing is buffered awaiting its flush, and
+     * the tail grace has passed (covers the ~1s between speech-end
+     * and the final chunk landing). Called from the sentence flush,
+     * the held-sentence send, recognizer-done, and the watchdog; the
+     * watchdog additionally force-releases on staleness, so no path
+     * can leave Spotify ducked forever.
+     */
+    private void maybeReleaseDictationDuck() {
+        if (!dictationDuckHeld) return;
+        if (nickSpeaking) return;
+        if (sentenceBuffer.length() > 0) return;
+        long idle = android.os.SystemClock.uptimeMillis()
+                - lastDictationActivityMs;
+        if (idle < DICTATION_DUCK_GRACE_MS) return;
+        releaseDictationDuck("dictation ended");
+    }
+
+    private void releaseDictationDuck(String why) {
+        if (!dictationDuckHeld && dictationFocusRequest == null) return;
+        try {
+            if (dictationFocusRequest != null) {
+                audioManager.abandonAudioFocusRequest(dictationFocusRequest);
+            }
+        } catch (Exception ignored) {}
+        dictationFocusRequest = null;
+        dictationDuckHeld = false;
+        if (dictationDuckWatchdog != null) {
+            handler.removeCallbacks(dictationDuckWatchdog);
+            dictationDuckWatchdog = null;
+        }
+        log("duck: released (" + why + ") — music fades back");
+    }
+
+    private void armDictationDuckWatchdog() {
+        if (dictationDuckWatchdog != null) return;
+        // A lambda, not an anonymous Runnable class, on purpose: this
+        // codebase keeps service callbacks in lambdas / named task
+        // classes — the one anonymous inner class tried here made the
+        // build-tools 34 d8 fail with an internal NPE (nestmate
+        // desugaring), 2026-10-29.
+        dictationDuckWatchdog = () -> {
+            dictationDuckWatchdog = null;
+            if (!dictationDuckHeld) return;
+            long idle = android.os.SystemClock.uptimeMillis()
+                    - lastDictationActivityMs;
+            if (idle > DICTATION_DUCK_STALE_MS) {
+                // No speech/chunk/partial activity for 20s: whatever
+                // the bookkeeping says, the capture is not live.
+                releaseDictationDuck("watchdog: stale " + idle + "ms");
+                return;
+            }
+            if (!nickSpeaking && sentenceBuffer.length() == 0
+                    && idle >= DICTATION_DUCK_GRACE_MS) {
+                releaseDictationDuck("watchdog: dictation over");
+                return;
+            }
+            armDictationDuckWatchdog();
+        };
+        handler.postDelayed(dictationDuckWatchdog, DICTATION_DUCK_WATCHDOG_MS);
     }
 
     private boolean isPhoneVoiceMode() {
@@ -3746,11 +3877,17 @@ public class VoiceService extends Service
         // Nick 2026-10-23 v1.46: polite interruption — Nick started
         // talking; Selena holds any pending playback until his pause.
         nickSpeaking = true;
+        // Nick 2026-10-29 v1.59 (ducking rule): real capture started —
+        // fade other audio down for the dictation.
+        acquireDictationDuck();
         sendBroadcast(new Intent(ACTION_SPEECH_DETECTED));
     }
 
     public void onSpeechEnd() {
         nickSpeaking = false;
+        // v1.59: speech-end anchors the duck's release grace — the
+        // dictation is in its tail (final chunk + flush), not over.
+        noteDictationActivity();
         unmuteBeep();
         // Nick 2026-10-23 v1.46: polite interruption — Nick just paused.
         // onResults (with his chunk) usually lands within ~1s; delay the
@@ -3768,6 +3905,10 @@ public class VoiceService extends Service
         // stick. Safety-net release for error paths where onEndOfSpeech
         // never fired; harmless otherwise (pumps are idempotent).
         nickSpeaking = false;
+        // Nick 2026-10-29 v1.59: session over — if nothing is buffered
+        // (e.g. the gate rejected the utterance, so no chunk ever
+        // landed and no flush will ever run), the duck releases here.
+        maybeReleaseDictationDuck();
         unmuteBeep();
         // Nick 2026-10-23 v1.48: FAST restart (500ms) after normal utterance
         // end — the 5s delay is for error cases only. Nick was waiting
@@ -3785,6 +3926,7 @@ public class VoiceService extends Service
      * still happens in onResults.
      */
     public void onPartialVoiceInput(String text) {
+        noteDictationActivity(); // v1.59: partials = capture still live
         String display = sentenceBuffer.length() > 0
                 ? sentenceBuffer.toString() + " " + text
                 : text;
@@ -3851,6 +3993,7 @@ public class VoiceService extends Service
         final boolean vpWasNoiseHold = noiseHoldActive;
         final boolean vpWasBypass = gateBypassSession;
         long now = android.os.SystemClock.uptimeMillis();
+        noteDictationActivity(); // v1.59: an accepted chunk = capture live
         // Nick 2026-10-28 v1.52: a real accepted chunk after a noise
         // pause means dictation RESUMED on top of the held text — the
         // message is continuing, so it is no longer a cut-off send:
@@ -4005,6 +4148,11 @@ public class VoiceService extends Service
         sendAppBroadcast(sent);
         final String toPost = sentence;
         new Thread(new InputPostTask(this, toPost)).start();
+        // Nick 2026-10-29 v1.59: the batch is sent and the buffer is
+        // empty — the dictation is over; release the duck BEFORE any
+        // held playback starts (playback takes its own MAY_DUCK focus,
+        // so the music never pops up in between).
+        maybeReleaseDictationDuck();
         // Nick 2026-10-23 v1.46: polite interruption — the sentence is
         // complete and he's silent; play anything Selena had held.
         releasePoliteHold();
@@ -4233,6 +4381,10 @@ public class VoiceService extends Service
         sent.putExtra(EXTRA_TEXT, sentence);
         sendAppBroadcast(sent);
         new Thread(new InputPostTask(this, sentence, true)).start();
+        // Nick 2026-10-29 v1.59: held dictation sent, buffer empty —
+        // release the duck (the watchdog would stale-release anyway;
+        // this is the prompt path).
+        maybeReleaseDictationDuck();
         releasePoliteHold();
     }
 
