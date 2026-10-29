@@ -63,6 +63,42 @@ public class SupabaseAuth {
         prefs(ctx).edit().clear().apply();
     }
 
+    /**
+     * Nick 2026-10-28 v1.53: the signed-in account's stable key — the
+     * auth user id (`sub` claim of the stored access token), falling
+     * back to a sanitized email key if the token can't be parsed.
+     * Used to key per-user on-device stores (the voiceprint wall,
+     * spec §5): it identifies WHICH profile a sample belongs to; it
+     * is never an authentication decision by itself. Non-blocking:
+     * reads only what's already stored. Null when signed out.
+     */
+    public static String userKey(Context ctx) {
+        SharedPreferences p = prefs(ctx);
+        String access = p.getString(K_ACCESS, null);
+        if (access != null) {
+            try {
+                String[] parts = access.split("\\.");
+                if (parts.length >= 2) {
+                    byte[] payload = android.util.Base64.decode(
+                            parts[1], android.util.Base64.URL_SAFE
+                                    | android.util.Base64.NO_WRAP
+                                    | android.util.Base64.NO_PADDING);
+                    JSONObject claims = new JSONObject(
+                            new String(payload, StandardCharsets.UTF_8));
+                    String sub = claims.optString("sub", "");
+                    if (!sub.isEmpty()) return sub;
+                }
+            } catch (Exception e) {
+                Log.w(TAG, "auth: userKey parse failed", e);
+            }
+        }
+        String email = p.getString(K_EMAIL, "");
+        if (email != null && !email.isEmpty()) {
+            return "em_" + email.replaceAll("[^a-zA-Z0-9]", "_");
+        }
+        return null;
+    }
+
     /** Returns null on success, or a human-readable error. Blocking. */
     public static String login(Context ctx, String email, String password) {
         try {

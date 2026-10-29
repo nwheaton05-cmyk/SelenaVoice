@@ -37,6 +37,8 @@ public class GateProbeTask implements Runnable {
         float meanDbfs = 0f;
         float stdDb = 0f;
         float peakDbfs = -120f;
+        float zcr = 0f;
+        float bright = 0f;
         boolean ok = false;
         AudioRecord rec = null;
         try {
@@ -65,17 +67,43 @@ public class GateProbeTask implements Runnable {
             int framesWanted = 12;          // ~240ms total
             double[] frameDb = new double[framesWanted];
             int frames = 0;
+            // Nick 2026-10-28 v1.53: probe-domain voiceprint features,
+            // measured from the same transient PCM and then discarded
+            // (measurements only — the audio itself is never kept).
+            // zcr: sign changes per sample (voiced speech sits low,
+            // hiss/friction sits high). bright: first-difference energy
+            // over signal energy (a spectral-tilt proxy: drones are
+            // dark, speech carries more high-frequency movement).
+            long pcmSamples = 0;
+            long signChanges = 0;
+            double pcmEnergy = 0;
+            double diffEnergy = 0;
+            int prevSample = 0;
             while (frames < framesWanted) {
                 int read = rec.read(frame, 0, frame.length);
                 if (read <= 0) break;
                 double sumSq = 0;
                 for (int i = 0; i < read; i++) {
                     sumSq += (double) frame[i] * (double) frame[i];
+                    if (pcmSamples > 0) {
+                        if ((frame[i] >= 0) != (prevSample >= 0)) signChanges++;
+                        double diff = (double) frame[i] - prevSample;
+                        diffEnergy += diff * diff;
+                    }
+                    pcmEnergy += (double) frame[i] * (double) frame[i];
+                    prevSample = frame[i];
+                    pcmSamples++;
                 }
                 double rms = Math.sqrt(sumSq / read);
                 double db = 20.0 * Math.log10(Math.max(rms, 1.0) / 32768.0);
                 frameDb[frames++] = db;
                 if (db > peakDbfs) peakDbfs = (float) db;
+            }
+            if (pcmSamples > 0) {
+                zcr = (float) ((double) signChanges / (double) pcmSamples);
+            }
+            if (pcmEnergy > 0) {
+                bright = (float) Math.min(1.0, diffEnergy / (2.0 * pcmEnergy));
             }
             if (frames >= 6) {
                 double sum = 0;
@@ -98,6 +126,6 @@ public class GateProbeTask implements Runnable {
                 try { rec.release(); } catch (Exception ignored) {}
             }
         }
-        service.onGateProbeResult(meanDbfs, stdDb, peakDbfs, ok);
+        service.onGateProbeResult(meanDbfs, stdDb, peakDbfs, zcr, bright, ok);
     }
 }

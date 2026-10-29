@@ -48,6 +48,23 @@ public class ServiceRecognitionListener implements RecognitionListener {
     private int samplerHead = 0;
     private int samplerCount = 0;
 
+    // Nick 2026-10-28 v1.53: per-utterance RMS trace for the learned
+    // voiceprint (Phase 4, spec §5). While an utterance runs, its
+    // envelope is captured here; at onResults it is reduced to the
+    // 7-dim measurement vector (Voiceprint.featuresFromTrace) and the
+    // trace itself is discarded. Only ACCEPTED utterances teach (the
+    // accept filters below still decide), and the features ride along
+    // so the drone guard can ask the voiceprint for a rescue verdict
+    // before discarding. Measurements only — this is level data, and
+    // even it never leaves memory except as the reduced vector.
+    private static final int TRACE_MAX = 1200;
+    private final float[] traceDb = new float[TRACE_MAX];
+    private final long[] traceMs = new long[TRACE_MAX];
+    private int traceN = 0;
+    private boolean traceActive = false;
+    private float[] pendingFeatures = null;
+    private float pendingConfidence = -1f;
+
     public ServiceRecognitionListener(VoiceService service) {
         this.service = service;
     }
@@ -69,6 +86,62 @@ public class ServiceRecognitionListener implements RecognitionListener {
         samplerMs[samplerHead] = lastRmsMs;
         samplerHead = (samplerHead + 1) % SAMPLER_WINDOW;
         if (samplerCount < SAMPLER_WINDOW) samplerCount++;
+        // Nick 2026-10-28 v1.53: feed the per-utterance voiceprint trace.
+        if (traceActive && traceN < TRACE_MAX) {
+            traceDb[traceN] = rmsdB;
+            traceMs[traceN] = lastRmsMs;
+            traceN++;
+        }
+    }
+
+    /**
+     * Nick 2026-10-28 v1.53: the most recent utterance's measurement
+     * vector, consumed exactly once by VoiceService.onVoiceInput on
+     * the acceptance path (the only path that teaches the voiceprint).
+     */
+    public float[] takeUtteranceFeatures() {
+        float[] f = pendingFeatures;
+        pendingFeatures = null;
+        return f;
+    }
+
+    public float takeUtteranceConfidence() {
+        float c = pendingConfidence;
+        pendingConfidence = -1f;
+        return c;
+    }
+
+    /**
+     * Nick 2026-10-28 v1.53: feature vector over the sampler's recent
+     * window (the drone the gate is hearing right now) — this is what
+     * teaches the NOISE profile in the recognizer domain.
+     */
+    public float[] samplerTraceFeatures() {
+        long now = android.os.SystemClock.uptimeMillis();
+        float[] db = new float[samplerCount];
+        long[] ms = new long[samplerCount];
+        int n = 0;
+        for (int i = 0; i < samplerCount; i++) {
+            if (now - samplerMs[i] > SAMPLER_WINDOW_MS) continue;
+            db[n] = samplerDb[i];
+            ms[n] = samplerMs[i];
+            n++;
+        }
+        if (n < 6) return null;
+        // Chronological order (ring buffer wraps).
+        for (int i = 1; i < n; i++) {
+            float d = db[i];
+            long t = ms[i];
+            int j = i - 1;
+            while (j >= 0 && ms[j] > t) {
+                db[j + 1] = db[j];
+                ms[j + 1] = ms[j];
+                j--;
+            }
+            db[j + 1] = d;
+            ms[j + 1] = t;
+        }
+        return Voiceprint.featuresFromTrace(db, ms, n);
     }
 
     /**
@@ -127,6 +200,9 @@ public class ServiceRecognitionListener implements RecognitionListener {
     @Override
     public void onBeginningOfSpeech() {
         maxRmsThisUtterance = -100.0f;
+        // Nick 2026-10-28 v1.53: start a fresh voiceprint trace.
+        traceN = 0;
+        traceActive = true;
         service.onSpeechDetected();
     }
 
@@ -141,6 +217,7 @@ public class ServiceRecognitionListener implements RecognitionListener {
         // playback, swallow the error (cancel() triggers ERROR_CLIENT)
         // — the unmute path restarts the recognizer when she's done.
         if (service.isMicMutedForPlayback()) return;
+        traceActive = false;
         if (error == SpeechRecognizer.ERROR_NO_MATCH
                 || error == SpeechRecognizer.ERROR_SPEECH_TIMEOUT) {
             // Nick 2026-10-18 v1.3: routine silence, not a real error.
@@ -160,11 +237,20 @@ public class ServiceRecognitionListener implements RecognitionListener {
         float confidence = getTopConfidence(results);
         float peakRms = maxRmsThisUtterance;
         maxRmsThisUtterance = -100.0f;
+        // Nick 2026-10-28 v1.53: reduce the utterance's envelope trace
+        // to its measurement vector BEFORE any discard path — the
+        // voiceprint rescue below needs it, and onVoiceInput consumes
+        // it if the result is accepted. The trace itself dies here.
+        pendingFeatures = Voiceprint.featuresFromTrace(traceDb, traceMs, traceN);
+        pendingConfidence = confidence;
+        traceActive = false;
+        traceN = 0;
         service.onRecognizerDone();
         if (service.isPlayingAudio()) {
             // Nick 2026-10-18 v1.2: echo prevention — the recognizer picked
             // up Selena's own playback, not Nick. Discard, don't POST.
             Log.i(TAG, "discarding result during playback: " + text);
+            pendingFeatures = null;
             return;
         }
         if (service.isGateDroneActiveNow()) {
@@ -172,8 +258,19 @@ public class ServiceRecognitionListener implements RecognitionListener {
             // drone right now — this "result" is the machine, not the
             // user, whatever the confidence/RMS filters would say (a
             // drone is LOUD, so the old peak-RMS filter waved it in).
-            Log.i(TAG, "discarding result during gate drone: " + text);
-            return;
+            // Nick 2026-10-28 v1.53: ONE exception — the learned
+            // voiceprint (§5) may RESCUE the result when the envelope
+            // is unmistakably the signed-in user and clearly unlike
+            // the known noise. The booster opens the gate; it never
+            // closes it (a failed rescue changes nothing), and the
+            // ordinary confidence/RMS filters below still apply.
+            if (service.voiceprintRescueVerdict(pendingFeatures, confidence)) {
+                Log.i(TAG, "voiceprint: RESCUED result from drone guard: " + text);
+            } else {
+                Log.i(TAG, "discarding result during gate drone: " + text);
+                pendingFeatures = null;
+                return;
+            }
         }
         if (text.isEmpty()) {
             return;

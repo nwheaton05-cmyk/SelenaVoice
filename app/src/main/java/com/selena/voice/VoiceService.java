@@ -350,6 +350,17 @@ public class VoiceService extends Service
     private static final float GATE_PROBE_BURST_PEAK_DB = 5.0f; // burst peak above drone baseline
     private static final long NOISE_HOLD_SEND_MS = 60000;      // spec §3: 60s noise clock
 
+    // Nick 2026-10-28 v1.53: learned voiceprint (Phase 4, spec §5).
+    // The store/profiles live in Voiceprint; the service owns the one
+    // live instance and feeds it from the acceptance path only. The
+    // voiceprint's verdict is a booster at gate decision points —
+    // it can open the gate wider, never narrower (§4.3).
+    private Voiceprint voiceprint;
+    private long vpDroneSeenMs = 0;              // last sampler drone sighting
+    private long vpLastNoiseFeedMs = 0;          // noise-teaching throttle
+    private float[] vpPendingBurstFeats = null;  // probe burst awaiting confirmation
+    private long vpBurstConfirmUntilMs = 0;
+
     // Nick 2026-10-19 v1.16: outbound (moved from MainActivity).
     private RealtimeClient realtimeClient;
     private boolean polling = false;
@@ -468,6 +479,12 @@ public class VoiceService extends Service
         CrashReporter.install(this);
         audioManager = (AudioManager) getSystemService(Context.AUDIO_SERVICE);
         recognitionListener = new ServiceRecognitionListener(this);
+        // Nick 2026-10-28 v1.53: learned voiceprint store (Phase 4,
+        // spec §5) + an opportunistic archive sync attempt (upload of
+        // week-old measurements / re-seed from the server archive).
+        voiceprint = new Voiceprint(this);
+        new Thread(new VoiceprintSyncTask(
+                this, VoiceprintSyncTask.MODE_SYNC, voiceprint)).start();
         // Nick 2026-10-28 v1.51: register the media session so Bluetooth
         // earbud/headset button presses are delivered to this app.
         initMediaSession();
@@ -521,6 +538,15 @@ public class VoiceService extends Service
                     onEarbudAction(earbudAction,
                             earbudSource != null ? earbudSource : "broadcast");
                 }
+            } else if ("RESET_VOICEPRINT".equals(intent.getAction())) {
+                // Nick 2026-10-28 v1.53 (§5): per-profile reset. The
+                // service owns the live voiceprint, so the reset lands
+                // here (local profile + records); the sync task drops
+                // the server archive under the user's profile.
+                if (voiceprint != null) voiceprint.resetCurrentUser();
+                new Thread(new VoiceprintSyncTask(
+                        this, VoiceprintSyncTask.MODE_RESET)).start();
+                log("voiceprint: reset by user (local + server archive)");
             } else if ("MANUAL_LISTEN".equals(intent.getAction())) {
                 // Nick 2026-10-28 v1.52 (§4.1): the mic tap is the
                 // manual override — while the noise gate has the
@@ -3428,6 +3454,11 @@ public class VoiceService extends Service
         // Nick 2026-10-18 v1.9: Nick's words reach the UI instantly, even
         // if the POST later fails (offline, timeout). His inputs are never
         // spoken aloud — playback only plays Selena's reply MP3s.
+        // Nick 2026-10-28 v1.53: capture the gate context BEFORE the
+        // bookkeeping below clears it — the voiceprint sample class
+        // depends on how this chunk was accepted.
+        final boolean vpWasNoiseHold = noiseHoldActive;
+        final boolean vpWasBypass = gateBypassSession;
         long now = android.os.SystemClock.uptimeMillis();
         // Nick 2026-10-28 v1.52: a real accepted chunk after a noise
         // pause means dictation RESUMED on top of the held text — the
@@ -3468,6 +3499,88 @@ public class VoiceService extends Service
         if (sentenceFlushTask != null) handler.removeCallbacks(sentenceFlushTask);
         sentenceFlushTask = () -> flushSentence();
         handler.postDelayed(sentenceFlushTask, SENTENCE_GAP_MS);
+        // Nick 2026-10-28 v1.53: this chunk was ACCEPTED — it may
+        // teach the voiceprint (§5: only accepted dictations teach).
+        vpLearnAccepted(text, vpWasNoiseHold, vpWasBypass);
+    }
+
+    /**
+     * Nick 2026-10-28 v1.53 (Phase 4, spec §5): feed the learned
+     * voiceprint from one accepted dictation chunk. Sample class:
+     * manual-override sessions are the strongest evidence (§4.1);
+     * chunks accepted out of a noise hold (or with the drone recently
+     * in the sampler) are over-noise — light voice weight, and the
+     * surrounding drone teaches the noise profile too; quiet-room
+     * chunks are clean; everything else is normal. A chunk that says
+     * "ignore that / that wasn't me" instead redirects the PREVIOUS
+     * sample to the noise profile (§4.2) and teaches nothing itself.
+     */
+    private void vpLearnAccepted(String text, boolean wasNoiseHold,
+                                 boolean wasBypass) {
+        if (voiceprint == null || recognitionListener == null) return;
+        try {
+            float[] feats = recognitionListener.takeUtteranceFeatures();
+            float conf = recognitionListener.takeUtteranceConfidence();
+            if (feats == null) return;
+            String t = (text == null ? "" : text.trim().toLowerCase(Locale.US));
+            if (t.startsWith("ignore that") || t.startsWith("that wasn't me")
+                    || t.startsWith("that wasnt me") || t.startsWith("not me")
+                    || t.startsWith("disregard that")) {
+                voiceprint.moveLastVoiceSampleToNoise();
+                log("voiceprint: 'wasn't me' — last sample redirected to the noise profile");
+                return;
+            }
+            String cls;
+            if (wasBypass) {
+                cls = Voiceprint.CLS_OVERRIDE;
+            } else if (wasNoiseHold || gateNow() - vpDroneSeenMs < 15000) {
+                cls = Voiceprint.CLS_OVER_NOISE;
+            } else {
+                float[] s = recognitionListener.samplerStats();
+                cls = (s[3] >= 1f && s[0] < GATE_LOUD_DB - 4f)
+                        ? Voiceprint.CLS_CLEAN : Voiceprint.CLS_NORMAL;
+            }
+            voiceprint.learnVoice(feats, cls, conf);
+            if (Voiceprint.CLS_OVER_NOISE.equals(cls)) {
+                float[] nf = recognitionListener.samplerTraceFeatures();
+                if (nf != null) voiceprint.learnNoiseRecog(nf, 0.7);
+            }
+            // A dictation landing right after a probe-burst re-arm
+            // CONFIRMS the burst was the user — teach the probe-domain
+            // voice profile so the next burst is recognized sooner.
+            if (vpPendingBurstFeats != null && gateNow() <= vpBurstConfirmUntilMs) {
+                voiceprint.learnVoiceProbe(vpPendingBurstFeats,
+                        Voiceprint.weightFor(cls) * 0.8);
+                vpPendingBurstFeats = null;
+                log("voiceprint: probe burst confirmed by dictation — probe voice profile taught");
+            }
+        } catch (Exception e) {
+            Log.w(TAG, "voiceprint: learn failed", e);
+        }
+    }
+
+    /**
+     * Nick 2026-10-28 v1.53 (§5/§4.3): the drone guard's one exception.
+     * Returns true only when the learned voiceprint is confident this
+     * envelope is the signed-in user (and clearly unlike the known
+     * noise) and the recognizer's own confidence isn't low. A false
+     * here changes nothing — the guard discards exactly as it did
+     * before the voiceprint existed. The voiceprint can open the
+     * gate; it can never be the reason anything is refused.
+     */
+    public boolean voiceprintRescueVerdict(float[] feats, float confidence) {
+        if (voiceprint == null || feats == null) return false;
+        try {
+            if (confidence >= 0 && confidence < 0.5f) return false;
+            boolean match = voiceprint.verdictRecog(feats) == Voiceprint.MATCH;
+            if (match) {
+                log("voiceprint: envelope MATCHES the signed-in user — rescuing result from the drone guard");
+            }
+            return match;
+        } catch (Exception e) {
+            Log.w(TAG, "voiceprint: rescue verdict failed", e);
+            return false;
+        }
     }
 
     /**
@@ -3634,7 +3747,19 @@ public class VoiceService extends Service
                 gateDroneSinceMs = 0;
                 return;
             }
-            if (samplerSeesDrone()) {
+            boolean droneNow = samplerSeesDrone();
+            if (droneNow) {
+                // Nick 2026-10-28 v1.53: the drone is a free NOISE
+                // profile sample (§5: the system learns two profiles).
+                // Throttled — a mower offers the same lesson for hours.
+                vpDroneSeenMs = gateNow();
+                if (voiceprint != null && gateNow() - vpLastNoiseFeedMs > 5000) {
+                    vpLastNoiseFeedMs = gateNow();
+                    float[] nf = recognitionListener.samplerTraceFeatures();
+                    if (nf != null) voiceprint.learnNoiseRecog(nf, 1.0);
+                }
+            }
+            if (droneNow) {
                 if (gateDroneSinceMs == 0) {
                     gateDroneSinceMs = gateNow();
                 } else if (gateNow() - gateDroneSinceMs >= GATE_KILL_SUSTAIN_MS) {
@@ -3750,12 +3875,15 @@ public class VoiceService extends Service
 
     /** Called by GateProbeTask on its worker thread. */
     public void onGateProbeResult(float meanDbfs, float stdDb,
-                                  float peakDbfs, boolean ok) {
-        handler.post(() -> handleGateProbeResult(meanDbfs, stdDb, peakDbfs, ok));
+                                  float peakDbfs, float zcr, float bright,
+                                  boolean ok) {
+        handler.post(() -> handleGateProbeResult(
+                meanDbfs, stdDb, peakDbfs, zcr, bright, ok));
     }
 
     private void handleGateProbeResult(float meanDbfs, float stdDb,
-                                       float peakDbfs, boolean ok) {
+                                       float peakDbfs, float zcr, float bright,
+                                       boolean ok) {
         gateProbeInFlight = false;
         if (gateState != GATE_KILLED || destroyed) return;
         if (!ok) {
@@ -3764,18 +3892,38 @@ public class VoiceService extends Service
             return;
         }
         try {
+            float[] probeFeats = new float[]{meanDbfs, stdDb, peakDbfs, zcr, bright};
+            // Nick 2026-10-28 v1.53: the voiceprint booster at the
+            // probe gate (§5/§4.3). When confirmed bursts have taught
+            // the probe-domain voice profile what the user sounds like
+            // over a drone, a burst that matches it (and doesn't match
+            // the drone) earns RELAXED thresholds. A non-match changes
+            // nothing — the standard thresholds judge it, exactly as
+            // before the voiceprint existed.
+            boolean vpBoost = voiceprint != null
+                    && voiceprint.probeBoostApplies(probeFeats);
+            float burstStd = vpBoost ? 2.0f : GATE_PROBE_BURST_STD_DB;
+            float burstPeakMargin = vpBoost ? 3.5f : GATE_PROBE_BURST_PEAK_DB;
             // Re-arm B (§3): a speech-shaped burst riding clearly above
             // the learned drone baseline. Judged BEFORE this sample can
             // move the baseline. Before a baseline exists, only an
             // unmistakably loud + varied probe counts.
             boolean burst;
             if (gateProbeCount >= 2 && !Float.isNaN(gateDroneBaselineDbfs)) {
-                burst = stdDb >= GATE_PROBE_BURST_STD_DB
-                        && peakDbfs >= gateDroneBaselineDbfs + GATE_PROBE_BURST_PEAK_DB;
+                burst = stdDb >= burstStd
+                        && peakDbfs >= gateDroneBaselineDbfs + burstPeakMargin;
             } else {
-                burst = stdDb >= GATE_PROBE_BURST_STD_DB && meanDbfs >= -20f;
+                burst = stdDb >= burstStd && meanDbfs >= -20f;
             }
             if (burst) {
+                if (vpBoost) {
+                    log("voiceprint: probe boost — voice-like burst over the drone, thresholds relaxed");
+                }
+                // Remember this burst: if a real dictation lands
+                // within the confirm window, it was the user, and the
+                // probe-domain voice profile learns from it (§5).
+                vpPendingBurstFeats = probeFeats;
+                vpBurstConfirmUntilMs = gateNow() + 12000;
                 exitGateKill("speech burst over the drone");
                 return;
             }
@@ -3790,6 +3938,15 @@ public class VoiceService extends Service
             } else if (Math.abs(meanDbfs - gateDroneBaselineDbfs) < 3f) {
                 gateDroneBaselineDbfs =
                         gateDroneBaselineDbfs * 0.9f + meanDbfs * 0.1f;
+            }
+            // Nick 2026-10-28 v1.53: near-baseline probes are the
+            // drone itself — teach the probe-domain NOISE profile
+            // (§5's second profile, device/environment, outside the
+            // per-user wall).
+            if (voiceprint != null && !Float.isNaN(gateDroneBaselineDbfs)
+                    && Math.abs(meanDbfs - gateDroneBaselineDbfs) < 3f) {
+                voiceprint.learnNoiseProbe(probeFeats,
+                        gateProbeCount < 3 ? 0.7 : 1.0);
             }
             gateProbeCount++;
             // Re-arm A (§3): the level fell well below the drone

@@ -82,6 +82,7 @@ public class MainActivity extends Activity {
     // the delete-key dialog — never hardcoded.
     private Button signInButton;
     private Button deleteKeyButton;
+    private Button voiceprintButton;
 
     // Nick 2026-10-22 v1.33: in-app auto-updater banner. Hidden until the
     // version check finds a newer APK; tap downloads + installs it.
@@ -375,6 +376,9 @@ public class MainActivity extends Activity {
         deleteKeyButton = findViewById(R.id.deleteKeyButton);
         deleteKeyButton.setEnabled(true);
         deleteKeyButton.setOnClickListener(v -> showDeleteKeyDialog());
+        voiceprintButton = findViewById(R.id.voiceprintButton);
+        voiceprintButton.setEnabled(true);
+        voiceprintButton.setOnClickListener(v -> showVoiceprintDialog());
         refreshSignInButton();
 
         // Nick 2026-10-22 v1.33: in-app auto-updater. Hidden until the
@@ -743,6 +747,34 @@ public class MainActivity extends Activity {
                     ri.setAction("RESTART_REALTIME");
                     startForegroundService(ri);
                 })
+                .show();
+    }
+
+    /**
+     * Nick 2026-10-28 v1.53 (Phase 4, spec §5): voiceprint status +
+     * per-profile reset. The reset itself runs in VoiceService (the
+     * RESET_VOICEPRINT intent) because the service owns the live
+     * profile; this dialog only reports status and asks.
+     */
+    private void showVoiceprintDialog() {
+        String status = Voiceprint.statusLine(this);
+        new android.app.AlertDialog.Builder(this)
+                .setTitle("Learned voiceprint")
+                .setMessage(status
+                        + "\n\nThe voiceprint only ever makes the noise gate MORE"
+                        + " willing to hear you — it can never block you. Reset"
+                        + " deletes this account's learned profile and its"
+                        + " server archive; learning starts over from scratch.")
+                .setPositiveButton("Reset voiceprint", (d, w) -> {
+                    Intent ri = new Intent(
+                            MainActivity.this, VoiceService.class);
+                    ri.setAction("RESET_VOICEPRINT");
+                    startForegroundService(ri);
+                    android.widget.Toast.makeText(MainActivity.this,
+                            "Voiceprint reset",
+                            android.widget.Toast.LENGTH_SHORT).show();
+                })
+                .setNegativeButton("Keep", null)
                 .show();
     }
 
