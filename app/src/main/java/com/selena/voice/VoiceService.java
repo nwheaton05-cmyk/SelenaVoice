@@ -371,6 +371,22 @@ public class VoiceService extends Service
     private boolean ttsReady = false;
     private final Queue<String> ttsQueue = new LinkedList<>();
     private boolean ttsSpeaking = false;
+    // Nick 2026-10-28 v1.55 (Phase 5, spec §8): playback-progress wire.
+    // The brain's fraction accounting needs to know WHICH queue row
+    // finished; currentPlayServerId tracks the selena_voice_queue row
+    // of whatever is playing right now (either path) and the completion
+    // handlers report it (playback_row_played) before unwinding.
+    private String currentPlayServerId = null;
+    // MP3 path: the row id rides with the queued File (path -> row id),
+    // consumed when playFileNow starts the file.
+    private final java.util.Map<String, String> audioFileServerIds =
+            new java.util.HashMap<>();
+    // TTS path: row ids ride a parallel queue alongside ttsQueue (same
+    // lock); pumpTtsQueue polls both together.
+    private final Queue<String> ttsServerIdQueue = new LinkedList<>();
+    // Row id of the TTS utterance pumpTtsQueue is about to speak;
+    // speakOnDevice adopts it for fresh utterances.
+    private String pendingTtsServerId = null;
     // Nick 2026-10-22 v1.27: pause/resume for phone (on-device TTS) mode.
     // Android TTS has no pause API — pause = tts.stop(), resume = re-speak
     // from the last word boundary reported by onRangeStart.
@@ -992,6 +1008,7 @@ public class VoiceService extends Service
         } catch (Exception ignored) {}
         synchronized (ttsQueue) {
             ttsQueue.clear();
+            ttsServerIdQueue.clear(); // v1.55: parallel queue stays in sync
         }
         ttsSpeaking = false;
         log("service polling stopped");
@@ -1149,7 +1166,7 @@ public class VoiceService extends Service
                 markSpokenLocked(text);
                 if (isPhoneVoiceMode()) {
                     final String speakText = text;
-                    handler.post(() -> onPriorityArrivalTts(speakText));
+                    handler.post(() -> onPriorityArrivalTts(speakText, sid));
                 } else if (!audioUrl.isEmpty() && audioUrl.startsWith("http")) {
                     // Nick 2026-10-23 v1.43: backward-compat MP3 path. The
                     // server still renders MP3s during transition; a row
@@ -1166,7 +1183,7 @@ public class VoiceService extends Service
                         log("priority: MP3 download failed: "
                                 + e.getMessage() + " — TTS fallback");
                         final String speakText = text;
-                        handler.post(() -> onPriorityArrivalTts(speakText));
+                        handler.post(() -> onPriorityArrivalTts(speakText, sid));
                     }
                 } else {
                     // Nick 2026-10-23 v1.43: in-app synthesis (Achernar since v1.45; Callirrhoe v1.44).
@@ -1183,7 +1200,7 @@ public class VoiceService extends Service
                         } catch (Exception e) {
                             log("priority: synthesis failed, on-device TTS "
                                     + "fallback: " + e.getMessage());
-                            handler.post(() -> onPriorityArrivalTts(stext));
+                            handler.post(() -> onPriorityArrivalTts(stext, ssid));
                         }
                     }).start();
                 }
@@ -1212,7 +1229,7 @@ public class VoiceService extends Service
                 broadcastMessage(text);
                 final MessageHistory.Entry histEntry = MessageHistory.add(text, null, sid);
                 final String speakText = text;
-                handler.post(() -> enqueueTts(speakText));
+                handler.post(() -> enqueueTts(speakText, sid));
                 // Nick 2026-10-22 v1.25: still fetch the server MP3 in the
                 // background so the message card grows a replay button.
                 if (!audioUrl.isEmpty() && audioUrl.startsWith("http")) {
@@ -1248,7 +1265,7 @@ public class VoiceService extends Service
                         final File df = f;
                         // Nick 2026-10-21 v1.24: cache for replay.
                         MessageHistory.add(text, f, sid);
-                        handler.post(() -> enqueueAudio(df));
+                        handler.post(() -> enqueueAudio(df, sid));
                     } catch (Exception e) {
                         log("audio download failed: " + audioUrl + ": " + e);
                     }
@@ -1269,11 +1286,11 @@ public class VoiceService extends Service
                     try {
                         final File sf = synthesizeToCache(stext);
                         MessageHistory.setAudioPath(histEntry.id, sf);
-                        handler.post(() -> enqueueAudio(sf));
+                        handler.post(() -> enqueueAudio(sf, sid));
                     } catch (Exception e) {
                         log("synth: low-priority synthesis failed, "
                                 + "on-device fallback: " + e.getMessage());
-                        handler.post(() -> enqueueTts(stext));
+                        handler.post(() -> enqueueTts(stext, sid));
                     }
                 }).start();
                 consumed = true;
@@ -1293,6 +1310,15 @@ public class VoiceService extends Service
 
     /** Runs on main thread: queue a downloaded file for playback. */
     private void enqueueAudio(File f) {
+        enqueueAudio(f, null);
+    }
+
+    /** v1.55: queue a file WITH its queue row id, so the completion
+     *  report can name the row that finished (see playFileNow). */
+    private void enqueueAudio(File f, String serverId) {
+        if (serverId != null) {
+            audioFileServerIds.put(f.getAbsolutePath(), serverId);
+        }
         synchronized (audioQueue) {
             audioQueue.add(f);
         }
@@ -1477,11 +1503,32 @@ public class VoiceService extends Service
             playbackPaused = false;
             log("playback started (echo guard on)");
             currentAudioFile = f;
+            // v1.55: adopt the row id that rode with this file, when
+            // one did (the priority path sets it explicitly beforehand
+            // and its files never enter the map).
+            String mappedSid = audioFileServerIds.remove(f.getAbsolutePath());
+            if (mappedSid != null) currentPlayServerId = mappedSid;
             broadcastPlaybackState();
         } catch (Exception e) {
             log("play failed: " + e);
             onPlaybackDone();
         }
+    }
+
+    /**
+     * v1.55 (Phase 5, §8): report the just-finished queue row to the
+     * brain so its per-sentence fraction accounting advances. Called
+     * FIRST in both completion handlers, before any interrupt/resume
+     * unwinding can overwrite currentPlayServerId. Fire-and-forget on
+     * a worker thread; a lost report only leaves the fraction
+     * conservative (the brain never moves a count backwards).
+     */
+    private void reportPlaybackProgress() {
+        String rowId = currentPlayServerId;
+        currentPlayServerId = null;
+        if (rowId == null || rowId.isEmpty()) return;
+        log("progress: reporting row played: " + rowId);
+        new Thread(new PlaybackProgressTask(rowId)).start();
     }
 
     /** Called by PlayerCompletionListener / PlayerErrorListener. */
@@ -1492,6 +1539,7 @@ public class VoiceService extends Service
     /** Called by PlaybackDoneTask on main thread after playback finishes or fails. */
     @SuppressWarnings("deprecation") // setSpeakerphoneOn, see playFileNow
     public void onPlaybackDoneNow() {
+        reportPlaybackProgress(); // v1.55: before any unwinding below
         abandonAudioFocus();
         restoreMusicVolume(); // Nick 2026-10-19 v1.17: undo the playback boost
         releasePlayer();
@@ -1753,8 +1801,15 @@ public class VoiceService extends Service
 
     /** Runs on main thread: queue text for on-device speech. */
     private void enqueueTts(String text) {
+        enqueueTts(text, null);
+    }
+
+    /** v1.55: queue a text WITH its queue row id on the parallel queue
+     *  (same lock as ttsQueue; pumpTtsQueue polls both together). */
+    private void enqueueTts(String text, String serverId) {
         synchronized (ttsQueue) {
             ttsQueue.add(text);
+            ttsServerIdQueue.add(serverId);
         }
         pumpTtsQueue();
     }
@@ -1772,11 +1827,14 @@ public class VoiceService extends Service
             return;
         }
         String text;
+        String rowId;
         synchronized (ttsQueue) {
             text = ttsQueue.poll();
+            rowId = ttsServerIdQueue.poll();
         }
         if (text == null) return;
         ttsSpeaking = true;
+        pendingTtsServerId = rowId;
         speakOnDevice(text, false);
     }
 
@@ -1793,6 +1851,13 @@ public class VoiceService extends Service
             ttsCurrentText = text;
             ttsResumeAtChar = 0;
             ttsPaused = false;
+            // v1.55: adopt the queued row id for this utterance (the
+            // priority path sets currentPlayServerId itself and leaves
+            // pending null, so it is never clobbered here).
+            if (pendingTtsServerId != null) {
+                currentPlayServerId = pendingTtsServerId;
+                pendingTtsServerId = null;
+            }
         }
         String preview = text.length() > 30 ? text.substring(0, 30) + "…" : text;
         log("tts: on-device speak '" + preview + "'");
@@ -1837,6 +1902,7 @@ public class VoiceService extends Service
     /** Runs on main thread after on-device TTS finishes or fails. */
     @SuppressWarnings("deprecation") // setSpeakerphoneOn, see playFileNow
     private void onTtsDone() {
+        reportPlaybackProgress(); // v1.55: before any unwinding below
         abandonAudioFocus();
         restoreMusicVolume(); // Nick 2026-10-19 v1.17: undo the speech boost
         ttsSpeaking = false;
@@ -2060,6 +2126,9 @@ public class VoiceService extends Service
      */
     private void interruptCurrentPlayback() {
         InterruptedState st = new InterruptedState();
+        // v1.55: the interrupted item keeps its row id so its resume
+        // restores it (its completion report belongs to this row).
+        st.serverId = currentPlayServerId;
         st.wasPaused = playbackPaused || ttsPaused;
         boolean something = false;
         // MP3/Aria path: save file + position.
@@ -2127,6 +2196,9 @@ public class VoiceService extends Service
         MessageHistory.add(text, f, serverId);
         broadcastMessage(text);
         toast("Priority message");
+        // v1.55: set AFTER the interrupt snapshot so the interrupted
+        // item's saved state keeps ITS row id, not this one's.
+        currentPlayServerId = serverId;
         playFileNow(f);
     }
 
@@ -2134,15 +2206,17 @@ public class VoiceService extends Service
      * Nick 2026-10-23 v1.40: speak a high-priority text immediately via
      * on-device TTS, interrupting whatever is playing. Runs on main thread.
      */
-    private void playPriorityTts(final String text) {
+    private void playPriorityTts(final String text, final String serverId) {
         log("priority: speaking high-priority text via on-device TTS");
         priorityMode = true;
         interruptCurrentPlayback();
         markSpokenLocked(text);
         broadcastMessage(text);
-        MessageHistory.add(text, null, null);
+        MessageHistory.add(text, null, serverId);
         toast("Priority message");
         ttsSpeaking = true;
+        // v1.55: after the interrupt snapshot (see playPriorityMp3).
+        currentPlayServerId = serverId;
         speakOnDevice(text, false);
     }
 
@@ -2181,9 +2255,9 @@ public class VoiceService extends Service
      * {@link #onPriorityArrivalMp3} — queue behind a playing priority
      * item, never interrupt it.
      */
-    private void onPriorityArrivalTts(final String text) {
+    private void onPriorityArrivalTts(final String text, final String serverId) {
         if (priorityMode) {
-            waitingPriority.offer(new WaitingPriority(null, text, null));
+            waitingPriority.offer(new WaitingPriority(null, text, serverId));
             log("priority: queued behind playing priority ("
                     + waitingPriority.size() + " waiting)");
             toast("Priority message queued");
@@ -2193,13 +2267,13 @@ public class VoiceService extends Service
         // gate instead of breaking in over Nick's voice. Released on his
         // pause via releasePoliteHold().
         if (politeHoldActive()) {
-            waitingPriority.offer(new WaitingPriority(null, text, null));
+            waitingPriority.offer(new WaitingPriority(null, text, serverId));
             log("priority: held for Nick's pause ("
                     + waitingPriority.size() + " waiting)");
             toast("Priority message queued");
             return;
         }
-        playPriorityTts(text);
+        playPriorityTts(text, serverId);
     }
 
     /**
@@ -2225,7 +2299,7 @@ public class VoiceService extends Service
         if (wp.audioFile != null) {
             playPriorityMp3(wp.audioFile, wp.text, wp.serverId);
         } else {
-            playPriorityTts(wp.text);
+            playPriorityTts(wp.text, wp.serverId);
         }
     }
 
@@ -2293,6 +2367,8 @@ public class VoiceService extends Service
         log("priority: resuming MP3 at " + st.audioPositionMs + "ms");
         // Same setup as playFileNow, then seek before start.
         playFileNow(f);
+        // v1.55: the resumed item's completion belongs to ITS row.
+        currentPlayServerId = st.serverId;
         if (player != null && st.audioPositionMs > 0) {
             try {
                 player.seekTo(st.audioPositionMs);
@@ -2320,6 +2396,8 @@ public class VoiceService extends Service
         ttsCurrentText = text;
         ttsResumeAtChar = at;
         ttsSpeaking = true;
+        // v1.55: the resumed item's completion belongs to ITS row.
+        currentPlayServerId = st.serverId;
         speakOnDevice(rest, true);
     }
 
@@ -2329,6 +2407,9 @@ public class VoiceService extends Service
      * paused-at-char. No autoplay.
      */
     private void restorePausedState(InterruptedState st) {
+        // v1.55: whichever path restores, its eventual completion
+        // reports this item's row.
+        currentPlayServerId = st.serverId;
         if (st.audioFile != null && st.audioFile.exists()) {
             // Rebuild the player paused at the saved position.
             playFileNow(st.audioFile);
@@ -2368,7 +2449,9 @@ public class VoiceService extends Service
         }
         synchronized (ttsQueue) {
             ttsQueue.clear();
+            ttsServerIdQueue.clear(); // v1.55: parallel queue stays in sync
         }
+        pendingTtsServerId = null;
         broadcastPlaybackState();
         toast("⏹ Stopped");
         log("stop: queues cleared (unlocked only)");
@@ -2418,7 +2501,9 @@ public class VoiceService extends Service
         }
         synchronized (ttsQueue) {
             ttsQueue.clear();
+            ttsServerIdQueue.clear(); // v1.55: parallel queue stays in sync
         }
+        pendingTtsServerId = null;
         broadcastPlaybackState();
         toast("Skipping to newest…");
         // Network on a worker thread (Android forbids it on main).
