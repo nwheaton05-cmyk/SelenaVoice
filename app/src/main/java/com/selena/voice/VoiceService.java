@@ -166,9 +166,15 @@ public class VoiceService extends Service
     // Samsung A17 — the recognizer beep apparently plays on a stream that
     // ignores the mute flag. New approach: save each stream's volume and
     // set it to 0 (not mute), then restore. STREAM_VOICE_CALL added too.
+    // Nick 2026-10-29 v1.63: STREAM_MUSIC is OUT of this set, permanently.
+    // His standing rule (14:32 EDT field report): playback must NEVER
+    // change the system media volume, in either direction — the media
+    // stream is simply never written by this app again. The remaining
+    // streams carry no media and none of her voice; they are zeroed
+    // only around recognizer restarts to kill the Samsung beep (his
+    // v1.2–v1.48 demand) and restored immediately after.
     private static final int[] BEEP_STREAMS = {
             AudioManager.STREAM_SYSTEM,
-            AudioManager.STREAM_MUSIC,
             AudioManager.STREAM_NOTIFICATION,
             AudioManager.STREAM_ALARM,
             AudioManager.STREAM_VOICE_CALL,
@@ -176,11 +182,12 @@ public class VoiceService extends Service
     private final int[] savedVolumes = new int[BEEP_STREAMS.length];
     private boolean beepMuted = false;
 
-    // Nick 2026-10-19 v1.17: audio-ducking boost. While Selena's reply
-    // plays, STREAM_MUSIC goes to max so she overpowers background audio
-    // (Spotify); the MAY_DUCK focus request keeps Spotify ducked. The
-    // user's volume is restored when playback ends. -1 = no boost active.
-    private int savedMusicVolume = -1;
+    // Nick 2026-10-29 v1.63: the v1.17 STREAM_MUSIC boost state
+    // (savedMusicVolume) is GONE — the boost was disabled in v1.48 and
+    // its restore machinery is now removed entirely. Nothing in this
+    // app raises or lowers STREAM_MUSIC; her loudness is her player's
+    // own output at the level Nick set, and music ducking is the
+    // MAY_DUCK audio-focus layer only (the music app lowers ITSELF).
 
     // Nick 2026-10-18 v1.2: echo prevention. True while Selena's audio
     // response is playing — recognition results arriving during playback
@@ -274,9 +281,25 @@ public class VoiceService extends Service
     // player (null when idle). Lets CLEAR_UNLOCKED stop playback only
     // when the playing message is unlocked.
     private String currentAudioPath;
-    // Nick 2026-10-19 v1.18: LoudnessEnhancer on the player's audio session
-    // pushes her voice ~+4dB past max stream volume (MP3/Aria path only —
-    // on-device TTS exposes no audio session). Released in releasePlayer().
+    // Nick 2026-10-29 v1.63 (14:38 "turn Selena voice up a bit",
+    // quantified 14:39): "I want Selena voice and Siteview to be 25%
+    // louder than Spotify." The SPEC is the relationship: her voice
+    // sits ≈1.25× the music's playing level. Android exposes no
+    // per-app output meter for Spotify, so the constant below is the
+    // honest approximation: a FIXED session gain sized against the
+    // music-stream level under the system MAY_DUCK (Spotify ducks to
+    // ~0.79 amplitude under the standard −6 dB system duck; her
+    // player at the full stream level × 1.25/0.79 ≈ ×1.58 amplitude
+    // ≈ +4 dB restores the 1.25× relationship over the ducked music).
+    // HER_VOICE_GAIN_MB = round(2000 · log10(VOICE_OVER_MUSIC_TARGET
+    // / 0.794)) with the target at 1.25. It is constant for every MP3
+    // play in every state — it does NOT vary with music or duck state
+    // (the revoked v1.61 shape coupled an enhancer to the STREAM_MUSIC
+    // ramp as compensation; that coupling netted her voice DOWN and
+    // stays deleted). The system stream volume is never written
+    // (standing rule). Field-tunable: change the target, recompute.
+    static final double VOICE_OVER_MUSIC_TARGET = 1.25;
+    static final int HER_VOICE_GAIN_MB = 394; // ≈ +3.94 dB, from the target above
     private LoudnessEnhancer loudnessEnhancer = null;
     private File currentAudioFile;
     private final Queue<File> audioQueue = new LinkedList<>();
@@ -300,27 +323,15 @@ public class VoiceService extends Service
     private static final long DICTATION_DUCK_GRACE_MS = 3000;
     private static final long DICTATION_DUCK_STALE_MS = 20000;
     private static final long DICTATION_DUCK_WATCHDOG_MS = 5000;
-    // Nick 2026-10-29 v1.61 (13:34 — "make music duck further"): the
-    // system MAY_DUCK depth is chosen by the ducked app (~20%) and
-    // Nick ruled it too shallow. DEEP DUCK is ours: while a dictation
-    // is captured or Selena's MP3 voice plays, STREAM_MUSIC is ramped
-    // down to DEEP_DUCK_FRACTION of its prior level (the MAY_DUCK
-    // focus requests stay as the cooperative layer underneath).
-    // Selena's player rides the same stream, so during PLAYBACK her
-    // MediaPlayer gets a compensating LoudnessEnhancer gain (capped
-    // at DEEP_DUCK_COMP_MAX_MB) — she lands near his set level while
-    // the music sits at the duck floor; nothing ever goes ABOVE his
-    // set level (the v1.48 rule). During DICTATION she isn't playing,
-    // so no compensation is needed. Both are named tunables for
-    // Nick's field adjustment.
-    static final double DEEP_DUCK_FRACTION = 0.10;
-    static final int DEEP_DUCK_COMP_MAX_MB = 1000; // +10 dB cap
-    private boolean deepDuckByPlayback = false;
-    private boolean deepDuckByDictation = false;
-    private int deepDuckSavedVolume = -1;
-    private int deepDuckTargetVolume = -1;
-    private int deepDuckGeneration = 0;
-    private Runnable deepDuckWatchdog = null;
+    // Nick 2026-10-29 v1.63: the v1.61 DEEP DUCK fields lived here
+    // (DEEP_DUCK_FRACTION, holder flags, saved/target volume, ramp
+    // generation, watchdog). ALL REMOVED under Nick's standing rule
+    // (14:32 EDT): this app never writes the system media volume.
+    // With no music playing, the ramp + capped compensation was
+    // netting out negative on Selena's OWN voice — his exact field
+    // symptom. Ducking is the MAY_DUCK focus layer above, and only
+    // that: the music app lowers its own playback; the knob never
+    // moves, and her voice always plays at the level he set.
     // Nick 2026-10-29 v1.60 (true wake word spike): sherpa-onnx
     // keyword spotter (WakeWordSpotter) + the app-side conversation
     // window it opens. While the spotter is healthy and no
@@ -852,10 +863,10 @@ public class VoiceService extends Service
         stopPolling();
         heartbeating = false;
         handler.removeCallbacksAndMessages(null);
-        restoreMusicVolume(); // Nick 2026-10-19 v1.17: safety net — never
-        // leave the music stream stuck at the boosted max.
+        // v1.63: no volume safety nets remain to run — nothing in
+        // this app writes the system media volume anymore (v1.17
+        // boost restore and the v1.61 deep-duck release are gone).
         releaseDictationDuck("service destroyed"); // v1.59 safety net
-        releaseDeepDuckAll("service destroyed"); // v1.61: never leave music ducked
         // Nick 2026-10-29 v1.60: stop + release the wake word spotter.
         if (wakeExpiryTask != null) {
             handler.removeCallbacks(wakeExpiryTask);
@@ -1001,15 +1012,10 @@ public class VoiceService extends Service
         if (beepMuted) return;
         try {
             for (int i = 0; i < BEEP_STREAMS.length; i++) {
-                // Nick 2026-10-19 v1.18: never zero STREAM_MUSIC while she is
-                // talking. Recognizer restarts can fire mid-playback and would
-                // knock her max-volume boost down. The Samsung beep is masked
-                // by her voice during playback anyway, so suppression loses
-                // nothing here.
-                if (isPlayingAudio && BEEP_STREAMS[i] == AudioManager.STREAM_MUSIC) {
-                    log("audio: muteBeep skipped STREAM_MUSIC (playback active)");
-                    continue;
-                }
+                // v1.63: STREAM_MUSIC is not in BEEP_STREAMS anymore,
+                // so this loop can never touch her playback stream —
+                // the v1.18 mid-playback skip that used to live here
+                // is unnecessary by construction.
                 savedVolumes[i] = audioManager.getStreamVolume(BEEP_STREAMS[i]);
                 audioManager.setStreamVolume(BEEP_STREAMS[i], 0, 0);
                 // Nick 2026-10-23 v1.48: also hard-mute — Samsung's beep
@@ -1045,55 +1051,13 @@ public class VoiceService extends Service
         }
     }
 
-    // Nick 2026-10-19 v1.17: temporarily raise STREAM_MUSIC to max while
-    // Selena talks, so her voice overpowers background audio like Spotify.
-    // The existing AUDIOFOCUS_GAIN_TRANSIENT request makes Spotify
-    // duck at the same time. Called AFTER unmuteBeep() so the saved value
-    // is the user's real volume, not a zeroed beep stream.
-    private void boostMusicVolume() {
-        // Nick 2026-10-23 v1.48: DISABLED — Nick turns the volume down
-        // deliberately (earbuds) and the boost was overriding him,
-        // blowing out his eardrums. Selena now plays at whatever volume
-        // he set. Method kept as no-op so restore logic stays intact.
-    }
-
-    // Nick 2026-10-19 v1.17: undo boostMusicVolume(). Only restores when
-    // the stream is still sitting at the boosted max — if the user (or a
-    // recognizer muteBeep cycle) changed it mid-playback, we never clobber
-    // their setting with a stale saved value (same rule as unmuteBeep).
-    private void restoreMusicVolume() {
-        if (savedMusicVolume < 0) return;
-        try {
-            int max = audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC);
-            int cur = audioManager.getStreamVolume(AudioManager.STREAM_MUSIC);
-            if (cur == max) {
-                audioManager.setStreamVolume(AudioManager.STREAM_MUSIC,
-                        savedMusicVolume, 0);
-                log("audio: music restored to " + savedMusicVolume);
-            } else {
-                log("audio: music changed mid-playback (" + cur + "), keeping it");
-            }
-        } catch (Exception e) {
-            log("audio: restore failed: " + e);
-        }
-        savedMusicVolume = -1;
-    }
-
-    // Nick 2026-10-19 v1.18: re-assert max immediately before start()/speak()
-    // so nothing that ran between boostMusicVolume() and playback (e.g. a
-    // recognizer cycle) can knock her down. Does not touch savedMusicVolume —
-    // restoreMusicVolume() still owns the undo.
-    private void ensureMaxMusic() {
-        try {
-            int max = audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC);
-            if (audioManager.getStreamVolume(AudioManager.STREAM_MUSIC) < max) {
-                audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, max, 0);
-                log("audio: re-asserted music max right before playback");
-            }
-        } catch (Exception e) {
-            log("audio: re-assert failed: " + e);
-        }
-    }
+    // Nick 2026-10-29 v1.63: boostMusicVolume() / restoreMusicVolume()
+    // / ensureMaxMusic() — the v1.17 STREAM_MUSIC boost machinery —
+    // are DELETED, not merely disabled. The boost had been a no-op
+    // since v1.48, but its restore/re-assert halves still wrote the
+    // media stream. Under the standing rule (14:32 EDT) no code path
+    // in this app writes STREAM_MUSIC in either direction; MAY_DUCK
+    // audio focus is the only ducking mechanism that remains.
 
     // ------------------------------------------------------------ v1.14 Realtime push (moved here v1.16)
 
@@ -1681,12 +1645,13 @@ public class VoiceService extends Service
             // touch setStreamVolume at all. If he's got it muted, it
             // plays muted. His choice.
             //
-            // Undo the mic-beep volume zeroing first so playback uses
-            // his REAL volume, not 0 and not a forced level.
-            // Nick 2026-10-19 v1.17: then boost to max for the duration of
-            // playback so Selena overpowers background audio (Spotify);
-            // restored when playback ends. His explicit request, supersedes
-            // the v1.10 no-override rule for the playback window only.
+            // Undo the mic-beep zeroing first so playback uses
+            // his REAL volume. (The beep set no longer contains
+            // STREAM_MUSIC at all — v1.63.)
+            // Nick 2026-10-19 v1.17's boost-to-max once lived here;
+            // Nick 2026-10-29 v1.63 removed it entirely: her voice
+            // plays at exactly the level he set, and other audio is
+            // ducked only by the MAY_DUCK focus request below.
             unmuteBeep();
             log("audio: using device volume (no override)");
             // Nick 2026-10-18 v1.11: Bluetooth-aware — earbuds win over the
@@ -1694,11 +1659,6 @@ public class VoiceService extends Service
             routeAudioForPlayback();
             log("audio: stream=MUSIC (USAGE_MEDIA)");
             requestAudioFocus();
-            boostMusicVolume();
-            // Nick 2026-10-29 v1.61 deep duck: drop the music stream
-            // to the duck floor for her speech; her player compensates
-            // with the LoudnessEnhancer below.
-            acquireDeepDuck(true);
             releasePlayer();
             player = new MediaPlayer();
             player.setAudioAttributes(new AudioAttributes.Builder()
@@ -1719,32 +1679,24 @@ public class VoiceService extends Service
             // (<100ms).
             player.prepare();
             log("audio: MediaPlayer prepared, duration=" + player.getDuration() + "ms");
-            // Nick 2026-10-23 v1.48: LoudnessEnhancer as a BOOST stays
-            // disabled — it overrode Nick's set volume. v1.61 reuses it
-            // for one narrow job only: while the deep duck holds
-            // STREAM_MUSIC at DEEP_DUCK_FRACTION, the enhancer gives
-            // HER player back the depth the duck took (capped), so she
-            // lands near — never above — his set level while the music
-            // sits at the floor. No duck active → no enhancer.
-            if (deepDuckByPlayback && deepDuckSavedVolume > 0
-                    && deepDuckTargetVolume >= 0
-                    && deepDuckTargetVolume < deepDuckSavedVolume) {
-                try {
-                    double frac = (double) deepDuckTargetVolume
-                            / (double) deepDuckSavedVolume;
-                    int depthMb = (int) Math.round(
-                            -2000.0 * Math.log10(Math.max(frac, 0.01)));
-                    int gainMb = Math.min(depthMb, DEEP_DUCK_COMP_MAX_MB);
-                    loudnessEnhancer = new LoudnessEnhancer(
-                            player.getAudioSessionId());
-                    loudnessEnhancer.setTargetGain(gainMb);
-                    loudnessEnhancer.setEnabled(true);
-                    log("deepduck: her player compensated +" + gainMb
-                            + " mB against the duck");
-                } catch (Exception e) {
-                    log("deepduck: compensation failed: " + e);
-                    loudnessEnhancer = null;
-                }
+            // v1.63 (14:38): her own +gain — FIXED at HER_VOICE_GAIN_MB
+            // on her player's session, applied identically on every
+            // play regardless of music/duck state. This is NOT the
+            // v1.61 compensation (which varied with the ramp and
+            // netted her voice down — Nick's 14:33 symptom); the ramp
+            // is gone, the gain is constant, and no stream volume is
+            // ever written. Failure is soft: she still plays, ungained.
+            try {
+                loudnessEnhancer = new LoudnessEnhancer(
+                        player.getAudioSessionId());
+                loudnessEnhancer.setTargetGain(HER_VOICE_GAIN_MB);
+                loudnessEnhancer.setEnabled(true);
+                log("voice: her gain +" + HER_VOICE_GAIN_MB
+                        + " mB on her player session (target "
+                        + VOICE_OVER_MUSIC_TARGET + "x over ducked music)");
+            } catch (Exception e) {
+                log("voice: her gain failed (plays ungained): " + e);
+                loudnessEnhancer = null;
             }
             // Nick 2026-10-23 v1.47: stop the mic BEFORE her voice
             // comes out, so it can't be transcribed as Nick's input.
@@ -1846,8 +1798,9 @@ public class VoiceService extends Service
         final String finishedGroup = currentPlaySegmentGroup;
         reportPlaybackProgress(); // v1.55: before any unwinding below
         abandonAudioFocus();
-        restoreMusicVolume(); // Nick 2026-10-19 v1.17: undo the playback boost
-        releaseDeepDuck(true); // v1.61: music back up when she finishes
+        // v1.63: nothing to restore — no volume was written on the
+        // way in (the v1.17 boost restore and the v1.61 deep-duck
+        // release that lived here are both deleted).
         releasePlayer();
         playing = false;
         isPlayingAudio = false;
@@ -2290,17 +2243,16 @@ public class VoiceService extends Service
         String preview = text.length() > 30 ? text.substring(0, 30) + "…" : text;
         log("tts: on-device speak '" + preview + "'");
         // Same routing as MP3 playback: loudspeaker, and undo the
-        // mic-beep volume zeroing first so we use Nick's real device
-        // volume (v1.10: no override, respect his setting).
-        // Nick 2026-10-19 v1.17: then boost to max while she talks so she
-        // overpowers Spotify; restored in onTtsDone. His explicit request.
+        // mic-beep zeroing first so we use Nick's real device
+        // volume (v1.10: no override, respect his setting — made
+        // absolute in v1.63: nothing here writes the media volume;
+        // the v1.17 boost call that lived in this spot is deleted).
         unmuteBeep();
         // Nick 2026-10-18 v1.11: Bluetooth-aware — earbuds win over the
         // speakerphone when connected, same as MP3 playback.
         routeAudioForPlayback();
         log("tts: stream=MUSIC");
         requestAudioFocus();
-        boostMusicVolume();
         // Nick 2026-10-23 v1.47: stop the mic BEFORE she speaks, so
         // her voice can't be transcribed as Nick's input.
         muteMicForPlayback();
@@ -2335,7 +2287,7 @@ public class VoiceService extends Service
         final String finishedGroup = currentPlaySegmentGroup;
         reportPlaybackProgress(); // v1.55: before any unwinding below
         abandonAudioFocus();
-        restoreMusicVolume(); // Nick 2026-10-19 v1.17: undo the speech boost
+        // v1.63: no boost to undo — nothing wrote the media volume.
         ttsSpeaking = false;
         ttsPaused = false;
         ttsCurrentText = null;
@@ -2381,8 +2333,8 @@ public class VoiceService extends Service
     }
 
     private void releasePlayer() {
-        // Nick 2026-10-19 v1.18: release the LoudnessEnhancer with the player
-        // so it never lingers on a dead audio session.
+        // v1.63: release her gain enhancer with the player so it
+        // never lingers on a dead audio session.
         if (loudnessEnhancer != null) {
             try { loudnessEnhancer.setEnabled(false); } catch (Exception ignored) {}
             try { loudnessEnhancer.release(); } catch (Exception ignored) {}
@@ -2553,7 +2505,6 @@ public class VoiceService extends Service
         // Release the MP3 player (also clears playbackPaused and
         // broadcasts state).
         releasePlayer();
-        releaseDeepDuck(true); // v1.61: a stop also un-ducks the music
         playing = false;
         isPlayingAudio = false;
         setPlayingAudio(false);
@@ -2969,7 +2920,6 @@ public class VoiceService extends Service
         // Release the MP3 player (also clears playbackPaused and
         // broadcasts state).
         releasePlayer();
-        releaseDeepDuck(true); // v1.61: the skipped-to play re-acquires
         playing = false;
         isPlayingAudio = false;
         setPlayingAudio(false);
@@ -3595,8 +3545,9 @@ public class VoiceService extends Service
         } catch (Exception e) {
             log("duck: dictation focus request failed: " + e);
         }
-        // v1.61: the manual deep duck rides the same lifecycle.
-        acquireDeepDuck(false);
+        // v1.63: the MAY_DUCK focus request above is the WHOLE duck
+        // now — the v1.61 manual ramp that rode this lifecycle is
+        // deleted (standing rule: never write the media volume).
     }
 
     /** Partials/chunks/speech-end while the duck is held = still capturing. */
@@ -3626,9 +3577,6 @@ public class VoiceService extends Service
     }
 
     private void releaseDictationDuck(String why) {
-        // v1.61: the manual deep duck releases even when the focus
-        // half had nothing to release (it is acquired unconditionally).
-        releaseDeepDuck(false);
         if (!dictationDuckHeld && dictationFocusRequest == null) return;
         try {
             if (dictationFocusRequest != null) {
@@ -3672,140 +3620,17 @@ public class VoiceService extends Service
         handler.postDelayed(dictationDuckWatchdog, DICTATION_DUCK_WATCHDOG_MS);
     }
 
-    // ------------------------------------------------------------ deep duck (v1.61)
-
-    /**
-     * Acquire the manual deep duck for one holder (playback=true,
-     * dictation=false). First holder in: save the music level and
-     * ramp STREAM_MUSIC down to DEEP_DUCK_FRACTION of it. If his
-     * level is 0 or already at the floor, there is nothing to duck.
-     */
-    private void acquireDeepDuck(boolean playback) {
-        if (playback) {
-            if (deepDuckByPlayback) return;
-            deepDuckByPlayback = true;
-        } else {
-            if (deepDuckByDictation) return;
-            deepDuckByDictation = true;
-        }
-        armDeepDuckWatchdog();
-        if (deepDuckSavedVolume >= 0) return; // other holder already ducked
-        try {
-            int cur = audioManager.getStreamVolume(AudioManager.STREAM_MUSIC);
-            int target = (int) Math.round(cur * DEEP_DUCK_FRACTION);
-            if (cur <= 0 || target >= cur) {
-                log("deepduck: level " + cur + " too low to duck further");
-                return;
-            }
-            if (target < 1) target = 1;
-            deepDuckSavedVolume = cur;
-            deepDuckTargetVolume = target;
-            rampMusicVolume(target);
-            log("deepduck: music " + cur + " → " + target + " ("
-                    + (playback ? "playback" : "dictation") + ")");
-        } catch (Exception e) {
-            log("deepduck: acquire failed: " + e);
-        }
-    }
-
-    /**
-     * Release one holder; the last one out ramps the music back to
-     * the saved level — but only if the stream is still sitting at
-     * our duck target (if Nick changed the volume mid-duck, his
-     * setting wins and we never clobber it; same rule as
-     * restoreMusicVolume).
-     */
-    private void releaseDeepDuck(boolean playback) {
-        if (playback) deepDuckByPlayback = false;
-        else deepDuckByDictation = false;
-        if (deepDuckByPlayback || deepDuckByDictation) return;
-        if (deepDuckWatchdog != null) {
-            handler.removeCallbacks(deepDuckWatchdog);
-            deepDuckWatchdog = null;
-        }
-        if (deepDuckSavedVolume < 0) return;
-        int saved = deepDuckSavedVolume;
-        int target = deepDuckTargetVolume;
-        deepDuckSavedVolume = -1;
-        deepDuckTargetVolume = -1;
-        try {
-            int cur = audioManager.getStreamVolume(AudioManager.STREAM_MUSIC);
-            if (cur == target) {
-                rampMusicVolume(saved);
-                log("deepduck: music restored to " + saved);
-            } else {
-                log("deepduck: volume changed while ducked (" + cur
-                        + ") — keeping his setting");
-            }
-        } catch (Exception e) {
-            log("deepduck: restore failed: " + e);
-        }
-    }
-
-    /** Force-release both holders (service teardown). */
-    private void releaseDeepDuckAll(String why) {
-        deepDuckByPlayback = false;
-        deepDuckByDictation = false;
-        releaseDeepDuck(true);
-        log("deepduck: force-released (" + why + ")");
-    }
-
-    /** Three-step ramp so the fade is a fade, not a click. Generation-guarded. */
-    private void rampMusicVolume(int to) {
-        final int gen = ++deepDuckGeneration;
-        try {
-            final int from = audioManager.getStreamVolume(
-                    AudioManager.STREAM_MUSIC);
-            if (from == to) return;
-            final int step1 = from + (to - from) / 3;
-            final int step2 = from + 2 * (to - from) / 3;
-            audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, step1, 0);
-            handler.postDelayed(() -> {
-                if (gen != deepDuckGeneration) return;
-                try {
-                    audioManager.setStreamVolume(
-                            AudioManager.STREAM_MUSIC, step2, 0);
-                } catch (Exception ignored) {}
-            }, 60);
-            handler.postDelayed(() -> {
-                if (gen != deepDuckGeneration) return;
-                try {
-                    audioManager.setStreamVolume(
-                            AudioManager.STREAM_MUSIC, to, 0);
-                } catch (Exception ignored) {}
-            }, 120);
-        } catch (Exception e) {
-            log("deepduck: ramp failed: " + e);
-        }
-    }
-
-    /**
-     * The stuck-duck watchdog: if a holder claims the duck but
-     * nothing has been playing or dictating for 20 s, the duck is
-     * stale — force it back up. Music must never sit at the floor
-     * because bookkeeping lost track.
-     */
-    private void armDeepDuckWatchdog() {
-        if (deepDuckWatchdog != null) return;
-        deepDuckWatchdog = () -> {
-            deepDuckWatchdog = null;
-            if (!deepDuckByPlayback && !deepDuckByDictation) return;
-            boolean playbackAlive = isPlayingAudio() || playing
-                    || playbackPaused || ttsSpeaking;
-            long dictIdle = android.os.SystemClock.uptimeMillis()
-                    - lastDictationActivityMs;
-            boolean dictAlive = dictationDuckHeld
-                    && dictIdle < DICTATION_DUCK_STALE_MS;
-            if ((deepDuckByPlayback && !playbackAlive)
-                    || (deepDuckByDictation && !dictAlive)) {
-                log("deepduck: watchdog — stale holder, restoring music");
-                releaseDeepDuckAll("watchdog");
-                return;
-            }
-            armDeepDuckWatchdog();
-        };
-        handler.postDelayed(deepDuckWatchdog, DICTATION_DUCK_WATCHDOG_MS);
-    }
+    // ------------------------------------------------------------ deep duck: REMOVED (v1.63)
+    // The v1.61 manual deep duck (acquireDeepDuck / releaseDeepDuck /
+    // rampMusicVolume / its watchdog) lived here. DELETED under
+    // Nick's standing rule (2026-10-29 14:32 EDT): this app never
+    // writes the system media volume — no ramp down, no restore, no
+    // compensation. The field symptom it caused: with NO music
+    // playing, the ramp + capped LoudnessEnhancer offset netted out
+    // negative on Selena's own MP3 voice. Ducking is now exactly the
+    // v1.59 layer: MAY_DUCK audio-focus requests (playback +
+    // dictation), under which the music app lowers its own playback
+    // and the system knob never moves.
 
     // ------------------------------------------------------------ v1.60 wake word (sherpa-onnx KWS)
 
