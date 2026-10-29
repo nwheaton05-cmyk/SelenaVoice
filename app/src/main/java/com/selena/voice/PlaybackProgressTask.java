@@ -31,6 +31,13 @@ import java.nio.charset.StandardCharsets;
  *
  * Top-level class per the standing d8 rule. Blocks on network IO —
  * run on a worker thread only.
+ *
+ * v1.56 (2026-10-29): generalized with an action parameter so the
+ * same wire also reports a user STOP (action 'playback_stopped').
+ * Delete-once-heard (Nick, 2026-10-29): a stopped message never
+ * resumes, so the brain deletes the owning item's queue rows +
+ * stored audio at stop. A PAUSE is never reported on this wire —
+ * paused messages keep everything.
  */
 public class PlaybackProgressTask implements Runnable {
     private static final String TAG = "SelenaVoice";
@@ -38,9 +45,15 @@ public class PlaybackProgressTask implements Runnable {
             "https://ar.siteviewoperations.com/api/selena-voice/brain";
 
     private final String queueRowId;
+    private final String action;
 
     public PlaybackProgressTask(String queueRowId) {
+        this(queueRowId, "playback_row_played");
+    }
+
+    public PlaybackProgressTask(String queueRowId, String action) {
         this.queueRowId = queueRowId;
+        this.action = action;
     }
 
     @Override
@@ -48,7 +61,7 @@ public class PlaybackProgressTask implements Runnable {
         HttpURLConnection conn = null;
         try {
             JSONObject body = new JSONObject();
-            body.put("action", "playback_row_played");
+            body.put("action", action);
             body.put("queueRowId", queueRowId);
             URL url = new URL(ENDPOINT);
             conn = (HttpURLConnection) url.openConnection();
@@ -61,9 +74,9 @@ public class PlaybackProgressTask implements Runnable {
             os.write(body.toString().getBytes(StandardCharsets.UTF_8));
             os.close();
             int code = conn.getResponseCode();
-            Log.i(TAG, "playback progress: row " + queueRowId + " -> HTTP " + code);
+            Log.i(TAG, "playback report (" + action + "): row " + queueRowId + " -> HTTP " + code);
         } catch (Exception e) {
-            Log.w(TAG, "playback progress report failed (row " + queueRowId + ")", e);
+            Log.w(TAG, "playback report failed (" + action + ", row " + queueRowId + ")", e);
         } finally {
             if (conn != null) conn.disconnect();
         }

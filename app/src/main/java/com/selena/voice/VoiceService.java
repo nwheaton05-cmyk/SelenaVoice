@@ -1531,6 +1531,36 @@ public class VoiceService extends Service
         new Thread(new PlaybackProgressTask(rowId)).start();
     }
 
+    /**
+     * v1.56 (2026-10-29): report a user STOP to the brain
+     * (delete-once-heard, Nick 2026-10-29). A stop is terminal — the
+     * stopped message never resumes — so the brain deletes the owning
+     * item's queue rows + stored audio. Captures the playing/paused
+     * row AND any stacked interrupted rows (a stop discards the stack
+     * too) BEFORE stopCurrentPlayback() clears them. A PAUSE never
+     * calls this: a paused message keeps its rows — it either resumes
+     * (and deletes when it plays out) or its remainder rolls into the
+     * next dictation's rework (and deletes when that merge lands).
+     * Priority interjections are not server rows — never reported.
+     */
+    private void reportPlaybackStopped() {
+        java.util.LinkedHashSet<String> ids = new java.util.LinkedHashSet<>();
+        if (currentPlayServerId != null && !currentPlayServerId.isEmpty()
+                && !"priority".equals(currentPlayServerId)) {
+            ids.add(currentPlayServerId);
+        }
+        for (InterruptedState st : interruptStack) {
+            if (st.serverId != null && !st.serverId.isEmpty()
+                    && !"priority".equals(st.serverId)) {
+                ids.add(st.serverId);
+            }
+        }
+        for (String rowId : ids) {
+            log("stop: reporting row stopped: " + rowId);
+            new Thread(new PlaybackProgressTask(rowId, "playback_stopped")).start();
+        }
+    }
+
     /** Called by PlayerCompletionListener / PlayerErrorListener. */
     public void onPlaybackDone() {
         handler.post(new PlaybackDoneTask(this));
@@ -2437,6 +2467,9 @@ public class VoiceService extends Service
      * place, per the v1.34 rule). Runs on the main thread.
      */
     private void stopAllPlayback() {
+        // v1.56: report the stop to the brain FIRST — stopCurrentPlayback
+        // clears the interrupt stack the report reads (delete-once-heard).
+        reportPlaybackStopped();
         stopCurrentPlayback();
         synchronized (audioQueue) {
             File f;
