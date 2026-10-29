@@ -377,16 +377,39 @@ public class VoiceService extends Service
     // of whatever is playing right now (either path) and the completion
     // handlers report it (playback_row_played) before unwinding.
     private String currentPlayServerId = null;
+    // Nick 2026-10-29 v1.58: segment spacing. Rows that are segments of
+    // ONE message share segment_group (null = standalone message).
+    // currentPlaySegmentGroup rides alongside currentPlayServerId
+    // through every tracking path below, so the completion handlers
+    // can hold the ruled 3s gap before a same-group successor starts
+    // (see advanceAfterSegmentGap).
+    private String currentPlaySegmentGroup = null;
+    // Nick 2026-10-29: 3-second spacing between segments of one
+    // message — long enough to hear the seam, short enough to keep
+    // the thought. NOT the dictation SENTENCE_GAP_MS further down.
+    private static final long SEGMENT_GAP_MS = 3000;
+    // A same-group advance waiting out its gap. Preemptible: pause /
+    // stop / skip / priority cancel it (cancelPendingSegmentAdvance),
+    // and a stale generation or already-started playback drops it.
+    private Runnable pendingSegmentAdvance = null;
+    private int segmentAdvanceGen = 0;
     // MP3 path: the row id rides with the queued File (path -> row id),
     // consumed when playFileNow starts the file.
     private final java.util.Map<String, String> audioFileServerIds =
             new java.util.HashMap<>();
+    // MP3 path segment groups, same map discipline as the row ids.
+    private final java.util.Map<String, String> audioFileSegmentGroups =
+            new java.util.HashMap<>();
     // TTS path: row ids ride a parallel queue alongside ttsQueue (same
     // lock); pumpTtsQueue polls both together.
     private final Queue<String> ttsServerIdQueue = new LinkedList<>();
+    // TTS path segment groups, same parallel-queue discipline.
+    private final Queue<String> ttsSegmentGroupQueue = new LinkedList<>();
     // Row id of the TTS utterance pumpTtsQueue is about to speak;
     // speakOnDevice adopts it for fresh utterances.
     private String pendingTtsServerId = null;
+    // Segment group of that same utterance; adopted the same way.
+    private String pendingTtsSegmentGroup = null;
     // Nick 2026-10-22 v1.27: pause/resume for phone (on-device TTS) mode.
     // Android TTS has no pause API — pause = tts.stop(), resume = re-speak
     // from the last word boundary reported by onRangeStart.
@@ -430,6 +453,9 @@ public class VoiceService extends Service
         // priority, restore the paused state instead of autoplaying.
         boolean wasPaused;
         String serverId;
+        // v1.58: the interrupted item's segment group, restored with
+        // its row id so a later completion gaps correctly.
+        String segmentGroup;
     }
     // LIFO stack of interrupted playbacks. Non-empty only during an
     // interrupt/resume flow; the completion handlers check it.
@@ -451,10 +477,18 @@ public class VoiceService extends Service
         final File audioFile;
         final String text;
         final String serverId;
+        // v1.58: segment group (null = standalone), for the 3s gap
+        // when this item succeeds a same-group segment.
+        final String segmentGroup;
         WaitingPriority(File audioFile, String text, String serverId) {
+            this(audioFile, text, serverId, null);
+        }
+        WaitingPriority(File audioFile, String text, String serverId,
+                String segmentGroup) {
             this.audioFile = audioFile;
             this.text = text;
             this.serverId = serverId;
+            this.segmentGroup = segmentGroup;
         }
     }
     private final java.util.ArrayDeque<WaitingPriority> waitingPriority =
@@ -941,6 +975,16 @@ public class VoiceService extends Service
             // Nick 2026-10-23 v1.40: carry the priority for interrupt
             // handling (defaults to 'high' like the server).
             m.put("priority", record.optString("priority", "high"));
+            // Nick 2026-10-29 v1.58: carry the segment grouping for
+            // the 3s between-segment gap (snake_case in the record;
+            // camelCase from here on, matching the poll API shape).
+            if (!record.isNull("segment_group")) {
+                m.put("segmentGroup",
+                        record.optString("segment_group", ""));
+            }
+            if (!record.isNull("segment_index")) {
+                m.put("segmentIndex", record.optInt("segment_index", -1));
+            }
             long beforeTs = getLastTs();
             // v1.30: advance the cursor only past CONSUMED messages.
             // handleQueueMessage returns beforeTs unchanged when it skips
@@ -1009,6 +1053,7 @@ public class VoiceService extends Service
         synchronized (ttsQueue) {
             ttsQueue.clear();
             ttsServerIdQueue.clear(); // v1.55: parallel queue stays in sync
+            ttsSegmentGroupQueue.clear(); // v1.58: group queue likewise
         }
         ttsSpeaking = false;
         log("service polling stopped");
@@ -1120,6 +1165,12 @@ public class VoiceService extends Service
         if (serverId.isEmpty()) serverId = m.optString("id", "");
         if (serverId.isEmpty()) serverId = null;
         final String sid = serverId;
+        // Nick 2026-10-29 v1.58: this row's segment group when it is
+        // one segment of a multi-row message (null = standalone). It
+        // rides every enqueue/play call below alongside the row id.
+        String segmentGroup = m.optString("segmentGroup", "");
+        if (segmentGroup.isEmpty()) segmentGroup = null;
+        final String sgroup = segmentGroup;
         // Nick 2026-10-18 v1.12: explicit JSON-null check. The server
         // sends "audioUrl": null for text-only speed-mode replies;
         // optString on a JSON null returns the literal string "null"
@@ -1166,7 +1217,7 @@ public class VoiceService extends Service
                 markSpokenLocked(text);
                 if (isPhoneVoiceMode()) {
                     final String speakText = text;
-                    handler.post(() -> onPriorityArrivalTts(speakText, sid));
+                    handler.post(() -> onPriorityArrivalTts(speakText, sid, sgroup));
                 } else if (!audioUrl.isEmpty() && audioUrl.startsWith("http")) {
                     // Nick 2026-10-23 v1.43: backward-compat MP3 path. The
                     // server still renders MP3s during transition; a row
@@ -1178,12 +1229,12 @@ public class VoiceService extends Service
                         final File pf = downloadToCache(audioUrl);
                         final String ptext = text;
                         final String psid = sid;
-                        handler.post(() -> onPriorityArrivalMp3(pf, ptext, psid));
+                        handler.post(() -> onPriorityArrivalMp3(pf, ptext, psid, sgroup));
                     } catch (Exception e) {
                         log("priority: MP3 download failed: "
                                 + e.getMessage() + " — TTS fallback");
                         final String speakText = text;
-                        handler.post(() -> onPriorityArrivalTts(speakText, sid));
+                        handler.post(() -> onPriorityArrivalTts(speakText, sid, sgroup));
                     }
                 } else {
                     // Nick 2026-10-23 v1.43: in-app synthesis (Achernar since v1.45; Callirrhoe v1.44).
@@ -1196,11 +1247,11 @@ public class VoiceService extends Service
                     new Thread(() -> {
                         try {
                             final File sf = synthesizeToCache(stext);
-                            handler.post(() -> onPriorityArrivalMp3(sf, stext, ssid));
+                            handler.post(() -> onPriorityArrivalMp3(sf, stext, ssid, sgroup));
                         } catch (Exception e) {
                             log("priority: synthesis failed, on-device TTS "
                                     + "fallback: " + e.getMessage());
-                            handler.post(() -> onPriorityArrivalTts(stext, ssid));
+                            handler.post(() -> onPriorityArrivalTts(stext, ssid, sgroup));
                         }
                     }).start();
                 }
@@ -1229,7 +1280,7 @@ public class VoiceService extends Service
                 broadcastMessage(text);
                 final MessageHistory.Entry histEntry = MessageHistory.add(text, null, sid);
                 final String speakText = text;
-                handler.post(() -> enqueueTts(speakText, sid));
+                handler.post(() -> enqueueTts(speakText, sid, sgroup));
                 // Nick 2026-10-22 v1.25: still fetch the server MP3 in the
                 // background so the message card grows a replay button.
                 if (!audioUrl.isEmpty() && audioUrl.startsWith("http")) {
@@ -1265,7 +1316,7 @@ public class VoiceService extends Service
                         final File df = f;
                         // Nick 2026-10-21 v1.24: cache for replay.
                         MessageHistory.add(text, f, sid);
-                        handler.post(() -> enqueueAudio(df, sid));
+                        handler.post(() -> enqueueAudio(df, sid, sgroup));
                     } catch (Exception e) {
                         log("audio download failed: " + audioUrl + ": " + e);
                     }
@@ -1286,11 +1337,11 @@ public class VoiceService extends Service
                     try {
                         final File sf = synthesizeToCache(stext);
                         MessageHistory.setAudioPath(histEntry.id, sf);
-                        handler.post(() -> enqueueAudio(sf, sid));
+                        handler.post(() -> enqueueAudio(sf, sid, sgroup));
                     } catch (Exception e) {
                         log("synth: low-priority synthesis failed, "
                                 + "on-device fallback: " + e.getMessage());
-                        handler.post(() -> enqueueTts(stext, sid));
+                        handler.post(() -> enqueueTts(stext, sid, sgroup));
                     }
                 }).start();
                 consumed = true;
@@ -1316,8 +1367,19 @@ public class VoiceService extends Service
     /** v1.55: queue a file WITH its queue row id, so the completion
      *  report can name the row that finished (see playFileNow). */
     private void enqueueAudio(File f, String serverId) {
+        enqueueAudio(f, serverId, null);
+    }
+
+    /** v1.58: queue a file WITH its row id AND segment group, so the
+     *  completion handlers can hold the 3s gap before a same-group
+     *  successor (see playFileNow / advanceAfterSegmentGap). */
+    private void enqueueAudio(File f, String serverId,
+            String segmentGroup) {
         if (serverId != null) {
             audioFileServerIds.put(f.getAbsolutePath(), serverId);
+        }
+        if (segmentGroup != null) {
+            audioFileSegmentGroups.put(f.getAbsolutePath(), segmentGroup);
         }
         synchronized (audioQueue) {
             audioQueue.add(f);
@@ -1508,6 +1570,12 @@ public class VoiceService extends Service
             // and its files never enter the map).
             String mappedSid = audioFileServerIds.remove(f.getAbsolutePath());
             if (mappedSid != null) currentPlayServerId = mappedSid;
+            // v1.58: adopt the segment group the same way (the
+            // priority path sets it explicitly beforehand, mirroring
+            // the row id).
+            String mappedGroup = audioFileSegmentGroups.remove(
+                    f.getAbsolutePath());
+            if (mappedGroup != null) currentPlaySegmentGroup = mappedGroup;
             broadcastPlaybackState();
         } catch (Exception e) {
             log("play failed: " + e);
@@ -1526,6 +1594,10 @@ public class VoiceService extends Service
     private void reportPlaybackProgress() {
         String rowId = currentPlayServerId;
         currentPlayServerId = null;
+        // v1.58: the finished item's group is captured by the caller
+        // BEFORE this runs; clear it here so a stale group can never
+        // leak into an unrelated item that sets no group of its own.
+        currentPlaySegmentGroup = null;
         if (rowId == null || rowId.isEmpty()) return;
         log("progress: reporting row played: " + rowId);
         new Thread(new PlaybackProgressTask(rowId)).start();
@@ -1561,27 +1633,16 @@ public class VoiceService extends Service
         }
     }
 
-    /**
-     * v1.57 (2026-10-29): pause-then-dictate counts as heard (Nick,
-     * 2026-10-29 08:40). Called at the top of doPostInput — the one
-     * choke point every sent dictation passes through. If a message
-     * sits PAUSED at that moment, the user has moved on: report it
-     * (playback_pause_dictate) and the brain deletes ALL of the item's
-     * queue rows + stored audio right then, unplayed remainder
-     * included — the message is NOT held for resume and does NOT wait
-     * for the rework merge. A plain pause with no dictation sent never
-     * reaches this code and keeps the message for resume. Deletion
-     * ledger only: the brain leaves the played fraction literal, and
-     * the item's pending text still rolls into the rework as before.
-     * Priority interjections are not server rows — never reported.
-     */
-    private void reportPauseDictateIfPaused() {
-        if (!playbackPaused && !ttsPaused) return;
-        String rowId = currentPlayServerId;
-        if (rowId == null || rowId.isEmpty() || "priority".equals(rowId)) return;
-        log("pause-dictate: reporting paused row as heard: " + rowId);
-        new Thread(new PlaybackProgressTask(rowId, "playback_pause_dictate")).start();
-    }
+    // NOTE (v1.58, 2026-10-29): there is deliberately NO pause wire.
+    // Nick's revised rule (08:41 EDT, superseding the 08:40 draft that
+    // briefly shipped in v1.57): a paused message is HELD — no report,
+    // no deletion at pause or at dictation. When the next dictation
+    // arrives, the brain's rework rolls the paused item's unplayed
+    // remainder into the successor message, and the QUEUING of that
+    // successor is what deletes the paused original's rows + audio
+    // (server-side, in the merge path). Resume before any dictation =
+    // normal path (plays out, deletes on heard). Nothing for the app
+    // to report in either case.
 
     /** Called by PlayerCompletionListener / PlayerErrorListener. */
     public void onPlaybackDone() {
@@ -1591,6 +1652,9 @@ public class VoiceService extends Service
     /** Called by PlaybackDoneTask on main thread after playback finishes or fails. */
     @SuppressWarnings("deprecation") // setSpeakerphoneOn, see playFileNow
     public void onPlaybackDoneNow() {
+        // v1.58: capture the finished item's segment group BEFORE the
+        // progress report clears the tracker.
+        final String finishedGroup = currentPlaySegmentGroup;
         reportPlaybackProgress(); // v1.55: before any unwinding below
         abandonAudioFocus();
         restoreMusicVolume(); // Nick 2026-10-19 v1.17: undo the playback boost
@@ -1617,34 +1681,140 @@ public class VoiceService extends Service
             }
             currentAudioFile = null;
         }
-        // Nick 2026-10-23 v1.42: priority FIFO — a priority item that just
-        // finished yields to waiting priority items first. Priority items
-        // queue behind each other and never interrupt each other;
-        // interrupted output only resumes once no priority items remain.
+        // Nick 2026-10-29 v1.58: the advance below is the pre-v1.58
+        // advance verbatim, routed through the segment-gap gate — a
+        // same-group successor starts after SEGMENT_GAP_MS, anything
+        // else starts immediately. The report above already fired, so
+        // delete-on-heard never waits on the gap.
+        advanceAfterSegmentGap(finishedGroup, nextGroupAudioFirst(), () -> {
+            if (!playing && !ttsSpeaking) {
+                // Nick 2026-10-23 v1.42: priority FIFO — a priority item that just
+                // finished yields to waiting priority items first. Priority items
+                // queue behind each other and never interrupt each other;
+                // interrupted output only resumes once no priority items remain.
+                if (priorityMode && !waitingPriority.isEmpty()) {
+                    playNextWaitingPriority();
+                    return;
+                }
+                // Nick 2026-10-23 v1.40: priority interrupt unwinding. A non-empty
+                // stack means we're mid-flow — pop and resume the next interrupted
+                // item instead of pumping normal queues. A priority that finished
+                // with an empty stack falls through to the normal pumps.
+                if (!interruptStack.isEmpty()) {
+                    log("priority: MP3 completion, unwinding interrupt stack ("
+                            + interruptStack.size() + " left)");
+                    priorityMode = false;
+                    resumeNextInterrupted();
+                    return;
+                }
+                if (priorityMode) {
+                    priorityMode = false;
+                    log("priority: flow done, resuming normal queues");
+                }
+                pumpAudioQueue();
+                pumpTtsQueue();
+            }
+            // Nick 2026-10-23 v1.47: if the pumps didn't start new
+            // playback, she's fully done — restart the mic if we muted it.
+            if (!isPlayingAudio) unmuteMicAfterPlayback();
+        });
+    }
+
+    /**
+     * Nick 2026-10-29 v1.58: the ruled 3-second gap between segments
+     * of ONE message. When the item that just finished and the next
+     * item up share a non-null segment_group, the advance runs after
+     * SEGMENT_GAP_MS; standalone or different-group successors advance
+     * immediately, exactly as before. The gap never delays a chain
+     * start — it only ever sits BETWEEN two segments.
+     *
+     * Preemption: the delayed advance is a handler runnable guarded by
+     * a generation counter. Pause / stop / skip-to-newest / a priority
+     * arrival cancel it outright (cancelPendingSegmentAdvance), the
+     * polite gate parks it like any other start, and if anything has
+     * already started playing by the time it fires the advance drops
+     * itself — the pumps re-check playing/ttsSpeaking, so a late fire
+     * can never double-start. While the gap runs, playback state reads
+     * idle (nothing is playing), so the existing interrupt / pause /
+     * stop semantics all win over the pending start.
+     */
+    private void advanceAfterSegmentGap(String finishedGroup,
+            String nextGroup, Runnable advance) {
+        if (finishedGroup == null || nextGroup == null
+                || !finishedGroup.equals(nextGroup)) {
+            advance.run();
+            return;
+        }
+        final int gen = ++segmentAdvanceGen;
+        log("segments: holding " + SEGMENT_GAP_MS
+                + "ms gap before next segment of " + finishedGroup);
+        Runnable delayed = () -> {
+            if (segmentAdvanceGen != gen) return; // cancelled/superseded
+            pendingSegmentAdvance = null;
+            if (politeHoldActive()) {
+                // Nick is talking — park exactly like an arrival
+                // during speech; the polite-hold release pumps the
+                // queues, so nothing is lost by not advancing here.
+                log("segments: gap elapsed under polite hold — parked");
+                return;
+            }
+            advance.run();
+        };
+        pendingSegmentAdvance = delayed;
+        handler.postDelayed(delayed, SEGMENT_GAP_MS);
+    }
+
+    /** Drop a pending post-gap advance (pause/stop/skip/priority win). */
+    private void cancelPendingSegmentAdvance() {
+        if (pendingSegmentAdvance != null) {
+            handler.removeCallbacks(pendingSegmentAdvance);
+            pendingSegmentAdvance = null;
+        }
+        segmentAdvanceGen++;
+    }
+
+    /** Group of the next item up, in onPlaybackDoneNow's branch order:
+     *  priority FIFO (when the priority branch would run) -> interrupt
+     *  stack -> audio queue -> TTS queue. Null covers both "nothing
+     *  queued" and "next item is a standalone message" — either way no
+     *  gap applies, which is all the caller needs. */
+    private String nextGroupAudioFirst() {
         if (priorityMode && !waitingPriority.isEmpty()) {
-            playNextWaitingPriority();
-            return;
+            return waitingPriority.peek().segmentGroup;
         }
-        // Nick 2026-10-23 v1.40: priority interrupt unwinding. A non-empty
-        // stack means we're mid-flow — pop and resume the next interrupted
-        // item instead of pumping normal queues. A priority that finished
-        // with an empty stack falls through to the normal pumps.
         if (!interruptStack.isEmpty()) {
-            log("priority: MP3 completion, unwinding interrupt stack ("
-                    + interruptStack.size() + " left)");
-            priorityMode = false;
-            resumeNextInterrupted();
-            return;
+            return interruptStack.peek().segmentGroup;
         }
-        if (priorityMode) {
-            priorityMode = false;
-            log("priority: flow done, resuming normal queues");
+        synchronized (audioQueue) {
+            File head = audioQueue.peek();
+            if (head != null) {
+                return audioFileSegmentGroups.get(head.getAbsolutePath());
+            }
         }
-        pumpAudioQueue();
-        pumpTtsQueue();
-        // Nick 2026-10-23 v1.47: if the pumps didn't start new
-        // playback, she's fully done — restart the mic if we muted it.
-        if (!isPlayingAudio) unmuteMicAfterPlayback();
+        synchronized (ttsQueue) {
+            if (!ttsQueue.isEmpty()) return ttsSegmentGroupQueue.peek();
+        }
+        return null;
+    }
+
+    /** Same peek in onTtsDone's branch order (TTS before audio). */
+    private String nextGroupTtsFirst() {
+        if (priorityMode && !waitingPriority.isEmpty()) {
+            return waitingPriority.peek().segmentGroup;
+        }
+        if (!interruptStack.isEmpty()) {
+            return interruptStack.peek().segmentGroup;
+        }
+        synchronized (ttsQueue) {
+            if (!ttsQueue.isEmpty()) return ttsSegmentGroupQueue.peek();
+        }
+        synchronized (audioQueue) {
+            File head = audioQueue.peek();
+            if (head != null) {
+                return audioFileSegmentGroups.get(head.getAbsolutePath());
+            }
+        }
+        return null;
     }
 
     /** Runs on a worker thread: download one audio file to the cache dir. */
@@ -1859,9 +2029,17 @@ public class VoiceService extends Service
     /** v1.55: queue a text WITH its queue row id on the parallel queue
      *  (same lock as ttsQueue; pumpTtsQueue polls both together). */
     private void enqueueTts(String text, String serverId) {
+        enqueueTts(text, serverId, null);
+    }
+
+    /** v1.58: queue a text WITH its row id AND segment group on the
+     *  parallel queues (same lock; pumpTtsQueue polls all together). */
+    private void enqueueTts(String text, String serverId,
+            String segmentGroup) {
         synchronized (ttsQueue) {
             ttsQueue.add(text);
             ttsServerIdQueue.add(serverId);
+            ttsSegmentGroupQueue.add(segmentGroup);
         }
         pumpTtsQueue();
     }
@@ -1880,13 +2058,16 @@ public class VoiceService extends Service
         }
         String text;
         String rowId;
+        String segGroup;
         synchronized (ttsQueue) {
             text = ttsQueue.poll();
             rowId = ttsServerIdQueue.poll();
+            segGroup = ttsSegmentGroupQueue.poll();
         }
         if (text == null) return;
         ttsSpeaking = true;
         pendingTtsServerId = rowId;
+        pendingTtsSegmentGroup = segGroup;
         speakOnDevice(text, false);
     }
 
@@ -1909,6 +2090,11 @@ public class VoiceService extends Service
             if (pendingTtsServerId != null) {
                 currentPlayServerId = pendingTtsServerId;
                 pendingTtsServerId = null;
+            }
+            // v1.58: adopt the queued segment group the same way.
+            if (pendingTtsSegmentGroup != null) {
+                currentPlaySegmentGroup = pendingTtsSegmentGroup;
+                pendingTtsSegmentGroup = null;
             }
         }
         String preview = text.length() > 30 ? text.substring(0, 30) + "…" : text;
@@ -1954,6 +2140,9 @@ public class VoiceService extends Service
     /** Runs on main thread after on-device TTS finishes or fails. */
     @SuppressWarnings("deprecation") // setSpeakerphoneOn, see playFileNow
     private void onTtsDone() {
+        // v1.58: capture the finished item's segment group BEFORE the
+        // progress report clears the tracker.
+        final String finishedGroup = currentPlaySegmentGroup;
         reportPlaybackProgress(); // v1.55: before any unwinding below
         abandonAudioFocus();
         restoreMusicVolume(); // Nick 2026-10-19 v1.17: undo the speech boost
@@ -1967,31 +2156,38 @@ public class VoiceService extends Service
         restoreAudioRouting();
         log("tts: echo guard off");
         broadcastPlaybackState();
-        // Nick 2026-10-23 v1.42: priority FIFO — a priority item that just
-        // finished yields to waiting priority items first (same rule as
-        // onPlaybackDoneNow).
-        if (priorityMode && !waitingPriority.isEmpty()) {
-            playNextWaitingPriority();
-            return;
-        }
-        // Nick 2026-10-23 v1.40: priority interrupt unwinding (same as
-        // onPlaybackDoneNow).
-        if (!interruptStack.isEmpty()) {
-            log("priority: TTS completion, unwinding interrupt stack ("
-                    + interruptStack.size() + " left)");
-            priorityMode = false;
-            resumeNextInterrupted();
-            return;
-        }
-        if (priorityMode) {
-            priorityMode = false;
-            log("priority: flow done, resuming normal queues");
-        }
-        pumpTtsQueue();
-        pumpAudioQueue();
-        // Nick 2026-10-23 v1.47: if the pumps didn't start new
-        // playback, she's fully done — restart the mic if we muted it.
-        if (!isPlayingAudio) unmuteMicAfterPlayback();
+        // Nick 2026-10-29 v1.58: same segment-gap gate as
+        // onPlaybackDoneNow; the advance below is the pre-v1.58
+        // advance verbatim (TTS pump first on this path).
+        advanceAfterSegmentGap(finishedGroup, nextGroupTtsFirst(), () -> {
+            if (!playing && !ttsSpeaking) {
+                // Nick 2026-10-23 v1.42: priority FIFO — a priority item that just
+                // finished yields to waiting priority items first (same rule as
+                // onPlaybackDoneNow).
+                if (priorityMode && !waitingPriority.isEmpty()) {
+                    playNextWaitingPriority();
+                    return;
+                }
+                // Nick 2026-10-23 v1.40: priority interrupt unwinding (same as
+                // onPlaybackDoneNow).
+                if (!interruptStack.isEmpty()) {
+                    log("priority: TTS completion, unwinding interrupt stack ("
+                            + interruptStack.size() + " left)");
+                    priorityMode = false;
+                    resumeNextInterrupted();
+                    return;
+                }
+                if (priorityMode) {
+                    priorityMode = false;
+                    log("priority: flow done, resuming normal queues");
+                }
+                pumpTtsQueue();
+                pumpAudioQueue();
+            }
+            // Nick 2026-10-23 v1.47: if the pumps didn't start new
+            // playback, she's fully done — restart the mic if we muted it.
+            if (!isPlayingAudio) unmuteMicAfterPlayback();
+        });
     }
 
     private void releasePlayer() {
@@ -2017,6 +2213,10 @@ public class VoiceService extends Service
     private boolean playbackPaused = false;
 
     private void pausePlayback() {
+        // v1.58: pausing during a segment gap cancels the pending
+        // start — the successor stays queued and the pumps (or the
+        // polite-hold release) start it later with no gap owed.
+        cancelPendingSegmentAdvance();
         // Nick 2026-10-22 v1.28: UNCONDITIONAL pause — works in phone
         // (on-device TTS) mode, Aria (MP3) mode, whatever is playing.
         // Every tap logs what it found and toasts the outcome, so a tap
@@ -2132,6 +2332,10 @@ public class VoiceService extends Service
      */
     private void stopCurrentPlayback() {
         log("stop: halting current playback");
+        // Nick 2026-10-29 v1.58: a stop also cancels a pending
+        // post-gap segment start and drops the group tracker.
+        cancelPendingSegmentAdvance();
+        currentPlaySegmentGroup = null;
         // Nick 2026-10-28 v1.52: a stop from anywhere (screen button,
         // STOP_ALL intent) also cancels an earbud press's pending
         // double-tap-window resume.
@@ -2177,10 +2381,14 @@ public class VoiceService extends Service
      * priority item immediately.
      */
     private void interruptCurrentPlayback() {
+        // v1.58: an interruption preempts any pending post-gap start.
+        cancelPendingSegmentAdvance();
         InterruptedState st = new InterruptedState();
         // v1.55: the interrupted item keeps its row id so its resume
         // restores it (its completion report belongs to this row).
         st.serverId = currentPlayServerId;
+        // v1.58: same for its segment group.
+        st.segmentGroup = currentPlaySegmentGroup;
         st.wasPaused = playbackPaused || ttsPaused;
         boolean something = false;
         // MP3/Aria path: save file + position.
@@ -2238,7 +2446,7 @@ public class VoiceService extends Service
      * must already be downloaded.
      */
     private void playPriorityMp3(final File f, final String text,
-            final String serverId) {
+            final String serverId, final String segmentGroup) {
         log("priority: playing high-priority MP3"
                 + (serverId != null ? " id=" + serverId : ""));
         priorityMode = true;
@@ -2251,6 +2459,8 @@ public class VoiceService extends Service
         // v1.55: set AFTER the interrupt snapshot so the interrupted
         // item's saved state keeps ITS row id, not this one's.
         currentPlayServerId = serverId;
+        // v1.58: same for the segment group.
+        currentPlaySegmentGroup = segmentGroup;
         playFileNow(f);
     }
 
@@ -2258,7 +2468,8 @@ public class VoiceService extends Service
      * Nick 2026-10-23 v1.40: speak a high-priority text immediately via
      * on-device TTS, interrupting whatever is playing. Runs on main thread.
      */
-    private void playPriorityTts(final String text, final String serverId) {
+    private void playPriorityTts(final String text, final String serverId,
+            final String segmentGroup) {
         log("priority: speaking high-priority text via on-device TTS");
         priorityMode = true;
         interruptCurrentPlayback();
@@ -2269,6 +2480,8 @@ public class VoiceService extends Service
         ttsSpeaking = true;
         // v1.55: after the interrupt snapshot (see playPriorityMp3).
         currentPlayServerId = serverId;
+        // v1.58: same for the segment group.
+        currentPlaySegmentGroup = segmentGroup;
         speakOnDevice(text, false);
     }
 
@@ -2279,9 +2492,13 @@ public class VoiceService extends Service
      * right after it finishes.
      */
     private void onPriorityArrivalMp3(final File f, final String text,
-            final String serverId) {
+            final String serverId, final String segmentGroup) {
+        // v1.58: a priority arrival preempts any pending post-gap
+        // start — whether it plays now or parks, it outranks the gap.
+        cancelPendingSegmentAdvance();
         if (priorityMode) {
-            waitingPriority.offer(new WaitingPriority(f, text, serverId));
+            waitingPriority.offer(new WaitingPriority(f, text, serverId,
+                    segmentGroup));
             log("priority: queued behind playing priority ("
                     + waitingPriority.size() + " waiting)"
                     + (serverId != null ? " id=" + serverId : ""));
@@ -2292,13 +2509,14 @@ public class VoiceService extends Service
         // gate instead of breaking in over Nick's voice. Released on his
         // pause via releasePoliteHold().
         if (politeHoldActive()) {
-            waitingPriority.offer(new WaitingPriority(f, text, serverId));
+            waitingPriority.offer(new WaitingPriority(f, text, serverId,
+                    segmentGroup));
             log("priority: held for Nick's pause ("
                     + waitingPriority.size() + " waiting)");
             toast("Priority message queued");
             return;
         }
-        playPriorityMp3(f, text, serverId);
+        playPriorityMp3(f, text, serverId, segmentGroup);
     }
 
     /**
@@ -2307,9 +2525,14 @@ public class VoiceService extends Service
      * {@link #onPriorityArrivalMp3} — queue behind a playing priority
      * item, never interrupt it.
      */
-    private void onPriorityArrivalTts(final String text, final String serverId) {
+    private void onPriorityArrivalTts(final String text, final String serverId,
+            final String segmentGroup) {
+        // v1.58: priority preempts a pending post-gap start (see
+        // onPriorityArrivalMp3).
+        cancelPendingSegmentAdvance();
         if (priorityMode) {
-            waitingPriority.offer(new WaitingPriority(null, text, serverId));
+            waitingPriority.offer(new WaitingPriority(null, text, serverId,
+                    segmentGroup));
             log("priority: queued behind playing priority ("
                     + waitingPriority.size() + " waiting)");
             toast("Priority message queued");
@@ -2319,13 +2542,14 @@ public class VoiceService extends Service
         // gate instead of breaking in over Nick's voice. Released on his
         // pause via releasePoliteHold().
         if (politeHoldActive()) {
-            waitingPriority.offer(new WaitingPriority(null, text, serverId));
+            waitingPriority.offer(new WaitingPriority(null, text, serverId,
+                    segmentGroup));
             log("priority: held for Nick's pause ("
                     + waitingPriority.size() + " waiting)");
             toast("Priority message queued");
             return;
         }
-        playPriorityTts(text, serverId);
+        playPriorityTts(text, serverId, segmentGroup);
     }
 
     /**
@@ -2349,9 +2573,10 @@ public class VoiceService extends Service
                 + waitingPriority.size() + " still waiting)"
                 + (wp.serverId != null ? " id=" + wp.serverId : ""));
         if (wp.audioFile != null) {
-            playPriorityMp3(wp.audioFile, wp.text, wp.serverId);
+            playPriorityMp3(wp.audioFile, wp.text, wp.serverId,
+                    wp.segmentGroup);
         } else {
-            playPriorityTts(wp.text, wp.serverId);
+            playPriorityTts(wp.text, wp.serverId, wp.segmentGroup);
         }
     }
 
@@ -2421,6 +2646,8 @@ public class VoiceService extends Service
         playFileNow(f);
         // v1.55: the resumed item's completion belongs to ITS row.
         currentPlayServerId = st.serverId;
+        // v1.58: same for its segment group.
+        currentPlaySegmentGroup = st.segmentGroup;
         if (player != null && st.audioPositionMs > 0) {
             try {
                 player.seekTo(st.audioPositionMs);
@@ -2450,6 +2677,8 @@ public class VoiceService extends Service
         ttsSpeaking = true;
         // v1.55: the resumed item's completion belongs to ITS row.
         currentPlayServerId = st.serverId;
+        // v1.58: same for its segment group.
+        currentPlaySegmentGroup = st.segmentGroup;
         speakOnDevice(rest, true);
     }
 
@@ -2462,6 +2691,8 @@ public class VoiceService extends Service
         // v1.55: whichever path restores, its eventual completion
         // reports this item's row.
         currentPlayServerId = st.serverId;
+        // v1.58: same for its segment group.
+        currentPlaySegmentGroup = st.segmentGroup;
         if (st.audioFile != null && st.audioFile.exists()) {
             // Rebuild the player paused at the saved position.
             playFileNow(st.audioFile);
@@ -2505,8 +2736,10 @@ public class VoiceService extends Service
         synchronized (ttsQueue) {
             ttsQueue.clear();
             ttsServerIdQueue.clear(); // v1.55: parallel queue stays in sync
+            ttsSegmentGroupQueue.clear(); // v1.58: group queue likewise
         }
         pendingTtsServerId = null;
+        pendingTtsSegmentGroup = null; // v1.58
         broadcastPlaybackState();
         toast("⏹ Stopped");
         log("stop: queues cleared (unlocked only)");
@@ -2519,6 +2752,11 @@ public class VoiceService extends Service
      */
     private void skipToNewest() {
         log("skip: abandoning current playback, clearing queues");
+        // Nick 2026-10-29 v1.58: skip takes manual control — a pending
+        // post-gap start dies here, and the group tracker resets: the
+        // newest message never waits on a gap owed to the abandoned one.
+        cancelPendingSegmentAdvance();
+        currentPlaySegmentGroup = null;
         // Nick 2026-10-23 v1.40: skip takes manual control — cancel any
         // priority interrupt flow and drop the saved resume stack.
         priorityMode = false;
@@ -2557,8 +2795,10 @@ public class VoiceService extends Service
         synchronized (ttsQueue) {
             ttsQueue.clear();
             ttsServerIdQueue.clear(); // v1.55: parallel queue stays in sync
+            ttsSegmentGroupQueue.clear(); // v1.58: group queue likewise
         }
         pendingTtsServerId = null;
+        pendingTtsSegmentGroup = null; // v1.58
         broadcastPlaybackState();
         toast("Skipping to newest…");
         // Network on a worker thread (Android forbids it on main).
@@ -2626,17 +2866,28 @@ public class VoiceService extends Service
             audioQueue.addAll(kept);
         }
         // Queued-but-unspoken TTS texts: keep locked, drop the rest.
+        // v1.58: the parallel row-id / segment-group queues are
+        // rebuilt lock-step with the texts — polling a text without
+        // its pair would misalign every following item's report.
         synchronized (ttsQueue) {
             java.util.Queue<String> kept = new java.util.LinkedList<>();
+            java.util.Queue<String> keptIds = new java.util.LinkedList<>();
+            java.util.Queue<String> keptGroups = new java.util.LinkedList<>();
             String t;
             while ((t = ttsQueue.poll()) != null) {
+                String pairId = ttsServerIdQueue.poll();
+                String pairGroup = ttsSegmentGroupQueue.poll();
                 if (MessageHistory.isTextLocked(t)) {
                     kept.add(t);
+                    keptIds.add(pairId);
+                    keptGroups.add(pairGroup);
                 } else {
                     droppedTts++;
                 }
             }
             ttsQueue.addAll(kept);
+            ttsServerIdQueue.addAll(keptIds);
+            ttsSegmentGroupQueue.addAll(keptGroups);
         }
 
         broadcastPlaybackState();
@@ -3779,11 +4030,6 @@ public class VoiceService extends Service
      * from it. Normal dictations post it as false.
      */
     public void doPostInput(String text, boolean possiblyCutOff) {
-        // v1.57: pause-then-dictate counts as heard — if a message is
-        // paused right now, this dictation retires it (see helper).
-        // Fired BEFORE the POST so the heard-deletion is on its way
-        // before the dictation itself lands.
-        reportPauseDictateIfPaused();
         HttpURLConnection conn = null;
         try {
             URL url = new URL(BASE_URL + "/api/selena-voice/input");
