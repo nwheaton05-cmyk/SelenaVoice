@@ -20,18 +20,29 @@ public class GuestDirectiveTask implements Runnable {
     private final String speakerName;
     private final String line;
     private final String text;
+    // v1.71 (rider G2): marks the enrollment sequence's first
+    // guest_speaking directive justEnrolled.
+    private final boolean justEnrolled;
 
     public GuestDirectiveTask(VoiceService service, String action,
                               String speakerName, String line, String text) {
+        this(service, action, speakerName, line, text, false);
+    }
+
+    public GuestDirectiveTask(VoiceService service, String action,
+                              String speakerName, String line, String text,
+                              boolean justEnrolled) {
         this.service = service;
         this.action = action;
         this.speakerName = speakerName;
         this.line = line;
         this.text = text;
+        this.justEnrolled = justEnrolled;
     }
 
     @Override
     public void run() {
-        service.doPostGuestDirective(action, speakerName, line, text);
+        service.doPostGuestDirective(action, speakerName, line, text,
+                justEnrolled);
     }
 }

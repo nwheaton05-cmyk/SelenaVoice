@@ -46,6 +46,15 @@ public class GuestProfiles {
     private static final String TAG = "SelenaVoice";
     private static final String FILE_NAME = "guests.json";
     private static final int MAX_GUESTS = 8;
+    /**
+     * Rider G1 (Nick, 2026-10-29 ~16:12): a guest unheard for this
+     * long drops off the ACTIVE roster. Dropping is NOT deletion —
+     * the stored print persists untouched (the 8-guest cap + LRU
+     * above is the only removal), and the guest reactivates
+     * instantly the next time their voice is recognized
+     * (matchRecog / learnRecog refresh lastHeardMs).
+     */
+    public static final long GUEST_ACTIVE_TIMEOUT_MS = 600_000L;
     /** Same scale as Voiceprint's MATCH_DIST (2.4). */
     public static final double GUEST_MATCH_DIST = 2.4;
     // The recognizer-domain variance floors, mirrored from
@@ -191,6 +200,30 @@ public class GuestProfiles {
     public List<Guest> list(Context ctx) {
         synchronized (LOCK) {
             return new ArrayList<>(load(ctx).guests);
+        }
+    }
+
+    /**
+     * The ACTIVE roster (rider G1): enrolled guests whose
+     * last-heard stamp is inside GUEST_ACTIVE_TIMEOUT_MS, most
+     * recently heard first. Purely a view over the store — nobody
+     * is removed, nothing is announced.
+     */
+    public List<String> activeGuestNames(Context ctx) {
+        synchronized (LOCK) {
+            Store s = load(ctx);
+            long now = System.currentTimeMillis();
+            List<Guest> active = new ArrayList<>();
+            for (Guest g : s.guests) {
+                if (g.lastHeardMs > 0
+                        && now - g.lastHeardMs <= GUEST_ACTIVE_TIMEOUT_MS) {
+                    active.add(g);
+                }
+            }
+            active.sort((a, b) -> Long.compare(b.lastHeardMs, a.lastHeardMs));
+            List<String> out = new ArrayList<>();
+            for (Guest g : active) out.add(g.name);
+            return out;
         }
     }
 

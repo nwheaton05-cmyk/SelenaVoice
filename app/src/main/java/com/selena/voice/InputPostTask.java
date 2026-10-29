@@ -25,6 +25,12 @@ public class InputPostTask implements Runnable {
     // held-sentence sends, and directive posts leave it false: those
     // flows have their own spoken continuations.
     private final boolean expectAnswer;
+    // Nick 2026-10-29 v1.71 (rider G2): true only on the FIRST
+    // dictation released by a just-completed guest enrollment — the
+    // NEW_GUEST_GREETING_RULE trigger (the responder greets the new
+    // guest by name, then answers their point). Set solely by
+    // VoiceService.releaseHeldGuestSentence on the enrollment path.
+    private final boolean justEnrolled;
 
     public InputPostTask(VoiceService service, String text) {
         this(service, text, false);
@@ -48,17 +54,26 @@ public class InputPostTask implements Runnable {
     public InputPostTask(VoiceService service, String text,
                          boolean possiblyCutOff, String speakerName,
                          String interruptJson, boolean expectAnswer) {
+        this(service, text, possiblyCutOff, speakerName, interruptJson,
+                expectAnswer, false);
+    }
+
+    public InputPostTask(VoiceService service, String text,
+                         boolean possiblyCutOff, String speakerName,
+                         String interruptJson, boolean expectAnswer,
+                         boolean justEnrolled) {
         this.service = service;
         this.text = text;
         this.possiblyCutOff = possiblyCutOff;
         this.speakerName = speakerName;
         this.interruptJson = interruptJson;
         this.expectAnswer = expectAnswer;
+        this.justEnrolled = justEnrolled;
     }
 
     @Override
     public void run() {
         service.doPostInput(text, possiblyCutOff, speakerName, interruptJson,
-                expectAnswer);
+                expectAnswer, justEnrolled);
     }
 }

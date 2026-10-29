@@ -539,6 +539,11 @@ public class VoiceService extends Service
     private boolean bufferNewVoiceCandidate = false;
     private float[] pendingGuestFeats = null;
     private String pendingGuestSentence = null;
+    // Rider G2 (v1.71): the name of a guest enrolled moments ago
+    // whose held dictation is about to be released — consumed
+    // one-shot by releaseHeldGuestSentence to mark that post (and
+    // its guest_speaking directive) justEnrolled.
+    private String justEnrolledGuestName = null;
     private long guestNameCaptureUntilMs = 0;
     private long guestAskCooldownUntilMs = 0;
     private Runnable guestHoldReleaseTask = null;
@@ -5131,6 +5136,38 @@ public class VoiceService extends Service
         doPostInput(text, possiblyCutOff, speakerName, null);
     }
 
+    // Rider G1 (Nick, 2026-10-29 ~16:12): the roster as the post
+    // carries it. Transition diffs are logged at DEBUG level only
+    // (Log.d — local, never uploaded, never spoken: inaudible by
+    // design). Computed at post time, so the roster the responder
+    // sees is exactly as fresh as the last post.
+    private final java.util.Set<String> reportedActiveGuests =
+            new java.util.HashSet<>();
+
+    private JSONArray activeGuestsJson() {
+        if (guestProfiles == null) return null;
+        java.util.List<String> names =
+                guestProfiles.activeGuestNames(this);
+        synchronized (reportedActiveGuests) {
+            for (String n : names) {
+                if (!reportedActiveGuests.contains(n)) {
+                    Log.d(TAG, "guests: '" + n + "' active on the roster");
+                }
+            }
+            for (String n : reportedActiveGuests) {
+                if (!names.contains(n)) {
+                    Log.d(TAG, "guests: '" + n
+                            + "' left the active roster (unheard 10 min)");
+                }
+            }
+            reportedActiveGuests.clear();
+            reportedActiveGuests.addAll(names);
+        }
+        JSONArray arr = new JSONArray();
+        for (String n : names) arr.put(n);
+        return arr;
+    }
+
     /** v1.64: interruptJson (see snapshotInterruption) rides along
      *  as an "interrupts" object when this dictation interrupted a
      *  playing/paused message. */
@@ -5145,6 +5182,17 @@ public class VoiceService extends Service
     public void doPostInput(String text, boolean possiblyCutOff,
                             String speakerName, String interruptJson,
                             boolean expectAnswer) {
+        doPostInput(text, possiblyCutOff, speakerName, interruptJson,
+                expectAnswer, false);
+    }
+
+    /** v1.71 (riders G1+G2): justEnrolled marks the enrollment
+     *  sequence's first dictation; every post also carries the
+     *  ACTIVE guest roster (activeGuests) so composed answers know
+     *  who is in the conversation. */
+    public void doPostInput(String text, boolean possiblyCutOff,
+                            String speakerName, String interruptJson,
+                            boolean expectAnswer, boolean justEnrolled) {
         HttpURLConnection conn = null;
         try {
             URL url = new URL(BASE_URL + "/api/selena-voice/input");
@@ -5161,6 +5209,15 @@ public class VoiceService extends Service
             if (speakerName != null) {
                 body.put("speakerName", speakerName);
                 body.put("speakerKind", "guest");
+            }
+            if (justEnrolled) {
+                body.put("justEnrolled", true);
+            }
+            // Rider G1: the ACTIVE guest roster rides on every
+            // dictation post (Nick's and guests' alike).
+            JSONArray roster = activeGuestsJson();
+            if (roster != null && roster.length() > 0) {
+                body.put("activeGuests", roster);
             }
             if (interruptJson != null) {
                 body.put("interrupts", new JSONObject(interruptJson));
@@ -6712,16 +6769,22 @@ public class VoiceService extends Service
                 log("guests: held dictation had no wake word — stays local");
             }
         }
+        // Rider G2: one-shot — only the release that immediately
+        // follows an enrollment carries the justEnrolled mark.
+        boolean justEnrolled = speakerName != null
+                && speakerName.equals(justEnrolledGuestName);
+        justEnrolledGuestName = null;
         if (!heldByWakeGate) {
             Intent sent = new Intent(ACTION_INPUT_SENT);
             sent.putExtra(EXTRA_TEXT, sentence);
             sendAppBroadcast(sent);
             if (speakerName != null) {
                 postGuestDirective("guest_speaking", speakerName, null,
-                        sentence);
+                        sentence, justEnrolled);
             }
             new Thread(new InputPostTask(this, sentence, false,
-                    speakerName, snapshotInterruption(sentence))).start();
+                    speakerName, snapshotInterruption(sentence), false,
+                    justEnrolled)).start();
             noteWakeConversationActivity();
             log("guests: held dictation released"
                     + (speakerName != null
@@ -6786,6 +6849,7 @@ public class VoiceService extends Service
             releasePoliteHold();
             return;
         }
+        justEnrolledGuestName = g.name;
         releaseHeldGuestSentence(g.name);
     }
 
@@ -6872,13 +6936,27 @@ public class VoiceService extends Service
 
     private void postGuestDirective(String action, String speakerName,
                                     String line, String text) {
+        postGuestDirective(action, speakerName, line, text, false);
+    }
+
+    /** v1.71 (rider G2): justEnrolled rides the guest_speaking
+     *  directive on the enrollment sequence's first dictation. */
+    private void postGuestDirective(String action, String speakerName,
+                                    String line, String text,
+                                    boolean justEnrolled) {
         new Thread(new GuestDirectiveTask(
-                this, action, speakerName, line, text)).start();
+                this, action, speakerName, line, text, justEnrolled)).start();
     }
 
     /** GuestDirectiveTask's POST — mirrors doPostMachineDirective. */
     public void doPostGuestDirective(String action, String speakerName,
                                      String line, String text) {
+        doPostGuestDirective(action, speakerName, line, text, false);
+    }
+
+    public void doPostGuestDirective(String action, String speakerName,
+                                     String line, String text,
+                                     boolean justEnrolled) {
         HttpURLConnection conn = null;
         try {
             URL url = new URL(BASE_URL + "/api/selena-voice/input");
@@ -6893,6 +6971,7 @@ public class VoiceService extends Service
             if (speakerName != null) body.put("speakerName", speakerName);
             if (line != null) body.put("line", line);
             if (text != null) body.put("text", text);
+            if (justEnrolled) body.put("justEnrolled", true);
             body.put("timestamp", System.currentTimeMillis());
             OutputStream os = null;
             try {
