@@ -4956,6 +4956,15 @@ public class VoiceService extends Service
     private volatile boolean offlineNoticePlayed = false;
     private volatile boolean offlineEpisodeActive = false;
     private android.net.ConnectivityManager.NetworkCallback offlineNetCallback;
+    // v1.66 refinement (Nick 2026-10-29 15:08): the FULL notice
+    // plays once per episode; later failures in the same episode
+    // get only a short confirmation, alternating the two bundled
+    // clips. The once-flag resets ONLY on a STEADY connection
+    // (STEADY_RESET_MS of continuous connectivity) — a flapping
+    // network does not earn a fresh full notice.
+    private volatile boolean shortConfirmAlt = false;
+    private volatile long steadyResetGen = 0;
+    private static final long STEADY_RESET_MS = 20_000;
 
     private void onDictationPostFailed(String text) {
         handler.post(() -> {
@@ -4967,8 +4976,15 @@ public class VoiceService extends Service
                         "offline-notice.mp3");
                 log("offline: dictation held + fallback clip played");
             } else {
-                log("offline: dictation stacked (notice already played "
-                        + "this episode)");
+                shortConfirmAlt = !shortConfirmAlt;
+                if (shortConfirmAlt) {
+                    playBundledFallback("fallback/saved.mp3",
+                            "offline-saved.mp3");
+                } else {
+                    playBundledFallback("fallback/added.mp3",
+                            "offline-added.mp3");
+                }
+                log("offline: dictation stacked + short confirmation");
             }
         });
     }
@@ -5009,17 +5025,56 @@ public class VoiceService extends Service
     }
 
     /** Reconnect announcement: only when an offline episode left
-     *  held dictations waiting (the announcement is the prompt that
-     *  they can now be sent — manually). Resets the episode. */
+     *  held dictations waiting (the announcement is the prompt
+     *  that they can now be sent — manually). Ends the episode's
+     *  announcement half; the FULL-notice once-flag is NOT reset
+     *  here — that waits for a steady connection (v1.66, 15:08). */
     private void maybeAnnounceReconnected() {
-        if (!offlineEpisodeActive) return;
-        offlineEpisodeActive = false;
-        offlineNoticePlayed = false;
-        if (heldTextWaiting()) {
-            playBundledFallback("fallback/reconnected.mp3",
-                    "reconnected-notice.mp3");
-            log("offline: service reconnected — announcement played "
-                    + "(text waiting in the box)");
+        if (offlineEpisodeActive) {
+            offlineEpisodeActive = false;
+            if (heldTextWaiting()) {
+                playBundledFallback("fallback/reconnected.mp3",
+                        "reconnected-notice.mp3");
+                log("offline: service reconnected — announcement played "
+                        + "(text waiting in the box)");
+            }
+        }
+        armSteadyReset();
+    }
+
+    /** Arm the steady-connection reset: after STEADY_RESET_MS of
+     *  continuous connectivity, the episode fully closes and the
+     *  next offline episode earns one fresh full notice. A network
+     *  loss invalidates the pending reset (see onNetworkLost). */
+    private void armSteadyReset() {
+        final long gen = ++steadyResetGen;
+        handler.postDelayed(() -> {
+            if (gen != steadyResetGen) return;
+            if (!isNetworkAvailableNow()) return;
+            if (offlineNoticePlayed) {
+                log("offline: steady connection — episode closed; "
+                        + "full notice re-armed");
+            }
+            offlineNoticePlayed = false;
+            offlineEpisodeActive = false;
+        }, STEADY_RESET_MS);
+    }
+
+    private boolean isNetworkAvailableNow() {
+        try {
+            android.net.ConnectivityManager cm =
+                    (android.net.ConnectivityManager)
+                            getSystemService(CONNECTIVITY_SERVICE);
+            if (cm == null) return false;
+            android.net.Network net = cm.getActiveNetwork();
+            if (net == null) return false;
+            android.net.NetworkCapabilities caps =
+                    cm.getNetworkCapabilities(net);
+            return caps != null && caps.hasCapability(
+                    android.net.NetworkCapabilities
+                            .NET_CAPABILITY_INTERNET);
+        } catch (Exception e) {
+            return false;
         }
     }
 
@@ -5062,6 +5117,7 @@ public class VoiceService extends Service
 
     /** OfflineNetworkCallback: the default network went away. */
     public void onNetworkLost() {
+        steadyResetGen++; // a loss cancels any pending steady reset
         offlineEpisodeActive = true;
     }
 
