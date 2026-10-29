@@ -29,7 +29,12 @@ public class MessageReceiver extends BroadcastReceiver {
         } else if (action.equals(VoiceService.ACTION_SPEECH_DETECTED)) {
             activity.onSpeechDetected();
         } else if (action.equals(VoiceService.ACTION_LISTENING_STATE)) {
-            activity.onListeningState(intent.getBooleanExtra(VoiceService.EXTRA_STATE, false));
+            // Nick 2026-10-28 v1.52: gate state rides along so the UI
+            // can show "Paused — loud noise" while the gate holds the
+            // recognizer off (extra absent on old broadcasts → null).
+            activity.onListeningState(
+                    intent.getBooleanExtra(VoiceService.EXTRA_STATE, false),
+                    intent.getStringExtra(VoiceService.EXTRA_GATE_STATE));
         } else if (action.equals(VoiceService.ACTION_POLL_STATUS)) {
             activity.onPollStatus(intent.getStringExtra(VoiceService.EXTRA_POLL_STATUS));
         } else if (action.equals(VoiceService.ACTION_PLAYBACK_STATE)) {

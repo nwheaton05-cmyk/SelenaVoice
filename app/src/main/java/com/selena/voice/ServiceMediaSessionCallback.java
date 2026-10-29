@@ -25,27 +25,27 @@ public class ServiceMediaSessionCallback extends MediaSession.Callback {
 
     @Override
     public void onPlay() {
-        service.onEarbudAction("play");
+        service.onEarbudAction("play", "session");
     }
 
     @Override
     public void onPause() {
-        service.onEarbudAction("pause");
+        service.onEarbudAction("pause", "session");
     }
 
     @Override
     public void onSkipToNext() {
-        service.onEarbudAction("next");
+        service.onEarbudAction("next", "session");
     }
 
     @Override
     public void onSkipToPrevious() {
-        service.onEarbudAction("previous");
+        service.onEarbudAction("previous", "session");
     }
 
     @Override
     public void onStop() {
-        service.onEarbudAction("stop");
+        service.onEarbudAction("stop", "session");
     }
 
     @Override
@@ -77,7 +77,7 @@ public class ServiceMediaSessionCallback extends MediaSession.Callback {
                     break;
             }
             if (action != null) {
-                service.onEarbudAction(action);
+                service.onEarbudAction(action, "session");
                 return true;
             }
         }

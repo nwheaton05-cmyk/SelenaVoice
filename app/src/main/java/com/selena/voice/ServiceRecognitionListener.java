@@ -34,6 +34,20 @@ public class ServiceRecognitionListener implements RecognitionListener {
     // the transcription is a guess — discard instead of sending garbage.
     private static final float CONFIDENCE_THRESHOLD = 0.5f;
 
+    // Nick 2026-10-28 v1.52: noise-gate sampler window. The gate in
+    // VoiceService needs level AND variation, not just a peak: speech
+    // RMS swings syllable to syllable, a mower drone sits flat. We keep
+    // the last ~48 RMS callbacks (they arrive many times a second while
+    // the recognizer owns the mic) and report mean / stddev / span over
+    // the recent slice. No second mic consumer is ever opened while the
+    // recognizer is live — see VoiceService's gate notes.
+    private static final int SAMPLER_WINDOW = 48;
+    private static final long SAMPLER_WINDOW_MS = 1500;
+    private final float[] samplerDb = new float[SAMPLER_WINDOW];
+    private final long[] samplerMs = new long[SAMPLER_WINDOW];
+    private int samplerHead = 0;
+    private int samplerCount = 0;
+
     public ServiceRecognitionListener(VoiceService service) {
         this.service = service;
     }
@@ -50,6 +64,50 @@ public class ServiceRecognitionListener implements RecognitionListener {
         // gate (see isMicHot).
         lastRmsDb = rmsdB;
         lastRmsMs = android.os.SystemClock.uptimeMillis();
+        // Nick 2026-10-28 v1.52: feed the noise-gate sampler window.
+        samplerDb[samplerHead] = rmsdB;
+        samplerMs[samplerHead] = lastRmsMs;
+        samplerHead = (samplerHead + 1) % SAMPLER_WINDOW;
+        if (samplerCount < SAMPLER_WINDOW) samplerCount++;
+    }
+
+    /**
+     * Nick 2026-10-28 v1.52: sampler snapshot for the VoiceService
+     * noise gate, computed over RMS samples from the last
+     * SAMPLER_WINDOW_MS. Returns {meanDb, stdDb, spanMs, fresh} where
+     * fresh is 1.0 when a sample arrived within the last 700ms (the
+     * recognizer goes quiet between sessions — stale windows must
+     * never be judged as "steady noise").
+     */
+    public float[] samplerStats() {
+        long now = android.os.SystemClock.uptimeMillis();
+        double sum = 0;
+        int n = 0;
+        long oldest = Long.MAX_VALUE;
+        long newest = 0;
+        for (int i = 0; i < samplerCount; i++) {
+            long t = samplerMs[i];
+            if (now - t > SAMPLER_WINDOW_MS) continue;
+            sum += samplerDb[i];
+            n++;
+            if (t < oldest) oldest = t;
+            if (t > newest) newest = t;
+        }
+        if (n < 4) {
+            return new float[]{-100f, 0f, 0f, 0f};
+        }
+        double mean = sum / n;
+        double var = 0;
+        for (int i = 0; i < samplerCount; i++) {
+            long t = samplerMs[i];
+            if (now - t > SAMPLER_WINDOW_MS) continue;
+            double d = samplerDb[i] - mean;
+            var += d * d;
+        }
+        float std = (float) Math.sqrt(var / n);
+        float span = (float) (newest - oldest);
+        float fresh = (now - lastRmsMs <= 700) ? 1f : 0f;
+        return new float[]{(float) mean, std, span, fresh};
     }
 
     /**
@@ -107,6 +165,14 @@ public class ServiceRecognitionListener implements RecognitionListener {
             // Nick 2026-10-18 v1.2: echo prevention — the recognizer picked
             // up Selena's own playback, not Nick. Discard, don't POST.
             Log.i(TAG, "discarding result during playback: " + text);
+            return;
+        }
+        if (service.isGateDroneActiveNow()) {
+            // Nick 2026-10-28 v1.52: the noise gate hears a loud, steady
+            // drone right now — this "result" is the machine, not the
+            // user, whatever the confidence/RMS filters would say (a
+            // drone is LOUD, so the old peak-RMS filter waved it in).
+            Log.i(TAG, "discarding result during gate drone: " + text);
             return;
         }
         if (text.isEmpty()) {

@@ -222,6 +222,23 @@ public class MainActivity extends Activity {
 
     /** Called by MessageReceiver when the listening state changes. */
     public void onListeningState(boolean listening) {
+        onListeningState(listening, null);
+    }
+
+    /**
+     * Nick 2026-10-28 v1.52: while the noise gate holds the recognizer
+     * off, the status line says so — a working gate must never look
+     * like a broken mic (spec §4.5). The mic button still forces a
+     * session open, which is the discoverable override.
+     */
+    public void onListeningState(boolean listening, String gateState) {
+        if ("killed".equals(gateState) || "noise_hold".equals(gateState)) {
+            final String text = "noise_hold".equals(gateState)
+                    ? "🚜 Paused — loud noise (dictation held)"
+                    : "🚜 Paused — loud noise";
+            runOnUiThread(() -> statusText.setText(text));
+            return;
+        }
         updateListeningUi(listening);
     }
 

@@ -110,6 +110,10 @@ public class VoiceService extends Service
     public static final String EXTRA_POLL_STATUS = "poll_status";
     public static final String EXTRA_TEXT = "text";
     public static final String EXTRA_STATE = "listening";
+    // Nick 2026-10-28 v1.52: noise-gate state riding the listening-state
+    // broadcast ("ambient" / "killed" / "noise_hold") so the UI can show
+    // the subtle "Paused — loud noise" state (spec §4.5).
+    public static final String EXTRA_GATE_STATE = "gate_state";
     // Nick 2026-10-23 v1.46: live dictation — the recognizer's partial
     // (in-progress) transcription, broadcast for the dictation popup.
     public static final String ACTION_PARTIAL_INPUT = "com.selena.voice.PARTIAL_INPUT";
@@ -245,6 +249,27 @@ public class VoiceService extends Service
     private MediaSession mediaSession;
     private String lastEarbudAction = null;
     private long lastEarbudActionMs = 0;
+    // Nick 2026-10-28 v1.52 (§6 press rules): which delivery path the
+    // last press came from ("session" / "broadcast"). A physical press
+    // can arrive via BOTH paths — cross-path repeats inside the
+    // debounce window are the same press; same-path repeats are
+    // genuinely new presses. The double-tap detection while paused
+    // depends on telling those apart.
+    private String lastEarbudSource = null;
+    // Nick 2026-10-28 v1.52: MediaSession politeness — the session is
+    // only ACTIVE while Selena has content (playing/paused) or is
+    // listening; while fully idle it deactivates so Spotify/Pandora
+    // receive their own earbud presses. Tracked to only call
+    // setActive on transitions.
+    private boolean mediaSessionActiveWanted = false;
+    // Nick 2026-10-28 v1.52: a press while Selena is paused holding
+    // the audio path does not resume instantly — it waits out the
+    // double-tap window. A second distinct press inside the window
+    // means STOP (and music resumes), not resume.
+    private Runnable pendingResumeTask = null;
+    private String pendingResumeSource = null;
+    private long pendingResumeMs = 0;
+    private static final long EARBUD_DOUBLE_TAP_MS = 400;
     // Nick 2026-10-22 v1.34: path of the MP3 currently loaded in the
     // player (null when idle). Lets CLEAR_UNLOCKED stop playback only
     // when the playing message is unlocked.
@@ -269,6 +294,61 @@ public class VoiceService extends Service
     // onRecognizerDone (every utterance ends in one of those, onResults,
     // or onError).
     private volatile boolean nickSpeaking = false;
+
+    // ------------------------------------------------------------ v1.52 noise gate
+    // Nick 2026-10-28 (spec §3/§4): a cheap sampler IN FRONT OF the
+    // recognizer. The old app let SpeechRecognizer's own VAD decide
+    // "someone is talking" — a mower is loud, so it opened dictation
+    // sessions on engine noise and held them open. The gate watches
+    // level + variation and kills the recognizer under a loud, steady
+    // drone. Sampling NEVER opens a second mic consumer while the
+    // recognizer is live (Android gives the mic to one client
+    // reliably; two consumers starve/degrade each other, worst on
+    // Samsung's engine):
+    //   - recognizer live  -> samples come from its onRmsChanged
+    //     stream (ServiceRecognitionListener.samplerStats).
+    //   - recognizer held off (KILLED) -> short AudioRecord probes
+    //     (GateProbeTask) are the only mic consumer and watch for the
+    //     two re-arms: drone stops, or speech bursts over the drone.
+    // Failure behavior (§4): any sampler error disables the gate and
+    // the app falls back to plain recognizer behavior — fail open for
+    // the user, closed for noise. A manual mic tap (or an earbud
+    // dictation request) forces a session open, gate bypassed for
+    // that session (§4.1).
+    private static final int GATE_AMBIENT = 0;
+    private static final int GATE_KILLED = 1;
+    private volatile int gateState = GATE_AMBIENT;
+    private boolean gateDisabled = false;
+    private boolean gateBypassSession = false;
+    private long gateDroneSinceMs = 0;
+    private long gateGraceUntilMs = 0;
+    private long gateDroneAbsentSinceMs = 0;
+    // Probe-side (dBFS) drone baseline, learned from the first probes
+    // after a kill, then drift-tracked only by near-baseline samples
+    // so a level drop can't drag the baseline down and hide itself.
+    private float gateDroneBaselineDbfs = Float.NaN;
+    private int gateProbeCount = 0;
+    private int gateProbeDropCount = 0;
+    private boolean gateProbeInFlight = false;
+    private Runnable gateTickTask = null;
+    private Runnable gateProbeScheduleTask = null;
+    // Pause-and-remember (§3): a held dictation lives in sentenceBuffer
+    // with these flags; the 60s noise clock (NOT the 4s sentence gap)
+    // sends it flagged possiblyCutOff if no further dictation comes.
+    private boolean noiseHoldActive = false;
+    private boolean bufferCutOffFlag = false;
+    private Runnable noiseHoldSendTask = null;
+    private static final long GATE_TICK_MS = 250;
+    // TUNABLE (spec §13.4 — kill timing left open by Nick; ~1s was the
+    // proposal): how long loud-and-steady must persist before KILLED.
+    private static final long GATE_KILL_SUSTAIN_MS = 1000;
+    private static final float GATE_LOUD_DB = -9.0f;       // recognizer-scale mean level
+    private static final float GATE_STEADY_STD_DB = 1.4f;  // recognizer-scale variation ceiling
+    private static final long GATE_PROBE_INTERVAL_MS = 1200;
+    private static final float GATE_PROBE_DROP_DB = 8.0f;      // drone-gone test (below baseline)
+    private static final float GATE_PROBE_BURST_STD_DB = 2.5f; // speech-shaped variation (dBFS frames)
+    private static final float GATE_PROBE_BURST_PEAK_DB = 5.0f; // burst peak above drone baseline
+    private static final long NOISE_HOLD_SEND_MS = 60000;      // spec §3: 60s noise clock
 
     // Nick 2026-10-19 v1.16: outbound (moved from MainActivity).
     private RealtimeClient realtimeClient;
@@ -407,6 +487,9 @@ public class VoiceService extends Service
         if (isAlwaysListening()) {
             startContinuousListening();
         }
+        // Nick 2026-10-28 v1.52: noise-gate watchdog (250ms tick,
+        // near-free when nothing is being listened to).
+        startGateWatchdog();
         log("service created (v1.16 background mode)");
     }
 
@@ -431,9 +514,22 @@ public class VoiceService extends Service
                 // against each other there.
                 String earbudAction = intent.getStringExtra(
                         EarbudButtonReceiver.EXTRA_EARBUD_ACTION);
+                String earbudSource = intent.getStringExtra(
+                        EarbudButtonReceiver.EXTRA_EARBUD_SOURCE);
                 log("intent: EARBUD_TAP received (" + earbudAction + ")");
-                if (earbudAction != null) onEarbudAction(earbudAction);
+                if (earbudAction != null) {
+                    onEarbudAction(earbudAction,
+                            earbudSource != null ? earbudSource : "broadcast");
+                }
             } else if ("MANUAL_LISTEN".equals(intent.getAction())) {
+                // Nick 2026-10-28 v1.52 (§4.1): the mic tap is the
+                // manual override — while the noise gate has the
+                // recognizer killed, a tap forces a session open,
+                // gate bypassed for that session. (recognizerActive
+                // stays true while killed, so check the gate first.)
+                if (gateState == GATE_KILLED) {
+                    forceGateOverride();
+                }
                 if (!recognizerActive) {
                     manualListening = true;
                     startContinuousListening();
@@ -1892,6 +1988,10 @@ public class VoiceService extends Service
      */
     private void stopCurrentPlayback() {
         log("stop: halting current playback");
+        // Nick 2026-10-28 v1.52: a stop from anywhere (screen button,
+        // STOP_ALL intent) also cancels an earbud press's pending
+        // double-tap-window resume.
+        cancelPendingResume();
         // Nick 2026-10-23 v1.40: stop cancels any priority flow too.
         priorityMode = false;
         // Nick 2026-10-23 v1.42: stop also drops queued priority items.
@@ -2512,17 +2612,32 @@ public class VoiceService extends Service
         // Bluetooth devices decide which transport command (play vs pause)
         // to send from the state we publish.
         updateMediaSessionState();
+        // Nick 2026-10-28 v1.52: playback transitions are also when the
+        // session's active/inactive politeness state can change.
+        refreshMediaSessionActive();
     }
 
     // ------------------------------------------------------------ v1.51 earbud buttons
 
     /**
-     * Nick 2026-10-28 v1.51: create + activate the media session.
-     * Framework android.media.session (no androidx in this build). The
-     * session must be ACTIVE for Android to route media-button presses
-     * to its callback; it stays active for the service's lifetime so a
-     * tap works while idle (start dictation) as well as during playback
-     * (pause the readout).
+     * Nick 2026-10-28 v1.51: create the media session. Framework
+     * android.media.session (no androidx in this build). The session
+     * must be ACTIVE for Android to route media-button presses to its
+     * callback.
+     *
+     * Nick 2026-10-28 v1.52 (§6 politeness): v1.51 kept the session
+     * active for the service's whole lifetime, which also meant an
+     * idle Selena kept claiming earbud presses that belonged to
+     * Spotify/Pandora. Now the session is active only while Selena
+     * has content (playing or paused) or is listening — the states
+     * where a press is plausibly FOR her. Fully idle → inactive, and
+     * the music apps get their presses back. Tradeoff, deliberately
+     * kept working: with always-listening on (Nick's normal mode) the
+     * session stays active, so earbud pause/dictation behave exactly
+     * as v1.51; the deactivation only bites when listening is off AND
+     * nothing is playing — and even then the manifest
+     * EarbudButtonReceiver can still deliver a press to start
+     * dictation on devices that fall back to the broadcast path.
      */
     private void initMediaSession() {
         try {
@@ -2530,15 +2645,40 @@ public class VoiceService extends Service
             mediaSession.setCallback(new ServiceMediaSessionCallback(this));
             mediaSession.setFlags(MediaSession.FLAG_HANDLES_MEDIA_BUTTONS
                     | MediaSession.FLAG_HANDLES_TRANSPORT_CONTROLS);
-            mediaSession.setActive(true);
+            mediaSessionActiveWanted = false;
+            refreshMediaSessionActive();
             updateMediaSessionState();
-            log("earbud: media session active");
+            log("earbud: media session created");
         } catch (Exception e) {
             // The manifest broadcast receiver still covers button presses
             // on the legacy path — a session failure must not kill the
             // service.
             log("earbud: media session init failed: " + e);
             mediaSession = null;
+        }
+    }
+
+    /**
+     * Nick 2026-10-28 v1.52: keep the media session's active flag in
+     * step with whether Selena has anything a press could mean —
+     * playing, paused-holding, speaking, or listening (including
+     * gate-killed: recognizerActive stays true while killed). Only
+     * touches the session on transitions.
+     */
+    private void refreshMediaSessionActive() {
+        if (mediaSession == null) return;
+        boolean want = safeIsPlaying() || ttsSpeaking
+                || playbackPaused || ttsPaused
+                || recognizerActive;
+        if (want == mediaSessionActiveWanted) return;
+        mediaSessionActiveWanted = want;
+        try {
+            mediaSession.setActive(want);
+            log("earbud: media session " + (want
+                    ? "activated (Selena has content or is listening)"
+                    : "deactivated (idle — music apps keep their presses)"));
+        } catch (Exception e) {
+            log("earbud: session active toggle failed: " + e);
         }
     }
 
@@ -2569,6 +2709,11 @@ public class VoiceService extends Service
         }
     }
 
+    /** v1.51 entry point, kept for any caller without a source. */
+    public void onEarbudAction(String action) {
+        onEarbudAction(action, "unknown");
+    }
+
     /**
      * Nick 2026-10-28 v1.51: one earbud/headset button action, from the
      * MediaSession callback or the manifest broadcast receiver.
@@ -2583,8 +2728,21 @@ public class VoiceService extends Service
      * The same physical press can arrive via BOTH delivery paths within
      * milliseconds — identical actions inside 1s are debounced, or a
      * pause would instantly resume itself.
+     *
+     * Nick 2026-10-28 v1.52 (§6): while Selena is PAUSED holding the
+     * audio path, toggle/play presses get double-tap interpretation
+     * (handlePausedPress) — a single press resumes her, a double tap
+     * STOPS her outright and gives the path back to the music. That
+     * path does its own duplicate detection using the delivery
+     * source: a cross-path repeat is the same physical press, a
+     * same-path repeat is a new one.
      */
-    public void onEarbudAction(String action) {
+    public void onEarbudAction(String action, String source) {
+        if ((playbackPaused || ttsPaused)
+                && ("toggle".equals(action) || "play".equals(action))) {
+            handlePausedPress(action, source);
+            return;
+        }
         long now = android.os.SystemClock.uptimeMillis();
         if (action.equals(lastEarbudAction)
                 && now - lastEarbudActionMs < 1000) {
@@ -2593,7 +2751,8 @@ public class VoiceService extends Service
         }
         lastEarbudAction = action;
         lastEarbudActionMs = now;
-        log("earbud: action=" + action
+        lastEarbudSource = source;
+        log("earbud: action=" + action + " via " + source
                 + " mp3Playing=" + safeIsPlaying()
                 + " ttsSpeaking=" + ttsSpeaking
                 + " paused=" + (playbackPaused || ttsPaused)
@@ -2631,11 +2790,110 @@ public class VoiceService extends Service
     }
 
     /**
+     * True when this event is the OTHER delivery path's copy of the
+     * press we just handled (session callback + manifest broadcast can
+     * both deliver one physical press). Requires both sources known
+     * and different, the same action, inside the debounce window.
+     */
+    private boolean isCrossPathDuplicate(String action, String source, long now) {
+        return action.equals(lastEarbudAction)
+                && source != null && lastEarbudSource != null
+                && !source.equals(lastEarbudSource)
+                && !"unknown".equals(source) && !"unknown".equals(lastEarbudSource)
+                && now - lastEarbudActionMs < 1000;
+    }
+
+    /**
+     * Nick 2026-10-28 v1.52 (§6): a toggle/play press while Selena is
+     * paused holding the audio path. She does NOT resume instantly:
+     * the press waits out EARBUD_DOUBLE_TAP_MS. A second DISTINCT
+     * press inside the window is a double tap → stopAllPlayback (the
+     * message never finishes) + abandon audio focus so the music
+     * resumes. If the window lapses, the pending resume fires — the
+     * only cost of the double-tap rule is ~400ms on resume.
+     *
+     * Duplicate safety: the press that CAUSED the pause can still
+     * have its cross-path twin in flight when this runs — that twin
+     * is ignored, or a single pause-press would "resume" itself. A
+     * second press delivered ONLY via the other path than the first
+     * is indistinguishable from such a twin and is treated as one
+     * (resume proceeds) — the failure direction is deliberate: a
+     * missed double-tap leaves Selena resumable, while a false one
+     * would destroy a message the user wanted paused.
+     */
+    private void handlePausedPress(String action, String source) {
+        long now = android.os.SystemClock.uptimeMillis();
+        if (isCrossPathDuplicate(action, source, now)) {
+            log("earbud: cross-path duplicate " + action + " debounced (paused)");
+            return;
+        }
+        if (pendingResumeTask != null) {
+            boolean duplicate = source != null && pendingResumeSource != null
+                    && !source.equals(pendingResumeSource)
+                    && !"unknown".equals(source)
+                    && !"unknown".equals(pendingResumeSource)
+                    && now - pendingResumeMs < 1000;
+            if (duplicate) {
+                log("earbud: cross-path duplicate debounced in double-tap window");
+                return;
+            }
+            // Second distinct press inside the window = DOUBLE TAP.
+            cancelPendingResume();
+            lastEarbudAction = action;
+            lastEarbudActionMs = now;
+            lastEarbudSource = source;
+            log("earbud: DOUBLE TAP while paused — stopping Selena,"
+                    + " releasing the audio path to music");
+            stopAllPlayback();
+            abandonAudioFocus();
+            updateMediaSessionState();
+            return;
+        }
+        lastEarbudAction = action;
+        lastEarbudActionMs = now;
+        lastEarbudSource = source;
+        pendingResumeSource = source;
+        pendingResumeMs = now;
+        log("earbud: press while paused — resume pending " + EARBUD_DOUBLE_TAP_MS
+                + "ms (a second press in the window = double-tap stop)");
+        pendingResumeTask = () -> {
+            pendingResumeTask = null;
+            pendingResumeSource = null;
+            // State may have moved on (screen stop, new message) —
+            // resume only if she's still the paused one.
+            if (playbackPaused || ttsPaused) {
+                log("earbud: single press confirmed — resuming Selena");
+                resumePlayback();
+            }
+        };
+        handler.postDelayed(pendingResumeTask, EARBUD_DOUBLE_TAP_MS);
+    }
+
+    /** Drop a pending double-tap-window resume, if any. */
+    private void cancelPendingResume() {
+        if (pendingResumeTask != null) {
+            handler.removeCallbacks(pendingResumeTask);
+            pendingResumeTask = null;
+        }
+        pendingResumeSource = null;
+    }
+
+    /**
      * Nick 2026-10-28 v1.51: earbud tap while idle = start dictating.
      * If always-listening already has the recognizer running there is
      * nothing to start — say so instead of silently doing nothing.
+     *
+     * Nick 2026-10-28 v1.52: while the noise gate has the recognizer
+     * killed, recognizerActive is still true but no session is live —
+     * an earbud dictation request is a manual override (§4.1), same
+     * as the on-screen mic tap.
      */
     private void startDictationFromEarbud() {
+        if (gateState == GATE_KILLED) {
+            forceGateOverride();
+            toast("Listening");
+            return;
+        }
         if (recognizerActive) {
             log("earbud: dictation requested, already listening");
             toast("Already listening");
@@ -2808,6 +3066,18 @@ public class VoiceService extends Service
     }
 
     private void stopContinuousListening() {
+        // Nick 2026-10-28 v1.52: ending listening ends any noise hold —
+        // send the held dictation (flagged) rather than losing the
+        // user's words, and reset the gate for the next session.
+        if (noiseHoldActive) sendHeldSentence();
+        if (gateState == GATE_KILLED) {
+            gateState = GATE_AMBIENT;
+            if (gateProbeScheduleTask != null) {
+                handler.removeCallbacks(gateProbeScheduleTask);
+                gateProbeScheduleTask = null;
+            }
+        }
+        gateBypassSession = false;
         recognizerActive = false;
         // Nick 2026-10-23 v1.41: last listening session ended — drop the
         // microphone FGS type immediately; live on mediaPlayback only.
@@ -2834,6 +3104,12 @@ public class VoiceService extends Service
         // Nick 2026-10-23 v1.47: never start listening while muted for
         // Selena playback — unmuteMicAfterPlayback() restarts when done.
         if (micMutedForPlayback) return;
+        // Nick 2026-10-28 v1.52: noise gate — while KILLED the
+        // recognizer stays OFF (nothing is recorded or sent); the
+        // probe loop owns re-arming. Every recognizer start funnels
+        // through here, so this one check suppresses them all. The
+        // manual override clears the killed state before starting.
+        if (gateState == GATE_KILLED && !gateBypassSession) return;
         try {
             muteBeep();
             Intent intent = new Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH);
@@ -3153,6 +3429,27 @@ public class VoiceService extends Service
         // if the POST later fails (offline, timeout). His inputs are never
         // spoken aloud — playback only plays Selena's reply MP3s.
         long now = android.os.SystemClock.uptimeMillis();
+        // Nick 2026-10-28 v1.52: a real accepted chunk after a noise
+        // pause means dictation RESUMED on top of the held text — the
+        // message is continuing, so it is no longer a cut-off send:
+        // clear the noise-hold bookkeeping and the 60s noise clock.
+        if (noiseHoldActive) {
+            noiseHoldActive = false;
+            bufferCutOffFlag = false;
+            if (noiseHoldSendTask != null) {
+                handler.removeCallbacks(noiseHoldSendTask);
+                noiseHoldSendTask = null;
+            }
+            // The gap check below must not flush the held text as its
+            // own sentence — the resumed chunk continues THIS message.
+            lastChunkMs = now;
+            log("gate: dictation resumed on top of held text");
+        }
+        // Actively dictating (possibly over a still-running drone after
+        // a burst re-arm) — keep the gate from re-killing mid-flow.
+        // Each accepted chunk extends the grace; once he stops, the
+        // normal 4s flush lands well before grace + kill-sustain do.
+        gateGraceUntilMs = now + 6000;
         long gap = now - lastChunkMs;
         // A long gap means the buffered chunks were a complete sentence —
         // flush them before starting the new one. (The flush timer
@@ -3183,6 +3480,10 @@ public class VoiceService extends Service
     private void flushSentence() {
         sentenceFlushTask = null;
         if (sentenceBuffer.length() == 0) return;
+        // Nick 2026-10-28 v1.52: a noise-held dictation is owned by
+        // the 60s noise clock (or by resumed dictation) — the normal
+        // 4s sentence gap must never flush it early or unflagged.
+        if (noiseHoldActive) return;
         if (nickSpeaking) {
             // Still mid-utterance — wait for a real pause. The next chunk
             // re-arms; re-arm here as a backstop.
@@ -3214,6 +3515,17 @@ public class VoiceService extends Service
 
     /** Called by InputPostTask on background thread. */
     public void doPostInput(String text) {
+        doPostInput(text, false);
+    }
+
+    /**
+     * Nick 2026-10-28 v1.52: possiblyCutOff carries the noise gate's
+     * verdict — true only when the dictation was held by loud noise
+     * and sent on the 60s no-further-dictation clock. The Siteview
+     * brain (which consumes this later) judges complete-vs-cut-off
+     * from it. Normal dictations post it as false.
+     */
+    public void doPostInput(String text, boolean possiblyCutOff) {
         HttpURLConnection conn = null;
         try {
             URL url = new URL(BASE_URL + "/api/selena-voice/input");
@@ -3226,6 +3538,7 @@ public class VoiceService extends Service
             JSONObject body = new JSONObject();
             body.put("text", text);
             body.put("timestamp", System.currentTimeMillis());
+            body.put("possiblyCutOff", possiblyCutOff);
             OutputStream os = null;
             try {
                 os = conn.getOutputStream();
@@ -3242,6 +3555,311 @@ public class VoiceService extends Service
             Log.w(TAG, "postInput failed", e);
         } finally {
             if (conn != null) conn.disconnect();
+        }
+    }
+
+    // ------------------------------------------------------------ v1.52 gate machinery
+
+    private long gateNow() {
+        return android.os.SystemClock.uptimeMillis();
+    }
+
+    /** Starts the 250ms gate evaluation loop (idempotent). */
+    private void startGateWatchdog() {
+        if (gateTickTask != null) return;
+        gateTickTask = () -> {
+            gateTick();
+            if (!destroyed) handler.postDelayed(gateTickTask, GATE_TICK_MS);
+        };
+        handler.postDelayed(gateTickTask, GATE_TICK_MS);
+    }
+
+    /**
+     * True when the recognizer's live RMS window reads as machine
+     * drone: loud (mean at/above GATE_LOUD_DB) AND steady (variation
+     * at/below GATE_STEADY_STD_DB) over a fresh, sufficiently long
+     * window. Speech fails the steadiness test by nature.
+     */
+    public boolean samplerSeesDrone() {
+        if (recognitionListener == null) return false;
+        float[] s = recognitionListener.samplerStats();
+        if (s[3] < 1f) return false;      // stale window — between sessions
+        if (s[2] < 700f) return false;    // not enough signal to judge
+        return s[0] >= GATE_LOUD_DB && s[1] <= GATE_STEADY_STD_DB;
+    }
+
+    /**
+     * Nick 2026-10-28 v1.52: consulted by ServiceRecognitionListener
+     * before accepting a result — while the gate is killed, or while
+     * the live window reads as drone at this moment, recognizer
+     * "results" are the machine talking, not the user.
+     */
+    public boolean isGateDroneActiveNow() {
+        if (gateState == GATE_KILLED) return true;
+        if (gateDisabled || gateBypassSession) return false;
+        return samplerSeesDrone();
+    }
+
+    /**
+     * Gate evaluation, every 250ms. Only the AMBIENT side lives here
+     * (KILLED exits are driven by probes). Any exception disables the
+     * gate — spec §4.4: fall back to plain recognizer behavior.
+     */
+    private void gateTick() {
+        if (destroyed || gateDisabled) return;
+        try {
+            if (gateState == GATE_KILLED) return; // probes drive exits
+            if (!recognizerActive || recognizer == null || micMutedForPlayback) {
+                gateDroneSinceMs = 0;
+                return;
+            }
+            if (gateBypassSession) {
+                // Override session (§4.1): the gate stays out of the
+                // way until the drone has been gone a while, then it
+                // quietly resumes duty for the next noise event.
+                if (!samplerSeesDrone()) {
+                    if (gateDroneAbsentSinceMs == 0) {
+                        gateDroneAbsentSinceMs = gateNow();
+                    } else if (gateNow() - gateDroneAbsentSinceMs > 5000) {
+                        gateBypassSession = false;
+                        gateDroneAbsentSinceMs = 0;
+                        log("gate: override session over — gate back on duty");
+                    }
+                } else {
+                    gateDroneAbsentSinceMs = 0;
+                }
+                return;
+            }
+            if (gateNow() < gateGraceUntilMs) {
+                gateDroneSinceMs = 0;
+                return;
+            }
+            if (samplerSeesDrone()) {
+                if (gateDroneSinceMs == 0) {
+                    gateDroneSinceMs = gateNow();
+                } else if (gateNow() - gateDroneSinceMs >= GATE_KILL_SUSTAIN_MS) {
+                    enterGateKill();
+                }
+            } else {
+                gateDroneSinceMs = 0;
+            }
+        } catch (Exception e) {
+            disableGate("tick failed: " + e);
+        }
+    }
+
+    /**
+     * Loud + steady sustained past the kill timing → KILLED. The
+     * recognizer session is cancelled and launchRecognizer() refuses
+     * to relaunch while killed: nothing is recorded or sent. If real
+     * accepted dictation is buffered, this becomes a noise HOLD
+     * instead — pause-and-remember, never discard (§3).
+     */
+    private void enterGateKill() {
+        gateState = GATE_KILLED;
+        gateDroneSinceMs = 0;
+        gateDroneBaselineDbfs = Float.NaN;
+        gateProbeCount = 0;
+        gateProbeDropCount = 0;
+        boolean holding = sentenceBuffer.length() > 0;
+        if (holding) {
+            noiseHoldActive = true;
+            bufferCutOffFlag = true;
+            if (sentenceFlushTask != null) {
+                handler.removeCallbacks(sentenceFlushTask);
+                sentenceFlushTask = null;
+            }
+            armNoiseHoldTimer();
+            log("gate: loud steady noise — dictation PAUSED and held ("
+                    + sentenceBuffer.length() + " chars kept)");
+        } else {
+            log("gate: loud steady noise — recognizer killed, nothing recorded");
+        }
+        // Cancel the in-flight session: the "utterance" in progress is
+        // the drone itself. Its error callback routes to
+        // onRecognizerDone, whose restarts launchRecognizer() then
+        // suppresses — the recognizer stays off until a probe re-arms
+        // or the user overrides.
+        if (recognizer != null) {
+            try { recognizer.cancel(); } catch (Exception ignored) {}
+        }
+        nickSpeaking = false;
+        updateNotification(holding
+                ? "🚜 Paused — loud noise (dictation held)"
+                : "🚜 Paused — loud noise");
+        broadcastListeningState();
+        scheduleGateProbe(300);
+    }
+
+    /** (Re)arm the 60s noise clock for a held dictation (§3). */
+    private void armNoiseHoldTimer() {
+        if (noiseHoldSendTask != null) handler.removeCallbacks(noiseHoldSendTask);
+        noiseHoldSendTask = () -> sendHeldSentence();
+        handler.postDelayed(noiseHoldSendTask, NOISE_HOLD_SEND_MS);
+    }
+
+    /**
+     * The 60s noise clock fired with no further dictation: send the
+     * held dictation now, flagged possiblyCutOff for the brain.
+     */
+    private void sendHeldSentence() {
+        noiseHoldSendTask = null;
+        if (!noiseHoldActive) return;
+        noiseHoldActive = false;
+        bufferCutOffFlag = false;
+        if (sentenceBuffer.length() == 0) return;
+        String sentence = sentenceBuffer.toString();
+        sentenceBuffer.setLength(0);
+        log("gate: 60s with no further dictation — sending held dictation"
+                + " flagged possiblyCutOff");
+        MessageHistory.addNick(sentence);
+        Intent sent = new Intent(ACTION_INPUT_SENT);
+        sent.putExtra(EXTRA_TEXT, sentence);
+        sendAppBroadcast(sent);
+        new Thread(new InputPostTask(this, sentence, true)).start();
+        releasePoliteHold();
+    }
+
+    // ------------------------------------------------------------ gate probes (KILLED side)
+
+    private void scheduleGateProbe(long delayMs) {
+        if (gateState != GATE_KILLED || destroyed) return;
+        if (gateProbeScheduleTask != null) {
+            handler.removeCallbacks(gateProbeScheduleTask);
+        }
+        gateProbeScheduleTask = () -> runGateProbe();
+        handler.postDelayed(gateProbeScheduleTask, delayMs);
+    }
+
+    private void runGateProbe() {
+        gateProbeScheduleTask = null;
+        if (gateState != GATE_KILLED || destroyed || gateDisabled) return;
+        // Selena's own voice over the speaker would read as a speech
+        // burst — never probe while she is audible.
+        if (isPlayingAudio() || micMutedForPlayback) {
+            scheduleGateProbe(800);
+            return;
+        }
+        if (gateProbeInFlight) {
+            scheduleGateProbe(400);
+            return;
+        }
+        gateProbeInFlight = true;
+        new Thread(new GateProbeTask(this)).start();
+    }
+
+    /** Called by GateProbeTask on its worker thread. */
+    public void onGateProbeResult(float meanDbfs, float stdDb,
+                                  float peakDbfs, boolean ok) {
+        handler.post(() -> handleGateProbeResult(meanDbfs, stdDb, peakDbfs, ok));
+    }
+
+    private void handleGateProbeResult(float meanDbfs, float stdDb,
+                                       float peakDbfs, boolean ok) {
+        gateProbeInFlight = false;
+        if (gateState != GATE_KILLED || destroyed) return;
+        if (!ok) {
+            // Spec §4.4: sampler failure → plain recognizer behavior.
+            disableGate("mic probe failed");
+            return;
+        }
+        try {
+            // Re-arm B (§3): a speech-shaped burst riding clearly above
+            // the learned drone baseline. Judged BEFORE this sample can
+            // move the baseline. Before a baseline exists, only an
+            // unmistakably loud + varied probe counts.
+            boolean burst;
+            if (gateProbeCount >= 2 && !Float.isNaN(gateDroneBaselineDbfs)) {
+                burst = stdDb >= GATE_PROBE_BURST_STD_DB
+                        && peakDbfs >= gateDroneBaselineDbfs + GATE_PROBE_BURST_PEAK_DB;
+            } else {
+                burst = stdDb >= GATE_PROBE_BURST_STD_DB && meanDbfs >= -20f;
+            }
+            if (burst) {
+                exitGateKill("speech burst over the drone");
+                return;
+            }
+            // Learn / drift-track the drone baseline. The first probes
+            // set it; afterwards only near-baseline samples move it, so
+            // a level drop cannot drag it down and mask itself.
+            if (gateProbeCount < 3 || Float.isNaN(gateDroneBaselineDbfs)) {
+                gateDroneBaselineDbfs = Float.isNaN(gateDroneBaselineDbfs)
+                        ? meanDbfs
+                        : (gateDroneBaselineDbfs * gateProbeCount + meanDbfs)
+                                / (gateProbeCount + 1);
+            } else if (Math.abs(meanDbfs - gateDroneBaselineDbfs) < 3f) {
+                gateDroneBaselineDbfs =
+                        gateDroneBaselineDbfs * 0.9f + meanDbfs * 0.1f;
+            }
+            gateProbeCount++;
+            // Re-arm A (§3): the level fell well below the drone
+            // baseline and stayed there — the machine stopped.
+            if (gateProbeCount >= 3
+                    && meanDbfs <= gateDroneBaselineDbfs - GATE_PROBE_DROP_DB) {
+                gateProbeDropCount++;
+                if (gateProbeDropCount >= 2) {
+                    exitGateKill("noise stopped");
+                    return;
+                }
+            } else {
+                gateProbeDropCount = 0;
+            }
+            scheduleGateProbe(GATE_PROBE_INTERVAL_MS);
+        } catch (Exception e) {
+            disableGate("probe handling failed: " + e);
+        }
+    }
+
+    /**
+     * Leave KILLED: recognizer restarts (unless muted for playback),
+     * the gate gets a short grace period so a dictation in flow is
+     * never instantly re-killed, and a held dictation gets a fresh
+     * 60s noise clock for its continuation.
+     */
+    private void exitGateKill(String reason) {
+        if (gateState != GATE_KILLED) return;
+        gateState = GATE_AMBIENT;
+        gateDroneSinceMs = 0;
+        gateGraceUntilMs = gateNow() + 6000;
+        if (gateProbeScheduleTask != null) {
+            handler.removeCallbacks(gateProbeScheduleTask);
+            gateProbeScheduleTask = null;
+        }
+        log("gate: re-armed (" + reason + ")"
+                + (noiseHoldActive ? " — held dictation resumes" : ""));
+        if (noiseHoldActive) armNoiseHoldTimer();
+        updateNotification("🎤 Listening…");
+        broadcastListeningState();
+        if (recognizerActive && !micMutedForPlayback && !destroyed) {
+            restartRecognizerNow();
+        }
+    }
+
+    /**
+     * Spec §4.1: manual override — the user tapped the mic (or asked
+     * for dictation from the earbud) while the gate had the recognizer
+     * killed. Force the session open; the gate is bypassed for this
+     * session and resumes duty once the drone has been gone a while.
+     */
+    public void forceGateOverride() {
+        if (gateState != GATE_KILLED) return;
+        gateBypassSession = true;
+        gateDroneAbsentSinceMs = 0;
+        log("gate: MANUAL OVERRIDE — session forced open, gate bypassed");
+        exitGateKill("manual override");
+    }
+
+    /**
+     * Spec §4.4: sampler/analyzer failure — disable the gate and fall
+     * back to today's plain SpeechRecognizer behavior. Failing open
+     * for the user beats a gate that can't hear.
+     */
+    private void disableGate(String why) {
+        if (gateDisabled) return;
+        gateDisabled = true;
+        log("gate: DISABLED (" + why + ") — plain recognizer fallback (fail open)");
+        if (gateState == GATE_KILLED) {
+            exitGateKill("sampler failure fallback");
         }
     }
 
@@ -3295,7 +3913,17 @@ public class VoiceService extends Service
     private void broadcastListeningState() {
         Intent i = new Intent(ACTION_LISTENING_STATE);
         i.putExtra(EXTRA_STATE, recognizerActive);
+        // Nick 2026-10-28 v1.52: gate state for the UI's subtle
+        // "Paused — loud noise" indicator (§4.5). recognizerActive
+        // stays true while killed (listening mode is still on — the
+        // sessions are what's suppressed), so this extra is what
+        // distinguishes "listening" from "held off by noise".
+        i.putExtra(EXTRA_GATE_STATE,
+                gateState == GATE_KILLED
+                        ? (noiseHoldActive ? "noise_hold" : "killed")
+                        : "ambient");
         sendAppBroadcast(i);
+        refreshMediaSessionActive();
     }
 
     private long getLastTs() {

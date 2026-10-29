@@ -27,6 +27,11 @@ import android.view.KeyEvent;
 public class EarbudButtonReceiver extends BroadcastReceiver {
 
     public static final String EXTRA_EARBUD_ACTION = "earbud_action";
+    // Nick 2026-10-28 v1.52: delivery-path tag ("broadcast" here,
+    // "session" from the MediaSession callback). VoiceService uses it
+    // to tell one physical press arriving via both paths apart from
+    // two real presses (the §6 double-tap-while-paused rule).
+    public static final String EXTRA_EARBUD_SOURCE = "earbud_source";
 
     @Override
     public void onReceive(Context context, Intent intent) {
@@ -64,6 +69,7 @@ public class EarbudButtonReceiver extends BroadcastReceiver {
         Intent forward = new Intent(context, VoiceService.class);
         forward.setAction("EARBUD_TAP");
         forward.putExtra(EXTRA_EARBUD_ACTION, action);
+        forward.putExtra(EXTRA_EARBUD_SOURCE, "broadcast");
         try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                 context.startForegroundService(forward);
