@@ -4959,12 +4959,14 @@ public class VoiceService extends Service
     // v1.66 refinement (Nick 2026-10-29 15:08): the FULL notice
     // plays once per episode; later failures in the same episode
     // get only a short confirmation, alternating the two bundled
-    // clips. The once-flag resets ONLY on a STEADY connection
-    // (STEADY_RESET_MS of continuous connectivity) — a flapping
-    // network does not earn a fresh full notice.
+    // clips. Timing (15:11): ONE steady-connection window —
+    // STEADY_CONNECTION_MS of continuous connectivity — gates
+    // BOTH the reconnect announcement and the once-flag reset.
+    // A flicker shorter than the window counts as neither; the
+    // episode continues.
     private volatile boolean shortConfirmAlt = false;
     private volatile long steadyResetGen = 0;
-    private static final long STEADY_RESET_MS = 20_000;
+    private static final long STEADY_CONNECTION_MS = 7_000;
 
     private void onDictationPostFailed(String text) {
         handler.post(() -> {
@@ -4991,7 +4993,7 @@ public class VoiceService extends Service
 
     private void onDictationPostSucceeded() {
         if (!offlineEpisodeActive) return;
-        handler.post(this::maybeAnnounceReconnected);
+        handler.post(this::armSteadyReset);
     }
 
     /** Stack into the text box's persisted content, in spoken
@@ -5024,40 +5026,33 @@ public class VoiceService extends Service
         }
     }
 
-    /** Reconnect announcement: only when an offline episode left
-     *  held dictations waiting (the announcement is the prompt
-     *  that they can now be sent — manually). Ends the episode's
-     *  announcement half; the FULL-notice once-flag is NOT reset
-     *  here — that waits for a steady connection (v1.66, 15:08). */
-    private void maybeAnnounceReconnected() {
-        if (offlineEpisodeActive) {
-            offlineEpisodeActive = false;
-            if (heldTextWaiting()) {
-                playBundledFallback("fallback/reconnected.mp3",
-                        "reconnected-notice.mp3");
-                log("offline: service reconnected — announcement played "
-                        + "(text waiting in the box)");
-            }
-        }
-        armSteadyReset();
-    }
-
-    /** Arm the steady-connection reset: after STEADY_RESET_MS of
-     *  continuous connectivity, the episode fully closes and the
-     *  next offline episode earns one fresh full notice. A network
-     *  loss invalidates the pending reset (see onNetworkLost). */
+    /** The steady-connection gate (Nick 2026-10-29 15:11): armed
+     *  on any sign of return (a succeeding post, the network
+     *  callback); after STEADY_CONNECTION_MS of CONTINUOUS
+     *  connectivity it fires BOTH gated behaviors — (a) the
+     *  reconnect announcement, only when held text is waiting,
+     *  and (b) the once-flag reset, so the next episode earns a
+     *  fresh full notice. A loss inside the window invalidates
+     *  the pending gate (onNetworkLost bumps the generation) and
+     *  the episode continues untouched. */
     private void armSteadyReset() {
         final long gen = ++steadyResetGen;
         handler.postDelayed(() -> {
             if (gen != steadyResetGen) return;
             if (!isNetworkAvailableNow()) return;
+            if (offlineEpisodeActive && heldTextWaiting()) {
+                playBundledFallback("fallback/reconnected.mp3",
+                        "reconnected-notice.mp3");
+                log("offline: steady connection — reconnect "
+                        + "announcement played (text waiting)");
+            }
             if (offlineNoticePlayed) {
                 log("offline: steady connection — episode closed; "
                         + "full notice re-armed");
             }
-            offlineNoticePlayed = false;
             offlineEpisodeActive = false;
-        }, STEADY_RESET_MS);
+            offlineNoticePlayed = false;
+        }, STEADY_CONNECTION_MS);
     }
 
     private boolean isNetworkAvailableNow() {
@@ -5112,7 +5107,7 @@ public class VoiceService extends Service
 
     /** OfflineNetworkCallback: a network came up. */
     public void onNetworkAvailable() {
-        handler.post(this::maybeAnnounceReconnected);
+        handler.post(this::armSteadyReset);
     }
 
     /** OfflineNetworkCallback: the default network went away. */
