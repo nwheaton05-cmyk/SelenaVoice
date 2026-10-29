@@ -307,6 +307,43 @@
             android:checked="false" />
     </LinearLayout>
 
+    <!-- Text box (Nick 2026-10-29 v1.65, offline workflow): the
+         stacking/holding field. Dictations that can't be delivered
+         (offline) stack here in spoken order; typed text lives here
+         too; the Send button is the ONLY way held text leaves —
+         manual send, never auto-delivered. -->
+    <TextView
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="Text box"
+        android:textSize="16sp"
+        android:textStyle="bold"
+        android:textColor="@color/selena_dark"
+        android:paddingTop="8dp"
+        android:paddingBottom="4dp" />
+
+    <EditText
+        android:id="@+id/heldTextBox"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:minLines="2"
+        android:gravity="top|start"
+        android:hint="Type here — or dictations stack here while you're offline"
+        android:textSize="15sp"
+        android:background="#FFFFFF"
+        android:padding="10dp"
+        android:inputType="textMultiLine|textCapSentences" />
+
+    <Button
+        android:id="@+id/heldSendButton"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="end"
+        android:text="Send"
+        android:textSize="15sp"
+        android:layout_marginTop="4dp"
+        android:layout_marginBottom="10dp" />
+
     <!-- Message log -->
     <TextView
         android:layout_width="match_parent"

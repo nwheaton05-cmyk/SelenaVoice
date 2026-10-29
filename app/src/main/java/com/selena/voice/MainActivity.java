@@ -84,6 +84,19 @@ public class MainActivity extends Activity {
     private Button deleteKeyButton;
     private Button voiceprintButton;
     private Button machinesButton;
+    // v1.65 (2026-10-29): the text box (offline workflow). The field
+    // mirrors the PREF_HELD_TEXT preference the service stacks into;
+    // the activity is the field's editor + manual sender.
+    private android.widget.EditText heldTextBox;
+    private android.content.SharedPreferences heldPrefs;
+    private boolean heldBoxSelfWrite = false;
+    private final android.content.SharedPreferences.OnSharedPreferenceChangeListener
+            heldListener = (prefs, key) -> {
+                if (VoiceService.PREF_HELD_TEXT.equals(key)
+                        && !heldBoxSelfWrite) {
+                    runOnUiThread(this::refreshHeldTextBox);
+                }
+            };
 
     // Nick 2026-10-22 v1.33: in-app auto-updater banner. Hidden until the
     // version check finds a newer APK; tap downloads + installs it.
@@ -384,6 +397,14 @@ public class MainActivity extends Activity {
         machinesButton.setEnabled(true);
         machinesButton.setOnClickListener(v -> showMachinesDialog());
         refreshSignInButton();
+
+        // v1.65: text box wiring (offline workflow).
+        heldPrefs = getSharedPreferences(VoiceService.PREFS, MODE_PRIVATE);
+        heldTextBox = findViewById(R.id.heldTextBox);
+        Button heldSendButton = findViewById(R.id.heldSendButton);
+        refreshHeldTextBox();
+        heldPrefs.registerOnSharedPreferenceChangeListener(heldListener);
+        heldSendButton.setOnClickListener(v -> sendHeldText());
 
         // Nick 2026-10-22 v1.33: in-app auto-updater. Hidden until the
         // version check finds a newer APK — v1.33 is the last manual
@@ -1079,6 +1100,7 @@ public class MainActivity extends Activity {
         // service was in manual-listen mode, pick up the real state.
         manualMicOn = VoiceService.isManualListening();
         updateMicButton();
+        refreshHeldTextBox(); // v1.65: pick up anything stacked while away
         // Nick 2026-10-23 v1.46: recreate the dictation popup if a manual
         // session was already running (the service's sentence buffer and
         // partials will refill it).
@@ -1100,10 +1122,117 @@ public class MainActivity extends Activity {
     @Override
     protected void onPause() {
         super.onPause();
+        persistHeldTextBox(); // v1.65: the user's edits are the field truth
         // Nick 2026-10-23 v1.46: popup is activity-scoped — take it down
         // to avoid a window leak. Re-shown on resume if still listening.
         dismissDictationPopup();
         try { unregisterReceiver(receiver); } catch (Exception ignored) {}
+    }
+
+    // ------------------------------------------------------------ v1.65 text box
+
+    /** Mirror the persisted held text into the field (no-op when
+     *  already in sync, so typing is never clobbered by our own
+     *  writes). */
+    private void refreshHeldTextBox() {
+        if (heldTextBox == null || heldPrefs == null) return;
+        String held = heldPrefs.getString(VoiceService.PREF_HELD_TEXT, "");
+        if (held == null) held = "";
+        if (!held.equals(heldTextBox.getText().toString())) {
+            heldTextBox.setText(held);
+            try {
+                heldTextBox.setSelection(held.length());
+            } catch (Exception ignored) {}
+        }
+    }
+
+    /** Persist the field's current content (edits and clears are
+     *  authoritative — the reconnect announcement keys off this). */
+    private void persistHeldTextBox() {
+        if (heldTextBox == null || heldPrefs == null) return;
+        String cur = heldTextBox.getText().toString();
+        String held = heldPrefs.getString(VoiceService.PREF_HELD_TEXT, "");
+        if (held == null) held = "";
+        if (!cur.equals(held)) {
+            heldBoxSelfWrite = true;
+            try {
+                if (cur.trim().isEmpty()) {
+                    heldPrefs.edit().remove(VoiceService.PREF_HELD_TEXT).apply();
+                } else {
+                    heldPrefs.edit()
+                            .putString(VoiceService.PREF_HELD_TEXT, cur).apply();
+                }
+            } finally {
+                heldBoxSelfWrite = false;
+            }
+        }
+    }
+
+    /**
+     * The manual send — the ONLY way text leaves the box
+     * (2026-10-29 disposition rule: no auto-delivery, ever). Sends
+     * the field's whole content as one input post, mirroring
+     * VoiceService.doPostInput's wire shape. Success clears the box;
+     * failure keeps everything held and says so.
+     */
+    private void sendHeldText() {
+        if (heldTextBox == null) return;
+        final String text = heldTextBox.getText().toString().trim();
+        if (text.isEmpty()) {
+            android.widget.Toast.makeText(this, "The text box is empty",
+                    android.widget.Toast.LENGTH_SHORT).show();
+            return;
+        }
+        new Thread(() -> {
+            boolean ok = false;
+            java.net.HttpURLConnection conn = null;
+            try {
+                java.net.URL url = new java.net.URL(
+                        VoiceService.BASE_URL + "/api/selena-voice/input");
+                conn = (java.net.HttpURLConnection) url.openConnection();
+                conn.setRequestMethod("POST");
+                conn.setRequestProperty("Content-Type", "application/json");
+                conn.setConnectTimeout(8000);
+                conn.setReadTimeout(8000);
+                conn.setDoOutput(true);
+                org.json.JSONObject body = new org.json.JSONObject();
+                body.put("text", text);
+                body.put("timestamp", System.currentTimeMillis());
+                java.io.OutputStream os = conn.getOutputStream();
+                try {
+                    os.write(body.toString().getBytes("UTF-8"));
+                } finally {
+                    try { os.close(); } catch (Exception ignored) {}
+                }
+                int code = conn.getResponseCode();
+                ok = code == 200 || code == 201;
+            } catch (Exception e) {
+                ok = false;
+            } finally {
+                if (conn != null) conn.disconnect();
+            }
+            final boolean sent = ok;
+            runOnUiThread(() -> {
+                if (sent) {
+                    MessageHistory.addNick(text);
+                    heldBoxSelfWrite = true;
+                    try {
+                        heldPrefs.edit()
+                                .remove(VoiceService.PREF_HELD_TEXT).apply();
+                    } finally {
+                        heldBoxSelfWrite = false;
+                    }
+                    heldTextBox.setText("");
+                    android.widget.Toast.makeText(this, "Sent",
+                            android.widget.Toast.LENGTH_SHORT).show();
+                } else {
+                    persistHeldTextBox();
+                    android.widget.Toast.makeText(this,
+                            "Still offline — your words stay in the text box",
+                            android.widget.Toast.LENGTH_LONG).show();
+                }
+            });
+        }).start();
     }
 
     // ------------------------------------------------------------ UI helpers

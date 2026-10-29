@@ -121,7 +121,12 @@ public class VoiceService extends Service
     // (in-progress) transcription, broadcast for the dictation popup.
     public static final String ACTION_PARTIAL_INPUT = "com.selena.voice.PARTIAL_INPUT";
 
-    private static final String PREFS = "selena_voice";
+    static final String PREFS = "selena_voice";
+    /** v1.65: the text box's persisted content (offline workflow) —
+     *  shared between the service (stacking) and MainActivity (the
+     *  field itself). One string; dictations stack newline-joined,
+     *  in spoken order. */
+    static final String PREF_HELD_TEXT = "held_text_box";
     private static final String KEY_LAST_TS = "last_ts";
     private static final String KEY_ALWAYS_ON = "always_listening";
     // Nick 2026-10-18 v1.11: voice mode lives in SharedPreferences so the
@@ -149,7 +154,7 @@ public class VoiceService extends Service
 
     // v1.50 (2026-10-26, OVH batch): owned-domain addresses replace
     // the DuckDNS bridge names (same OVH server, permanent names).
-    private static final String BASE_URL = "https://siteviewoperations.com";
+    static final String BASE_URL = "https://siteviewoperations.com";
     // Nick 2026-10-18 v1.14: Supabase Realtime push (LEG 1).
     // v1.50: the anon key is now ONLY the gateway/apikey value — the
     // queue's anon SELECT policy was removed 2026-10-26, so Realtime
@@ -666,6 +671,7 @@ public class VoiceService extends Service
     @Override
     public void onCreate() {
         super.onCreate();
+        registerOfflineWatcher(); // v1.65: reconnect announcements
         // FOREGROUND FIRST (Nick 2026-10-23): Android 12+ kills the service
         // with ForegroundServiceDidNotStartInTimeException if startForeground()
         // doesn't land within seconds of startForegroundService(). Everything
@@ -890,6 +896,15 @@ public class VoiceService extends Service
     @Override
     public void onDestroy() {
         destroyed = true;
+        if (offlineNetCallback != null) {
+            try {
+                android.net.ConnectivityManager cm =
+                        (android.net.ConnectivityManager)
+                                getSystemService(CONNECTIVITY_SERVICE);
+                if (cm != null) cm.unregisterNetworkCallback(offlineNetCallback);
+            } catch (Exception ignored) {}
+            offlineNetCallback = null;
+        }
         stopRealtime();
         stopPolling();
         heartbeating = false;
@@ -4911,14 +4926,143 @@ public class VoiceService extends Service
             log("input posted (" + code + "): " + text
                     + (speakerName != null
                             ? " [speaker: guest '" + speakerName + "']" : ""));
+            if (code == 200 || code == 201) onDictationPostSucceeded();
             // Nick 2026-10-18 v1.9: the INPUT_SENT broadcast now fires in
             // onVoiceInput() before the POST, so the log is instant even
             // when the network is down. Nothing to broadcast here anymore.
         } catch (Exception e) {
             Log.w(TAG, "postInput failed", e);
+            onDictationPostFailed(text);
         } finally {
             if (conn != null) conn.disconnect();
         }
+    }
+
+    // ------------------------------------------------------------ v1.65 offline dictation (2026-10-29)
+
+    // Nick 2026-10-29 (14:52–14:56 rulings): when a dictation's
+    // delivery fails because the device is offline —
+    //  1. A PRE-RENDERED clip in Selena's voice plays (bundled asset
+    //     fallback/offline.mp3 — a server render is impossible
+    //     offline): apology + "send it when you're back" + the news
+    //     that the words are held. Once per offline episode.
+    //  2. The dictated text is NOT auto-delivered, ever: it STACKS,
+    //     in spoken order, in an on-device held list (the app's text
+    //     surface), and the USER manually resends when service is
+    //     back. The auto-delivery outbox shape was rejected.
+    //  3. When service reconnects AND held dictations are waiting,
+    //     a second pre-rendered clip announces it by name
+    //     (fallback/reconnected.mp3) — the send itself stays manual.
+    private volatile boolean offlineNoticePlayed = false;
+    private volatile boolean offlineEpisodeActive = false;
+    private android.net.ConnectivityManager.NetworkCallback offlineNetCallback;
+
+    private void onDictationPostFailed(String text) {
+        handler.post(() -> {
+            stackUnsentDictation(text);
+            offlineEpisodeActive = true;
+            if (!offlineNoticePlayed) {
+                offlineNoticePlayed = true;
+                playBundledFallback("fallback/offline.mp3",
+                        "offline-notice.mp3");
+                log("offline: dictation held + fallback clip played");
+            } else {
+                log("offline: dictation stacked (notice already played "
+                        + "this episode)");
+            }
+        });
+    }
+
+    private void onDictationPostSucceeded() {
+        if (!offlineEpisodeActive) return;
+        handler.post(this::maybeAnnounceReconnected);
+    }
+
+    /** Stack into the text box's persisted content, in spoken
+     *  order (newline-joined). NEVER auto-sent — the field is the
+     *  user's to send manually (14:53/14:54 rulings). MainActivity's
+     *  text box reads/writes the same preference. */
+    private void stackUnsentDictation(String text) {
+        try {
+            android.content.SharedPreferences prefs =
+                    getSharedPreferences(PREFS, MODE_PRIVATE);
+            String cur = prefs.getString(PREF_HELD_TEXT, "");
+            String next = (cur == null || cur.trim().isEmpty())
+                    ? text : cur + "\n" + text;
+            prefs.edit().putString(PREF_HELD_TEXT, next).apply();
+            log("offline: text box now holds "
+                    + next.split("\n").length
+                    + " stacked dictation(s) for manual send");
+        } catch (Exception e) {
+            Log.w(TAG, "offline: stack failed", e);
+        }
+    }
+
+    private boolean heldTextWaiting() {
+        try {
+            String cur = getSharedPreferences(PREFS, MODE_PRIVATE)
+                    .getString(PREF_HELD_TEXT, "");
+            return cur != null && !cur.trim().isEmpty();
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    /** Reconnect announcement: only when an offline episode left
+     *  held dictations waiting (the announcement is the prompt that
+     *  they can now be sent — manually). Resets the episode. */
+    private void maybeAnnounceReconnected() {
+        if (!offlineEpisodeActive) return;
+        offlineEpisodeActive = false;
+        offlineNoticePlayed = false;
+        if (heldTextWaiting()) {
+            playBundledFallback("fallback/reconnected.mp3",
+                    "reconnected-notice.mp3");
+            log("offline: service reconnected — announcement played "
+                    + "(text waiting in the box)");
+        }
+    }
+
+    /** Play a bundled pre-rendered clip through the normal audio
+     *  queue (her player, her gain, no stream writes). */
+    private void playBundledFallback(String assetPath, String cacheName) {
+        try {
+            File out = new File(getCacheDir(), cacheName);
+            try (java.io.InputStream in = getAssets().open(assetPath);
+                 java.io.FileOutputStream fos = new java.io.FileOutputStream(out)) {
+                byte[] buf = new byte[8192];
+                int n;
+                while ((n = in.read(buf)) > 0) fos.write(buf, 0, n);
+            }
+            enqueueAudio(out);
+        } catch (Exception e) {
+            Log.w(TAG, "offline: fallback clip failed: " + assetPath, e);
+        }
+    }
+
+    /** Watch connectivity so the reconnect announcement can fire
+     *  even if no new dictation proves the network is back first. */
+    private void registerOfflineWatcher() {
+        try {
+            android.net.ConnectivityManager cm =
+                    (android.net.ConnectivityManager)
+                            getSystemService(CONNECTIVITY_SERVICE);
+            if (cm == null) return;
+            offlineNetCallback = new OfflineNetworkCallback(this);
+            cm.registerDefaultNetworkCallback(offlineNetCallback);
+        } catch (Exception e) {
+            Log.w(TAG, "offline: watcher registration failed", e);
+        }
+    }
+
+    /** OfflineNetworkCallback: a network came up. */
+    public void onNetworkAvailable() {
+        handler.post(this::maybeAnnounceReconnected);
+    }
+
+    /** OfflineNetworkCallback: the default network went away. */
+    public void onNetworkLost() {
+        offlineEpisodeActive = true;
     }
 
     // ------------------------------------------------------------ v1.52 gate machinery
