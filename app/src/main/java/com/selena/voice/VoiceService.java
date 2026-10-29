@@ -442,6 +442,54 @@ public class VoiceService extends Service
     private static final float GATE_PROBE_BURST_PEAK_DB = 5.0f; // burst peak above drone baseline
     private static final long NOISE_HOLD_SEND_MS = 60000;      // spec §3: 60s noise clock
 
+    // Nick 2026-10-29 v1.70 — ADAPTIVE AMBIENT GATE (his 13:11
+    // calibration ruling, ordered built 16:00: "the ambient noise
+    // threshold [should be] dialed up or down depending on the
+    // variations of ambient noise throughout the day"). The fixed
+    // GATE_LOUD_DB line is retired as the primary test. Instead
+    // the gate continuously learns the environment's AMBIENT
+    // BASELINE (recognizer scale, like the sampler stats it feeds
+    // on) from steady-or-quiet windows during non-speech periods,
+    // and the kill line floats as a MARGIN over that baseline:
+    //     kill line = clamp(baseline + GATE_KILL_MARGIN_DB,
+    //                       GATE_KILL_LINE_MIN_DB, GATE_KILL_LINE_MAX_DB)
+    // Quiet morning → the line sits low and the gate is keen. Road
+    // noise / a loud shop → the baseline (and the line) rise with
+    // the day, so ordinary loud surroundings stop reading as a
+    // kill-worthy drone — while speech, which is unsteady by
+    // nature, still bursts through the steadiness test untouched.
+    // The hard floor/ceiling keep two failure shapes impossible:
+    // a silent room can't make a whisper "too loud" (line floor),
+    // and a loud workplace can't teach the gate that a shout is
+    // ambient (line ceiling + baseline ceiling). The baseline
+    // persists across restarts (decaying toward the default when
+    // stale), so a cold start begins at EXACTLY the pre-v1.70 line
+    // (default −27 + margin 18 = −9 = old GATE_LOUD_DB) and
+    // converges on the real room within ~30 s of steady sound.
+    // Principle preserved: fail open for the user, closed for
+    // noise; the manual override still forces a session.
+    private static final float GATE_KILL_MARGIN_DB = 18.0f;
+    private static final float GATE_BASELINE_DEFAULT_DB = -27.0f;
+    private static final float GATE_BASELINE_MIN_DB = -42.0f;
+    private static final float GATE_BASELINE_MAX_DB = -15.0f;
+    private static final float GATE_KILL_LINE_MIN_DB = -21.0f;
+    private static final float GATE_KILL_LINE_MAX_DB = -3.0f;
+    // A window may teach the baseline when it is steady (at or
+    // under this variation) or plainly quieter than the baseline;
+    // speech fails both tests, so his voice never teaches it.
+    private static final float GATE_AMBIENT_LEARN_STD_DB = 2.2f;
+    private static final float GATE_AMBIENT_ALPHA = 0.02f;     // per eligible 250 ms tick (~12 s TC)
+    private static final float GATE_AMBIENT_MAX_STEP_DB = 0.1f; // per-tick clamp — the day drifts, it never jumps
+    private static final long GATE_AMBIENT_SPEECH_TAIL_MS = 1500;
+    private static final long GATE_BASELINE_STALE_MS = 6 * 3600_000L;
+    private static final String PREF_GATE_BASELINE = "gate_ambient_baseline_db";
+    private static final String PREF_GATE_BASELINE_MS = "gate_ambient_baseline_ms";
+    private float gateAmbientBaselineDb = GATE_BASELINE_DEFAULT_DB;
+    private long gateAmbientLastSpeechMs = 0;
+    private int gateAmbientSaveTicks = 0;
+    private float gateAmbientLastSaved = Float.NaN;
+    private long gateBaselineLogMs = 0;
+
     // Nick 2026-10-28 v1.53: learned voiceprint (Phase 4, spec §5).
     // The store/profiles live in Voiceprint; the service owns the one
     // live instance and feeds it from the acceptance path only. The
@@ -724,6 +772,9 @@ public class VoiceService extends Service
         }
         // Nick 2026-10-28 v1.52: noise-gate watchdog (250ms tick,
         // near-free when nothing is being listened to).
+        // v1.70: restore the learned ambient baseline first, so the
+        // adaptive kill line starts from the room's history.
+        loadGateBaseline();
         startGateWatchdog();
         // Nick 2026-10-29 v1.60: wake word spotter loads async; when
         // it's ready it takes over the idle mic (see onWakeSpotterReady
@@ -1689,6 +1740,18 @@ public class VoiceService extends Service
     // routing — the wrong semantic for media playback.
     @SuppressWarnings("deprecation")
     private void playFileNow(File f) {
+        // Nick 2026-10-29 v1.70: playback starting is the holding
+        // note's master cancel — her answer (or any of her clips)
+        // beginning retires a pending note, and a note file that
+        // somehow queued behind this file is dropped, never played
+        // late. The note's OWN file starting just disarms quietly:
+        // it fired, that's the end of its lifecycle.
+        if (HOLDING_NOTE_CACHE.equals(f.getName())) {
+            cancelHoldingNoteTask();
+        } else {
+            purgeQueuedHoldingNote();
+            cancelHoldingNote("playback started");
+        }
         try {
             // Nick 2026-10-18 v1.7: THE SILENT-PLAYBACK FIX. v1.5/v1.6 used
             // USAGE_VOICE_COMMUNICATION, which Android routes to the
@@ -2272,6 +2335,12 @@ public class VoiceService extends Service
     /** Runs on main thread: speak text with Android's built-in TTS. */
     @SuppressWarnings("deprecation") // setSpeakerphoneOn, see playFileNow
     private void speakOnDevice(String text, boolean isResume) {
+        // v1.70: device-TTS speech starting is answer/local speech —
+        // a pending holding note retires (see playFileNow).
+        if (!isResume) {
+            purgeQueuedHoldingNote();
+            cancelHoldingNote("local speech started");
+        }
         if (tts == null || !ttsReady) {
             log("tts: on-device not ready, dropping text");
             onTtsDone();
@@ -2917,6 +2986,7 @@ public class VoiceService extends Service
      * place, per the v1.34 rule). Runs on the main thread.
      */
     private void stopAllPlayback() {
+        cancelHoldingNote("stopped");
         // v1.56: report the stop to the brain FIRST — stopCurrentPlayback
         // clears the interrupt stack the report reads (delete-once-heard).
         reportPlaybackStopped();
@@ -3941,6 +4011,7 @@ public class VoiceService extends Service
             return;
         }
         wakeConvoOpen = false;
+        cancelHoldingNote("conversation closed");
         log("wakeword: conversation window closed (2m idle) — spotter resuming");
         if (isAlwaysListening() && !destroyed && gateState != GATE_KILLED
                 && recognizerActive) {
@@ -4444,6 +4515,9 @@ public class VoiceService extends Service
         // Nick 2026-10-23 v1.46: polite interruption — Nick started
         // talking; Selena holds any pending playback until his pause.
         nickSpeaking = true;
+        // v1.70: he's dictating again — a pending holding note must
+        // never talk over him.
+        cancelHoldingNote("user dictating");
         // Nick 2026-10-29 v1.59 (ducking rule): real capture started —
         // fade other audio down for the dictation.
         acquireDictationDuck();
@@ -4674,7 +4748,7 @@ public class VoiceService extends Service
                 cls = Voiceprint.CLS_OVER_NOISE;
             } else {
                 float[] s = recognitionListener.samplerStats();
-                cls = (s[3] >= 1f && s[0] < GATE_LOUD_DB - 4f)
+                cls = (s[3] >= 1f && s[0] < gateKillLineDb() - 4f)
                         ? Voiceprint.CLS_CLEAN : Voiceprint.CLS_NORMAL;
             }
             // Nick 2026-10-29 v1.62 new-voice attribution — BEFORE
@@ -4858,7 +4932,7 @@ public class VoiceService extends Service
                     postGuestDirective("guest_speaking", spk, null, toPost);
                 }
                 new Thread(new InputPostTask(this, toPost, false, spk,
-                        snapshotInterruption(toPost))).start();
+                        snapshotInterruption(toPost), spk == null)).start();
                 noteWakeConversationActivity();
             }
         }
@@ -5062,6 +5136,15 @@ public class VoiceService extends Service
      *  playing/paused message. */
     public void doPostInput(String text, boolean possiblyCutOff,
                             String speakerName, String interruptJson) {
+        doPostInput(text, possiblyCutOff, speakerName, interruptJson, false);
+    }
+
+    /** v1.70: expectAnswer (see InputPostTask) — a successful post
+     *  of one of Nick's own conversational dictations arms the
+     *  automatic holding note (armHoldingNote). */
+    public void doPostInput(String text, boolean possiblyCutOff,
+                            String speakerName, String interruptJson,
+                            boolean expectAnswer) {
         HttpURLConnection conn = null;
         try {
             URL url = new URL(BASE_URL + "/api/selena-voice/input");
@@ -5093,7 +5176,14 @@ public class VoiceService extends Service
             log("input posted (" + code + "): " + text
                     + (speakerName != null
                             ? " [speaker: guest '" + speakerName + "']" : ""));
-            if (code == 200 || code == 201) onDictationPostSucceeded();
+            if (code == 200 || code == 201) {
+                onDictationPostSucceeded();
+                // Nick 2026-10-29 v1.70: the automatic holding note
+                // arms HERE — on proven delivery of one of his own
+                // dictations — never at dispatch (a failed post is
+                // the offline flow's story, not a waiting story).
+                if (expectAnswer) armHoldingNote();
+            }
             // Nick 2026-10-18 v1.9: the INPUT_SENT broadcast now fires in
             // onVoiceInput() before the POST, so the log is instant even
             // when the network is down. Nothing to broadcast here anymore.
@@ -5253,7 +5343,7 @@ public class VoiceService extends Service
             }
             enqueueAudio(out);
         } catch (Exception e) {
-            Log.w(TAG, "offline: fallback clip failed: " + assetPath, e);
+            Log.w(TAG, "clips: bundled clip failed: " + assetPath, e);
         }
     }
 
@@ -5283,6 +5373,115 @@ public class VoiceService extends Service
         offlineEpisodeActive = true;
     }
 
+    // ------------------------------------------------------------ v1.70 automatic holding note
+
+    // Nick 2026-10-29 15:59: "It should just be automatic from
+    // Selena Voice. You shouldn't have to cue it." The parity
+    // batch's Item 3 put the trigger in the responder's hands (a
+    // helper to run when filing research); at 15:55 his questions
+    // waited ~4 minutes with no note at all, because nobody ran
+    // it. The guarantee now lives HERE, in the app, where it can't
+    // be forgotten:
+    //   - A successful post of one of Nick's own dictations (the
+    //     expectAnswer flag — not fast-lane, not offline-held, not
+    //     guest flows) arms a grace timer.
+    //   - If no answer playback has begun when it expires, the app
+    //     plays the next clip from the LOCALLY BUNDLED rotating
+    //     library (assets/holding/, the same 12 pre-rendered clips
+    //     as the bucket library — a note that waits on a render or
+    //     a download defeats its purpose). The clip promises
+    //     investigation only; the real answer follows as always.
+    //   - The timer dies the moment any of her speech starts
+    //     (queue MP3 or device TTS), on stop/interruption, when
+    //     Nick starts dictating again, and at conversation end.
+    //     Once per dictation: a fresh post re-arms, a fired or
+    //     cancelled note never replays for the same dictation.
+    // The responder helper (~/workspace/bin/selena-holding-note)
+    // still exists as an optional extra on top of this floor.
+    // Nick 2026-10-29 16:04: the grace is 1–2 s — "relatively
+    // immediately." Long enough for a fast answer to beat the
+    // note, short enough that a slow one never feels like silence.
+    private static final long HOLDING_NOTE_GRACE_MS = 1500;
+    private static final int HOLDING_NOTE_COUNT = 12;
+    private static final String PREF_HOLDING_NOTE_IDX = "holding_note_next_idx";
+    private static final String HOLDING_NOTE_CACHE = "holding-note-auto.mp3";
+    private Runnable holdingNoteTask = null;
+    private volatile boolean holdingNoteArmed = false;
+
+    /** Runs on the posting thread (doPostInput success) — hops to
+     *  the main handler, where all timer state lives. */
+    private void armHoldingNote() {
+        handler.post(() -> {
+            cancelHoldingNoteTask();
+            holdingNoteArmed = true;
+            holdingNoteTask = this::fireHoldingNote;
+            handler.postDelayed(holdingNoteTask, HOLDING_NOTE_GRACE_MS);
+            log("holdingnote: armed (" + HOLDING_NOTE_GRACE_MS + " ms grace)");
+        });
+    }
+
+    private void cancelHoldingNoteTask() {
+        if (holdingNoteTask != null) {
+            handler.removeCallbacks(holdingNoteTask);
+            holdingNoteTask = null;
+        }
+        holdingNoteArmed = false;
+    }
+
+    /** Retire a pending note (no-op when none is pending). */
+    private void cancelHoldingNote(String reason) {
+        if (!holdingNoteArmed && holdingNoteTask == null) return;
+        handler.post(() -> {
+            if (!holdingNoteArmed && holdingNoteTask == null) return;
+            cancelHoldingNoteTask();
+            log("holdingnote: cancelled (" + reason + ")");
+        });
+    }
+
+    /** Drop a fired-but-still-queued note file: her real answer is
+     *  starting, and a stale "hold on" must never play after it. */
+    private void purgeQueuedHoldingNote() {
+        synchronized (audioQueue) {
+            audioQueue.removeIf(
+                    f -> HOLDING_NOTE_CACHE.equals(f.getName()));
+        }
+    }
+
+    private void fireHoldingNote() {
+        holdingNoteTask = null;
+        if (!holdingNoteArmed || destroyed) return;
+        holdingNoteArmed = false;
+        // The moment has passed if anything is already on its way
+        // to his ears, if he's talking again, or if the polite gate
+        // would only park the note behind his pause to go stale.
+        if (isPlayingAudio() || nickSpeaking || politeHoldActive()) {
+            log("holdingnote: skipped at fire time (speech/playback active)");
+            return;
+        }
+        synchronized (audioQueue) {
+            if (!audioQueue.isEmpty()) {
+                log("holdingnote: skipped at fire time (answer already queued)");
+                return;
+            }
+        }
+        int idx;
+        try {
+            android.content.SharedPreferences prefs =
+                    getSharedPreferences(PREFS, MODE_PRIVATE);
+            idx = prefs.getInt(PREF_HOLDING_NOTE_IDX, 0);
+            if (idx < 0 || idx >= HOLDING_NOTE_COUNT) idx = 0;
+            prefs.edit().putInt(PREF_HOLDING_NOTE_IDX,
+                    (idx + 1) % HOLDING_NOTE_COUNT).apply();
+        } catch (Exception e) {
+            idx = 0;
+        }
+        String asset = "holding/holding-note-"
+                + (idx + 1 < 10 ? "0" : "") + (idx + 1) + ".mp3";
+        playBundledFallback(asset, HOLDING_NOTE_CACHE);
+        log("holdingnote: played clip " + (idx + 1) + " after "
+                + HOLDING_NOTE_GRACE_MS + "ms (no answer yet)");
+    }
+
     // ------------------------------------------------------------ v1.52 gate machinery
 
     private long gateNow() {
@@ -5301,16 +5500,123 @@ public class VoiceService extends Service
 
     /**
      * True when the recognizer's live RMS window reads as machine
-     * drone: loud (mean at/above GATE_LOUD_DB) AND steady (variation
-     * at/below GATE_STEADY_STD_DB) over a fresh, sufficiently long
-     * window. Speech fails the steadiness test by nature.
+     * drone: loud (mean at/above the ADAPTIVE kill line — baseline
+     * + margin, bounded; see the v1.70 constants) AND steady
+     * (variation at/below GATE_STEADY_STD_DB) over a fresh,
+     * sufficiently long window. Speech fails the steadiness test
+     * by nature.
      */
     public boolean samplerSeesDrone() {
         if (recognitionListener == null) return false;
         float[] s = recognitionListener.samplerStats();
         if (s[3] < 1f) return false;      // stale window — between sessions
         if (s[2] < 700f) return false;    // not enough signal to judge
-        return s[0] >= GATE_LOUD_DB && s[1] <= GATE_STEADY_STD_DB;
+        return s[0] >= gateKillLineDb() && s[1] <= GATE_STEADY_STD_DB;
+    }
+
+    /** The current adaptive kill line (recognizer scale). */
+    private float gateKillLineDb() {
+        float line = gateAmbientBaselineDb + GATE_KILL_MARGIN_DB;
+        if (line < GATE_KILL_LINE_MIN_DB) line = GATE_KILL_LINE_MIN_DB;
+        if (line > GATE_KILL_LINE_MAX_DB) line = GATE_KILL_LINE_MAX_DB;
+        return line;
+    }
+
+    /** Restore the persisted ambient baseline (v1.70). A fresh
+     *  value is trusted as-is; a stale one (older than
+     *  GATE_BASELINE_STALE_MS) decays halfway toward the default —
+     *  yesterday's shop shouldn't deafen this morning's kitchen,
+     *  and the default itself reproduces the pre-v1.70 line. */
+    private void loadGateBaseline() {
+        try {
+            android.content.SharedPreferences prefs =
+                    getSharedPreferences(PREFS, MODE_PRIVATE);
+            if (!prefs.contains(PREF_GATE_BASELINE)) {
+                log("gate: no stored ambient baseline — starting at default "
+                        + GATE_BASELINE_DEFAULT_DB + " dB (kill line "
+                        + gateKillLineDb() + " dB)");
+                return;
+            }
+            float stored = prefs.getFloat(PREF_GATE_BASELINE,
+                    GATE_BASELINE_DEFAULT_DB);
+            long age = System.currentTimeMillis()
+                    - prefs.getLong(PREF_GATE_BASELINE_MS, 0);
+            if (age > GATE_BASELINE_STALE_MS) {
+                stored = stored + (GATE_BASELINE_DEFAULT_DB - stored) * 0.5f;
+                log("gate: stored ambient baseline stale ("
+                        + (age / 3600000L) + "h) — decayed halfway to default");
+            }
+            if (stored < GATE_BASELINE_MIN_DB) stored = GATE_BASELINE_MIN_DB;
+            if (stored > GATE_BASELINE_MAX_DB) stored = GATE_BASELINE_MAX_DB;
+            gateAmbientBaselineDb = stored;
+            gateAmbientLastSaved = stored;
+            log(String.format(Locale.US,
+                    "gate: ambient baseline restored %.1f dB, kill line %.1f dB",
+                    gateAmbientBaselineDb, gateKillLineDb()));
+        } catch (Exception e) {
+            Log.w(TAG, "gate: baseline load failed", e);
+        }
+    }
+
+    private void saveGateBaseline() {
+        try {
+            getSharedPreferences(PREFS, MODE_PRIVATE).edit()
+                    .putFloat(PREF_GATE_BASELINE, gateAmbientBaselineDb)
+                    .putLong(PREF_GATE_BASELINE_MS,
+                            System.currentTimeMillis())
+                    .apply();
+            gateAmbientLastSaved = gateAmbientBaselineDb;
+            gateAmbientSaveTicks = 0;
+        } catch (Exception e) {
+            Log.w(TAG, "gate: baseline save failed", e);
+        }
+    }
+
+    /**
+     * Feed the ambient baseline one gate tick (v1.70). Called only
+     * in the AMBIENT state with the recognizer live and the mic not
+     * muted for playback. A tick teaches only when the window is
+     * fresh, Nick is not speaking (and hasn't for a short tail —
+     * his voice is never ambient), and nothing of hers is playing.
+     * Eligible windows must be STEADY or plainly QUIETER than the
+     * baseline; the step is EMA-smoothed and rate-clamped, so the
+     * baseline tracks the day over tens of seconds and cannot be
+     * dragged by a door slam, a shout, or a single loud second.
+     */
+    private void maybeLearnAmbientBaseline() {
+        if (recognitionListener == null || isPlayingAudio()) return;
+        if (nickSpeaking) {
+            gateAmbientLastSpeechMs = gateNow();
+            return;
+        }
+        if (gateNow() - gateAmbientLastSpeechMs
+                < GATE_AMBIENT_SPEECH_TAIL_MS) return;
+        float[] s = recognitionListener.samplerStats();
+        if (s[3] < 1f || s[2] < 700f) return; // stale / too little signal
+        boolean steady = s[1] <= GATE_AMBIENT_LEARN_STD_DB;
+        boolean quiet = s[0] < gateAmbientBaselineDb - 6f;
+        if (!steady && !quiet) return;
+        float step = (s[0] - gateAmbientBaselineDb) * GATE_AMBIENT_ALPHA;
+        if (step > GATE_AMBIENT_MAX_STEP_DB) step = GATE_AMBIENT_MAX_STEP_DB;
+        if (step < -GATE_AMBIENT_MAX_STEP_DB) step = -GATE_AMBIENT_MAX_STEP_DB;
+        gateAmbientBaselineDb += step;
+        if (gateAmbientBaselineDb < GATE_BASELINE_MIN_DB) {
+            gateAmbientBaselineDb = GATE_BASELINE_MIN_DB;
+        }
+        if (gateAmbientBaselineDb > GATE_BASELINE_MAX_DB) {
+            gateAmbientBaselineDb = GATE_BASELINE_MAX_DB;
+        }
+        if (gateNow() - gateBaselineLogMs > 20000) {
+            gateBaselineLogMs = gateNow();
+            log(String.format(Locale.US,
+                    "gate: baseline %.1f dB, kill line %.1f dB",
+                    gateAmbientBaselineDb, gateKillLineDb()));
+        }
+        if (++gateAmbientSaveTicks >= 200
+                || Math.abs(gateAmbientBaselineDb - gateAmbientLastSaved)
+                        >= 1.0f) {
+            saveGateBaseline();
+        }
     }
 
     /**
@@ -5360,6 +5666,11 @@ public class VoiceService extends Service
                 gateDroneSinceMs = 0;
                 return;
             }
+            // v1.70: every ambient tick first FEEDS the learned
+            // baseline (steady/quiet, non-speech windows only), so
+            // the drone test below judges against the room as it is
+            // today, not a line compiled for one room in October.
+            maybeLearnAmbientBaseline();
             boolean droneNow = samplerSeesDrone();
             if (droneNow) {
                 // Nick 2026-10-28 v1.53: the drone is a free NOISE
@@ -5413,10 +5724,17 @@ public class VoiceService extends Service
             }
             armNoiseHoldTimer();
             log("gate: loud steady noise — dictation PAUSED and held ("
-                    + sentenceBuffer.length() + " chars kept)");
+                    + sentenceBuffer.length() + " chars kept)"
+                    + String.format(Locale.US,
+                            " [baseline %.1f dB, kill line %.1f dB]",
+                            gateAmbientBaselineDb, gateKillLineDb()));
         } else {
-            log("gate: loud steady noise — recognizer killed, nothing recorded");
+            log("gate: loud steady noise — recognizer killed, nothing recorded"
+                    + String.format(Locale.US,
+                            " [baseline %.1f dB, kill line %.1f dB]",
+                            gateAmbientBaselineDb, gateKillLineDb()));
         }
+        saveGateBaseline();
         // Cancel the in-flight session: the "utterance" in progress is
         // the drone itself. Its error callback routes to
         // onRecognizerDone, whose restarts launchRecognizer() then
@@ -5612,8 +5930,31 @@ public class VoiceService extends Service
                     && !Float.isNaN(gateDroneBaselineDbfs)
                     && Math.abs(meanDbfs - gateDroneBaselineDbfs) < 3f
                     && (gateProbeCount < 3 || gateProbeCount % 3 == 0)) {
-                machineProfiles.matchOrCreate(this, machineUserKey(),
-                        spectrum, null);
+                boolean[] created = new boolean[1];
+                MachineProfiles.Profile mp = machineProfiles.matchOrCreate(
+                        this, machineUserKey(), spectrum, created);
+                if (mp != null) {
+                    // Nick 2026-10-29 v1.70 (13:11 ruling): a known
+                    // machine's STORED LEVEL anchors this episode —
+                    // read it before today's probe can move it, seed
+                    // the still-forming drone baseline from it, then
+                    // teach the profile today's level. Mower-on /
+                    // blades-on noise IS the baseline condition while
+                    // it runs; a recognized machine says how loud
+                    // that condition is from the first probes.
+                    double storedLevel = mp.levelDbfs;
+                    machineProfiles.noteLevel(this, machineUserKey(),
+                            mp.id, meanDbfs);
+                    if (!created[0] && gateProbeCount < 3
+                            && !Double.isNaN(storedLevel)
+                            && Math.abs((float) storedLevel
+                                    - gateDroneBaselineDbfs) > 0.5f) {
+                        gateDroneBaselineDbfs = (float) storedLevel;
+                        log("gate: machine anchor — '" + mp.name
+                                + "' stored level " + storedLevel
+                                + " dBFS seeds the drone baseline");
+                    }
+                }
                 if (droneReady && gateProbeCount >= 3
                         && tryEnterDroneMode()) {
                     return; // drone session owns the mic now

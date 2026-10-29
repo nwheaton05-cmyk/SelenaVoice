@@ -19,6 +19,12 @@ public class InputPostTask implements Runnable {
     // VoiceService.snapshotInterruption), or null when this dictation
     // interrupted nothing.
     private final String interruptJson;
+    // Nick 2026-10-29 v1.70: true only for Nick's own conversational
+    // dictations (flushSentence's normal branch) — a successful post
+    // of one of those arms the automatic holding note. Guest posts,
+    // held-sentence sends, and directive posts leave it false: those
+    // flows have their own spoken continuations.
+    private final boolean expectAnswer;
 
     public InputPostTask(VoiceService service, String text) {
         this(service, text, false);
@@ -36,15 +42,23 @@ public class InputPostTask implements Runnable {
     public InputPostTask(VoiceService service, String text,
                          boolean possiblyCutOff, String speakerName,
                          String interruptJson) {
+        this(service, text, possiblyCutOff, speakerName, interruptJson, false);
+    }
+
+    public InputPostTask(VoiceService service, String text,
+                         boolean possiblyCutOff, String speakerName,
+                         String interruptJson, boolean expectAnswer) {
         this.service = service;
         this.text = text;
         this.possiblyCutOff = possiblyCutOff;
         this.speakerName = speakerName;
         this.interruptJson = interruptJson;
+        this.expectAnswer = expectAnswer;
     }
 
     @Override
     public void run() {
-        service.doPostInput(text, possiblyCutOff, speakerName, interruptJson);
+        service.doPostInput(text, possiblyCutOff, speakerName, interruptJson,
+                expectAnswer);
     }
 }

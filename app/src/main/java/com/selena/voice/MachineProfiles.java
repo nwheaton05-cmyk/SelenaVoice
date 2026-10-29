@@ -73,6 +73,12 @@ public class MachineProfiles {
         public float[] psd;        // mean power spectrum (unnormalized)
         public double psdWeight;   // spectra folded in so far
         public double refPower;    // total power at learn conditions
+        // Nick 2026-10-29 v1.70: the machine's typical LEVEL (probe
+        // mean dBFS, EMA) — the gate's high-end anchor. Shape matching
+        // is power-normalized, so without this the library knew WHAT
+        // a machine sounds like but not HOW LOUD it runs; a matched
+        // profile now seeds the episode's drone baseline from this.
+        public double levelDbfs = Double.NaN;
         public int runs;
         public double totalSec;
         public long lastHeardMs;
@@ -179,6 +185,30 @@ public class MachineProfiles {
                 if (p.id == profileId) {
                     foldPsd(p, psd, weight);
                     s.lastActiveId = p.id;
+                    save(ctx, userKey, s);
+                    return;
+                }
+            }
+        }
+    }
+
+    /**
+     * Nick 2026-10-29 v1.70: fold one observed level (probe mean
+     * dBFS, taken while this machine was the near-baseline sound)
+     * into the profile's level anchor. First observation sets it;
+     * later ones EMA toward it slowly, so one odd run can't move
+     * the anchor. Callers pass only near-baseline samples — speech
+     * bursts over the machine must never teach its level.
+     */
+    public void noteLevel(Context ctx, String userKey, int profileId,
+                          double meanDbfs) {
+        synchronized (LOCK) {
+            Store s = load(ctx, userKey);
+            for (Profile p : s.profiles) {
+                if (p.id == profileId) {
+                    p.levelDbfs = Double.isNaN(p.levelDbfs)
+                            ? meanDbfs
+                            : p.levelDbfs * 0.75 + meanDbfs * 0.25;
                     save(ctx, userKey, s);
                     return;
                 }
@@ -349,6 +379,7 @@ public class MachineProfiles {
                     p.named = o.optBoolean("named", false);
                     p.psdWeight = o.optDouble("psdWeight", 0);
                     p.refPower = o.optDouble("refPower", 0);
+                    p.levelDbfs = o.optDouble("levelDbfs", Double.NaN);
                     p.runs = o.optInt("runs", 0);
                     p.totalSec = o.optDouble("totalSec", 0);
                     p.lastHeardMs = o.optLong("lastHeardMs", 0);
@@ -391,6 +422,9 @@ public class MachineProfiles {
                 o.put("named", p.named);
                 o.put("psdWeight", p.psdWeight);
                 o.put("refPower", p.refPower);
+                if (!Double.isNaN(p.levelDbfs)) {
+                    o.put("levelDbfs", Math.round(p.levelDbfs * 10.0) / 10.0);
+                }
                 o.put("runs", p.runs);
                 o.put("totalSec", p.totalSec);
                 o.put("lastHeardMs", p.lastHeardMs);
