@@ -1214,7 +1214,12 @@ public class MainActivity extends Activity {
             final boolean sent = ok;
             runOnUiThread(() -> {
                 if (sent) {
+                    // Nick 2026-10-29 15:19: typed sends are recorded
+                    // in the window's conversation record, in order,
+                    // alongside dictations — same MessageHistory the
+                    // dictation path writes — and rendered at once.
                     MessageHistory.addNick(text);
+                    renderHistory(true);
                     heldBoxSelfWrite = true;
                     try {
                         heldPrefs.edit()

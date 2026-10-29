@@ -44,6 +44,18 @@ import java.util.Arrays;
  * model, plus a ~1.5s ring of level measurements (dBFS) used for the
  * drone mirror in VoiceService — measurements only, same rule as the
  * voiceprint.
+ *
+ * v1.68 (Nick 2026-10-29 15:19 — ZERO-GAP WAKE HANDOFF): a 3 s
+ * rolling PCM ring (in-memory only, continuously overwritten, never
+ * written anywhere) mirrors the capture. At a spot, VoiceService can
+ * begin a HANDOFF: this capture keeps running as the SOLE mic
+ * consumer, stops feeding the KWS model, and forwards every chunk
+ * to the wake-stream ASR session, which first decodes a seed slice
+ * from the ring (the audio from the wake word's end up to the spot)
+ * and then the forwarded live chunks. No mic transfer, no recognizer
+ * cold start — speech from the instant the wake word ends is
+ * captured. The ring is the same transient-hold class as the earbud
+ * identification sample: gone the moment the handoff ends.
  */
 public class WakeWordSpotter {
     private static final String TAG = "SelenaVoice";
@@ -68,6 +80,24 @@ public class WakeWordSpotter {
     private static final int CHUNK_SAMPLES = 1600; // 100 ms per feed
     private static final long REFRACTORY_MS = 2500;
     private static final int STATS_WINDOW = 15;    // ~1.5s of chunks
+
+    // Zero-gap handoff (v1.68): 3 s rolling PCM ring + the seed
+    // lookback — the slice fed to the ASR first, ending at the spot.
+    // The lookback approximates this model's detection lag (the
+    // keyword's end sits roughly this far behind the spot moment);
+    // VoiceService strips any wake-word tail the slice may include.
+    private static final int RING_SAMPLES = 48000;      // 3.0 s
+    static final int SEED_LOOKBACK_SAMPLES = 5600;      // 350 ms
+
+    /** Live-chunk consumer during a wake handoff. */
+    public interface ChunkSink {
+        void onChunk(short[] chunk, int n);
+    }
+
+    private final short[] ring = new short[RING_SAMPLES];
+    private int ringHead = 0;   // next write index
+    private int ringCount = 0;  // valid samples (<= RING_SAMPLES)
+    private volatile ChunkSink handoffSink = null;
 
     private final VoiceService service;
     private KeywordSpotter spotter;
@@ -150,11 +180,77 @@ public class WakeWordSpotter {
         spotter = null;
     }
 
+    public boolean isHandoff() {
+        return handoffSink != null;
+    }
+
+    /**
+     * Begin a zero-gap handoff: the capture keeps running, chunks
+     * are forwarded to {@code sink} instead of the KWS model.
+     * Returns the seed slice (float samples, ending at the most
+     * recent audio, starting SEED_LOOKBACK_SAMPLES back), or null
+     * if the ring holds nothing yet.
+     */
+    public synchronized float[] beginHandoff(ChunkSink sink) {
+        if (sink == null) return null;
+        handoffSink = sink;
+        if (ringCount == 0) return new float[0];
+        int len = Math.min(ringCount, SEED_LOOKBACK_SAMPLES);
+        float[] seed = new float[len];
+        int start = (ringHead - len + RING_SAMPLES * 2) % RING_SAMPLES;
+        for (int i = 0; i < len; i++) {
+            seed[i] = ring[(start + i) % RING_SAMPLES] / 32768.0f;
+        }
+        return seed;
+    }
+
+    /** End the handoff (session over): KWS feeding resumes on the
+     *  next chunks unless the caller stops the capture outright. */
+    public synchronized void endHandoff() {
+        handoffSink = null;
+    }
+
+    private void pushRing(short[] buf, int n) {
+        synchronized (this) {
+            for (int i = 0; i < n; i++) {
+                ring[ringHead] = buf[i];
+                ringHead = (ringHead + 1) % RING_SAMPLES;
+            }
+            ringCount = Math.min(RING_SAMPLES, ringCount + n);
+        }
+    }
+
     private void captureLoop() {
         short[] buf = new short[CHUNK_SAMPLES];
         float[] samples = new float[CHUNK_SAMPLES];
         int readErrors = 0;
         while (running) {
+            if (handoffSink != null) {
+                // Zero-gap handoff: this record IS the dictation
+                // mic now. Never park, never feed the KWS model —
+                // just capture and forward.
+                if (record == null && !openRecord()) {
+                    service.onWakeSpotterFailed("handoff AudioRecord init failed");
+                    return;
+                }
+                int n;
+                try {
+                    n = record.read(buf, 0, buf.length);
+                } catch (Exception e) {
+                    n = -1;
+                }
+                if (n <= 0) {
+                    if (!running) break;
+                    sleep(20);
+                    continue;
+                }
+                pushRing(buf, n);
+                ChunkSink sink = handoffSink;
+                if (sink != null) {
+                    sink.onChunk(java.util.Arrays.copyOf(buf, n), n);
+                }
+                continue;
+            }
             if (service.wakeSpotterParked()) {
                 // The recognizer, playback, or the gate owns the mic
                 // right now: release ours and wait. Nothing is fed,
@@ -184,6 +280,7 @@ public class WakeWordSpotter {
             }
             readErrors = 0;
             pushStats(chunkDbfs(buf, n));
+            pushRing(buf, n);
             for (int i = 0; i < n; i++) samples[i] = buf[i] / 32768.0f;
             float[] feed = (n == CHUNK_SAMPLES)
                     ? samples : Arrays.copyOf(samples, n);

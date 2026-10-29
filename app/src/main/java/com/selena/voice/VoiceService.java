@@ -354,6 +354,11 @@ public class VoiceService extends Service
     private WakeWordSpotter wakeSpotter = null;
     private volatile boolean wakeSpotterReady = false;
     private volatile boolean wakeSpotterFailed = false;
+    // v1.68 zero-gap wake handoff (Nick 2026-10-29 15:19): the
+    // own-ASR session that takes the first dictation at a spot,
+    // fed by the spotter's ring seed + forwarded live chunks.
+    private WakeStreamSession wakeStream = null;
+    private volatile long wakeStreamTryAtMs = 0;
     private volatile boolean wakeConvoOpen = false;
     private volatile long wakeConvoUntilMs = 0;
     private Runnable wakeExpiryTask = null;
@@ -925,6 +930,10 @@ public class VoiceService extends Service
         if (droneSession != null) {
             droneSession.release();
             droneSession = null;
+        }
+        if (wakeStream != null) {
+            wakeStream.release();
+            wakeStream = null;
         }
         unmuteBeep();
         recognizerActive = false;
@@ -3732,6 +3741,9 @@ public class VoiceService extends Service
      */
     private void refreshWakeMode() {
         if (wakeSpotter == null) return;
+        // v1.68: a zero-gap handoff owns the spotter's capture —
+        // the arbiter leaves it alone until the session ends.
+        if (wakeSpotter.isHandoff()) return;
         boolean want = wakeSpotterReady && !wakeSpotterFailed
                 && isAlwaysListening() && !wakeConvoOpen && !manualListening
                 && !destroyed && gateState != GATE_KILLED
@@ -3785,10 +3797,105 @@ public class VoiceService extends Service
                     + levels + ")");
             return;
         }
+        if (tryZeroGapHandoff(keyword, levels)) {
+            new Thread(new WakeDirectiveTask(this, keyword)).start();
+            return;
+        }
         log("wakeword: spotted '" + keyword + "' (" + levels
                 + ") — opening conversation, recognizer taking over");
         openWakeConversation("spotter");
         new Thread(new WakeDirectiveTask(this, keyword)).start();
+    }
+
+    /** Lazily build the zero-gap recognizer (it shares the drone
+     *  path's downloaded ASR model; retried at most every 30 s
+     *  until the model is present and the build succeeds). */
+    private void ensureWakeStreamAsync() {
+        if (wakeStream != null && wakeStream.isReady()) return;
+        long now = System.currentTimeMillis();
+        if (now - wakeStreamTryAtMs < 30_000) return;
+        wakeStreamTryAtMs = now;
+        new Thread(() -> {
+            WakeStreamSession candidate = new WakeStreamSession(this);
+            if (candidate.init(this)) {
+                wakeStream = candidate;
+            }
+        }, "SelenaWakeStreamInit").start();
+    }
+
+    /**
+     * Zero-gap handoff (v1.68, Nick 2026-10-29 15:19): conversation
+     * bookkeeping as usual, but the spotter's capture keeps running
+     * in handoff mode and the wake-stream session takes the first
+     * dictation — ring seed first, forwarded live chunks after — so
+     * recognition is already running from the wake word's end.
+     * Returns false when the session isn't available; the caller
+     * then runs the pre-v1.68 cold-start path (fail open).
+     */
+    private boolean tryZeroGapHandoff(String keyword, String levels) {
+        if (wakeSpotter == null) return false;
+        ensureWakeStreamAsync();
+        if (wakeStream == null || !wakeStream.isReady()
+                || wakeStream.isActive()) {
+            return false;
+        }
+        wakeConvoOpen = true;
+        wakeConvoUntilMs = gateNow() + WAKE_CONVO_WINDOW_MS;
+        armWakeExpiry();
+        float[] seed = wakeSpotter.beginHandoff(wakeStream);
+        if (seed == null || !wakeStream.begin(seed)) {
+            wakeSpotter.endHandoff();
+            wakeConvoOpen = false;
+            return false;
+        }
+        log("wakeword: spotted '" + keyword + "' (" + levels
+                + ") — zero-gap handoff: own ASR live on the "
+                + "spotter's stream (seed " + seed.length
+                + " samples, no recognizer cold start)");
+        return true;
+    }
+
+    /** Wake-stream final: the conversation's first dictation,
+     *  delivered through the same door as every dictation
+     *  (onVoiceInput). Called from the session thread. */
+    public void onWakeStreamDictation(String text) {
+        handler.post(() -> {
+            if (text == null || text.trim().isEmpty()) return;
+            String cleaned = stripWakePrefix(text.trim());
+            if (cleaned.isEmpty()) return;
+            acquireDictationDuck();
+            log("wakestream: dictation '" + cleaned + "'");
+            onVoiceInput(cleaned);
+        });
+    }
+
+    /** Wake-stream session over (final delivered, timeout, or
+     *  failure): end the handoff and give the conversation to the
+     *  platform recognizer — the pre-v1.68 post-spot state. Called
+     *  from the session thread. */
+    public void onWakeStreamEnded() {
+        handler.post(() -> {
+            if (wakeSpotter != null) {
+                wakeSpotter.endHandoff();
+                wakeSpotter.stopCapture();
+            }
+            if (!destroyed && wakeConvoOpen && !recognizerActive
+                    && !manualListening) {
+                startContinuousListening();
+            }
+            refreshWakeMode();
+        });
+    }
+
+    /** Remove a leading wake word the seed slice may have caught
+     *  ("insight, what time…" → "what time…"). */
+    private String stripWakePrefix(String text) {
+        if (!sentenceStartsWithWakeWord(text)) return text;
+        String low = text.toLowerCase(Locale.US);
+        int cut = low.startsWith("hey insight")
+                ? "hey insight".length() : "insight".length();
+        return text.substring(cut)
+                .replaceAll("^[\\s,.:;!-]+", "").trim();
     }
 
     /**
