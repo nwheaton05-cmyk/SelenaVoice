@@ -39,10 +39,11 @@ import java.nio.charset.StandardCharsets;
  * stored audio at stop. A plain PAUSE is never reported on this
  * wire — paused messages keep everything.
  *
- * v1.57 (2026-10-29): a third action, 'playback_pause_dictate' —
- * pause-then-dictate counts as heard (Nick, 2026-10-29 08:40): when
- * a dictation is sent while a message sits paused, the brain
- * deletes that item's rows + audio at that point.
+ * (A 'playback_pause_dictate' action briefly existed in v1.57 under
+ * an 08:40 draft rule; Nick revised the rule at 08:41 the same
+ * morning — paused messages are held and delete server-side when
+ * the rework's successor message is queued — so v1.58 removed the
+ * wire again. This class carries played/stopped reports only.)
  */
 public class PlaybackProgressTask implements Runnable {
     private static final String TAG = "SelenaVoice";
