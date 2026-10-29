@@ -4847,6 +4847,12 @@ public class VoiceService extends Service
                 log("guests(earbuds): known guest '" + spk
                         + "' — private relay only, no dictation post");
                 noteWakeConversationActivity();
+            } else if (spk == null && tryLocalFastLane(toPost)) {
+                // Nick 2026-10-29 v1.69: LOCAL FAST LANE — a
+                // phone-known question (time / date) answered
+                // on-device. NOT posted: no double handling. The
+                // exchange still counts as conversation activity.
+                noteWakeConversationActivity();
             } else {
                 if (spk != null) {
                     postGuestDirective("guest_speaking", spk, null, toPost);
@@ -4865,6 +4871,60 @@ public class VoiceService extends Service
         // Nick 2026-10-23 v1.46: polite interruption — the sentence is
         // complete and he's silent; play anything Selena had held.
         releasePoliteHold();
+    }
+
+    /**
+     * Nick 2026-10-29 v1.69: LOCAL FAST LANE — try to answer a
+     * just-flushed dictation on-device. Returns true when the
+     * sentence was a phone-known question (current time, current
+     * date / day of week — FastLane's exact-match table) AND the
+     * answer was spoken locally; the caller then skips the post
+     * entirely (no double handling).
+     *
+     * Fall-through guarantee: ANY doubt returns false and the
+     * caller posts exactly as before v1.69 — no clear match, or a
+     * match while the speech path is busy. Busy means she is
+     * mid-reply: we never talk over her, and rather than answering
+     * late-and-local the question takes the normal server path,
+     * untouched.
+     *
+     * The match runs on the wake-stripped text: the spotter path
+     * strips before onVoiceInput, but the transcript-fallback path
+     * can carry the wake word into the buffer. Guests never reach
+     * here (the caller routes them first), and noise-held
+     * possibly-cut-off sentences never reach here either —
+     * sendHeldSentence keeps posting those as always, because a
+     * truncated fragment must not be mistaken for a whole question.
+     *
+     * Speech uses speakOnDevice — the same local path as the
+     * drone/guest prompts — so the answer obeys the standing
+     * playback rules: MAY_DUCK focus, mic parked while she talks
+     * (echo guard), single-press pause / double-tap stop via the
+     * ttsSpeaking bookkeeping. The exchange is recorded in
+     * MessageHistory like any other (his side was added by the
+     * caller before the wake-gate check; hers is added here).
+     */
+    private boolean tryLocalFastLane(String sentence) {
+        String answer = FastLane.answerFor(stripWakePrefix(sentence),
+                System.currentTimeMillis());
+        if (answer == null) return false;
+        if (tts == null || !ttsReady || isPlayingAudio() || playing
+                || ttsSpeaking) {
+            log("fastlane: phone-known question matched but the "
+                    + "speech path is busy — posting as usual");
+            return false;
+        }
+        log("fastlane: answered locally — '" + answer + "'");
+        broadcastMessage(answer);
+        MessageHistory.add(answer, null);
+        // Park the drone capture for the utterance, same as the
+        // other local prompts, so she can't transcribe herself.
+        int words = Math.max(1, answer.split("\\s+").length);
+        droneSelfTalkUntilMs = System.currentTimeMillis()
+                + words * 650L + 1200L;
+        ttsSpeaking = true;
+        speakOnDevice(answer, false);
+        return true;
     }
 
     /** Nick 2026-10-23 v1.46: popup shows the in-progress sentence. */
