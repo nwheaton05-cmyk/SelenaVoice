@@ -15,6 +15,10 @@ public class InputPostTask implements Runnable {
     // signed-in user. The post carries it so the responder addresses
     // the guest by name.
     private final String speakerName;
+    // Nick 2026-10-29 v1.64: interruption context JSON (see
+    // VoiceService.snapshotInterruption), or null when this dictation
+    // interrupted nothing.
+    private final String interruptJson;
 
     public InputPostTask(VoiceService service, String text) {
         this(service, text, false);
@@ -26,14 +30,21 @@ public class InputPostTask implements Runnable {
 
     public InputPostTask(VoiceService service, String text,
                          boolean possiblyCutOff, String speakerName) {
+        this(service, text, possiblyCutOff, speakerName, null);
+    }
+
+    public InputPostTask(VoiceService service, String text,
+                         boolean possiblyCutOff, String speakerName,
+                         String interruptJson) {
         this.service = service;
         this.text = text;
         this.possiblyCutOff = possiblyCutOff;
         this.speakerName = speakerName;
+        this.interruptJson = interruptJson;
     }
 
     @Override
     public void run() {
-        service.doPostInput(text, possiblyCutOff, speakerName);
+        service.doPostInput(text, possiblyCutOff, speakerName, interruptJson);
     }
 }

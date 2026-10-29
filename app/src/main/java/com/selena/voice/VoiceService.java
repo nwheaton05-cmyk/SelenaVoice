@@ -17,9 +17,12 @@ import android.content.pm.PackageManager;
 import android.content.pm.ServiceInfo;
 import android.media.AudioAttributes;
 import android.media.AudioDeviceInfo;
+import android.media.AudioFormat;
+import android.media.AudioRecord;
 import android.media.AudioFocusRequest;
 import android.media.AudioManager;
 import android.media.MediaPlayer;
+import android.media.MediaRecorder;
 import android.media.audiofx.LoudnessEnhancer;
 import android.media.session.MediaSession;
 import android.media.session.PlaybackState;
@@ -486,6 +489,34 @@ public class VoiceService extends Service
     /** Clearly-far line for "not Nick": MATCH_DIST is 2.4; a cold
      *  shifts an envelope, but not this far. Nudge-grade by design. */
     private static final double NEW_VOICE_MIN_DIST = 3.2;
+
+    // Nick 2026-10-29 v1.64: EARBUD (private-output) mode of the
+    // second-voice system — the Item 2 half of the parity batch; the
+    // design was completed and ruled 14:02–14:13 EDT. When the active
+    // output is Nick's earbuds (isEarbudsConnected — product-name
+    // identity, never Bluetooth-yes/no), a second voice is handled
+    // COMPLETELY differently from group mode: nothing is said in the
+    // moment, the words are never answered and never executed, and
+    // the content reaches Nick only as a private relay + consent
+    // query in his earbuds. Unknown voice: hold the sentence, grab a
+    // ~3 s room sample (TRANSIENT, memory only — played back once
+    // for identification, then discarded; the durable artifact is
+    // the voiceprint enrolled from the dictation's own envelope
+    // measurements), and at the next silent period ask NICK who that
+    // was and play the sample; the name enrolls the guest and only
+    // THEN is the content relayed. Known guest: relay directly.
+    // Never identified: the content is reported as guest_unidentified
+    // and never posted as a dictation.
+    private boolean pendingGuestEarbud = false;
+    private short[] heldGuestSamplePcm = null;
+    private long earbudHoldSinceMs = 0;
+    private Runnable earbudIdentifyTask = null;
+    private Runnable earbudCaptureTask = null;
+    private static final int EARBUD_SAMPLE_SECONDS = 3;
+    private static final int EARBUD_SAMPLE_RATE = 16000;
+    private static final long EARBUD_IDENTIFY_POLL_MS = 5000;
+    private static final long EARBUD_IDENTIFY_QUIET_MS = 6000;
+    private static final long EARBUD_IDENTIFY_CAP_MS = 300000;
 
     // Nick 2026-10-19 v1.16: outbound (moved from MainActivity).
     private RealtimeClient realtimeClient;
@@ -4425,7 +4456,14 @@ public class VoiceService extends Service
                 handleGuestNameReply(t);
                 return;
             }
-            releaseHeldGuestSentence(null);
+            // v1.64: in earbud mode a non-name reply NEVER releases
+            // the overheard words as a dictation — the hold resolves
+            // as unidentified instead.
+            if (pendingGuestEarbud) {
+                earbudHoldTimeout();
+            } else {
+                releaseHeldGuestSentence(null);
+            }
         }
         // Nick 2026-10-18 v1.9: Nick's words reach the UI instantly, even
         // if the POST later fails (offline, timeout). His inputs are never
@@ -4637,7 +4675,7 @@ public class VoiceService extends Service
                             sentenceBuffer.toString()))) {
                 String held = sentenceBuffer.toString();
                 sentenceBuffer.setLength(0);
-                startNewVoiceAsk(held);
+                startNewVoiceFlow(held);
                 maybeReleaseDictationDuck();
                 releasePoliteHold();
                 return;
@@ -4677,11 +4715,24 @@ public class VoiceService extends Service
             // explicitly (directive in order, then the tagged post).
             final String spk = bufferGuestName;
             bufferGuestName = null;
-            if (spk != null) {
-                postGuestDirective("guest_speaking", spk, null, toPost);
+            // v1.64 earbud mode: a KNOWN guest's words are never
+            // posted as a group dictation — they become a private
+            // relay to Nick (directive only; the brain composes the
+            // "I just heard [name] say… do you want me to…?" line and
+            // nothing is executed on the guest's words).
+            if (spk != null && isEarbudsConnected()) {
+                postGuestDirective("guest_relay", spk, null, toPost);
+                log("guests(earbuds): known guest '" + spk
+                        + "' — private relay only, no dictation post");
+                noteWakeConversationActivity();
+            } else {
+                if (spk != null) {
+                    postGuestDirective("guest_speaking", spk, null, toPost);
+                }
+                new Thread(new InputPostTask(this, toPost, false, spk,
+                        snapshotInterruption(toPost))).start();
+                noteWakeConversationActivity();
             }
-            new Thread(new InputPostTask(this, toPost, false, spk)).start();
-            noteWakeConversationActivity();
         }
         if (heldByWakeGate) bufferGuestName = null; // v1.62: never leak a tag
         // Nick 2026-10-29 v1.59: the batch is sent and the buffer is
@@ -4699,6 +4750,100 @@ public class VoiceService extends Service
         Intent i = new Intent(ACTION_PARTIAL_INPUT);
         i.putExtra(EXTRA_TEXT, sentenceBuffer.toString());
         sendAppBroadcast(i);
+    }
+
+    // ------------------------------------------------------------ v1.64 interruption context (Item 4)
+
+    /**
+     * Nick 2026-10-29 v1.64 (interruption final shape, 14:16–14:20
+     * ruling): when a dictation lands while one of her messages is
+     * PLAYING or PAUSED, the post carries an "interrupts" object so
+     * the responder can run the ruled branch — SAME topic → revise
+     * the message (openly recognized as a revision); OFF topic →
+     * park the new topic in one line, FINISH the original, then take
+     * up the new topic. Heard fraction stays delivered context in
+     * both branches. The app supplies the facts (which row, playing
+     * vs paused, how much was heard, and — when the interrupted
+     * message's text is known on-device, i.e. the TTS path — a
+     * content-word overlap hint); the topic judgment itself is the
+     * responder's, made on the full texts it holds server-side.
+     * Returns null when nothing of hers is in flight.
+     */
+    private String snapshotInterruption(String dictationText) {
+        try {
+            boolean mp3Active = playing || playbackPaused;
+            boolean ttsActive = ttsSpeaking || ttsPaused;
+            if (!mp3Active && !ttsActive) return null;
+            String rowId = currentPlayServerId;
+            if (rowId != null && "priority".equals(rowId)) return null;
+            JSONObject o = new JSONObject();
+            o.put("state", (playbackPaused || ttsPaused) ? "paused" : "playing");
+            if (rowId != null && !rowId.isEmpty()) o.put("rowId", rowId);
+            double heard = -1;
+            if (mp3Active && player != null) {
+                try {
+                    int dur = player.getDuration();
+                    if (dur > 0) {
+                        heard = Math.min(1.0, Math.max(0.0,
+                                (double) player.getCurrentPosition() / dur));
+                    }
+                } catch (Exception ignored) {}
+            } else if (ttsActive && ttsCurrentText != null
+                    && ttsCurrentText.length() > 0) {
+                heard = Math.min(1.0, Math.max(0.0,
+                        (double) ttsResumeAtChar / ttsCurrentText.length()));
+                o.put("topicOverlapHint", String.format(Locale.US, "%.2f",
+                        contentWordOverlap(dictationText, ttsCurrentText)));
+            }
+            if (heard >= 0) {
+                o.put("heardFraction", String.format(Locale.US, "%.2f", heard));
+            }
+            log("interrupt: dictation interrupts her message ("
+                    + o.optString("state") + ", heard="
+                    + o.optString("heardFraction", "?") + ")");
+            return o.toString();
+        } catch (Exception e) {
+            Log.w(TAG, "interrupt snapshot failed", e);
+            return null;
+        }
+    }
+
+    /** Content-word Jaccard overlap (stopwords dropped, naive stem
+     *  by suffix strip). Advisory only — the responder's semantic
+     *  judgment is the branch switch. */
+    static double contentWordOverlap(String a, String b) {
+        java.util.Set<String> sa = contentWords(a);
+        java.util.Set<String> sb = contentWords(b);
+        if (sa.isEmpty() || sb.isEmpty()) return 0;
+        int inter = 0;
+        for (String w : sa) if (sb.contains(w)) inter++;
+        int union = sa.size() + sb.size() - inter;
+        return union == 0 ? 0 : (double) inter / union;
+    }
+
+    private static java.util.Set<String> contentWords(String text) {
+        java.util.Set<String> out = new java.util.HashSet<>();
+        if (text == null) return out;
+        String[] stop = {"the", "a", "an", "and", "or", "but", "to", "of",
+                "in", "on", "for", "with", "is", "are", "was", "were",
+                "it", "that", "this", "i", "you", "we", "they", "he",
+                "she", "do", "does", "did", "have", "has", "had", "be",
+                "been", "at", "by", "from", "as", "if", "then", "so",
+                "just", "about", "what", "when", "where", "who", "how",
+                "why", "can", "could", "would", "will", "should", "not",
+                "no", "yes", "me", "my", "your", "our", "their", "there",
+                "here", "one", "get", "got", "let", "lets"};
+        java.util.Set<String> stops = new java.util.HashSet<>(
+                java.util.Arrays.asList(stop));
+        for (String w : text.toLowerCase(Locale.US)
+                .replaceAll("[^a-z0-9' ]", " ").split("\\s+")) {
+            if (w.length() < 3 || stops.contains(w)) continue;
+            if (w.endsWith("ing") && w.length() > 5) w = w.substring(0, w.length() - 3);
+            else if (w.endsWith("ed") && w.length() > 4) w = w.substring(0, w.length() - 2);
+            else if (w.endsWith("s") && w.length() > 3) w = w.substring(0, w.length() - 1);
+            out.add(w);
+        }
+        return out;
     }
 
     /** Called by InputPostTask on background thread. */
@@ -4727,6 +4872,14 @@ public class VoiceService extends Service
      */
     public void doPostInput(String text, boolean possiblyCutOff,
                             String speakerName) {
+        doPostInput(text, possiblyCutOff, speakerName, null);
+    }
+
+    /** v1.64: interruptJson (see snapshotInterruption) rides along
+     *  as an "interrupts" object when this dictation interrupted a
+     *  playing/paused message. */
+    public void doPostInput(String text, boolean possiblyCutOff,
+                            String speakerName, String interruptJson) {
         HttpURLConnection conn = null;
         try {
             URL url = new URL(BASE_URL + "/api/selena-voice/input");
@@ -4743,6 +4896,9 @@ public class VoiceService extends Service
             if (speakerName != null) {
                 body.put("speakerName", speakerName);
                 body.put("speakerKind", "guest");
+            }
+            if (interruptJson != null) {
+                body.put("interrupts", new JSONObject(interruptJson));
             }
             OutputStream os = null;
             try {
@@ -4938,7 +5094,7 @@ public class VoiceService extends Service
         // owns this sentence now, not the 60s send.
         if (bufferNewVoiceCandidate && pendingGuestSentence == null) {
             bufferNewVoiceCandidate = false;
-            startNewVoiceAsk(sentence);
+            startNewVoiceFlow(sentence);
             return;
         }
         log("gate: 60s with no further dictation — sending held dictation"
@@ -4960,10 +5116,19 @@ public class VoiceService extends Service
         }
         final String heldSpk = bufferGuestName;
         bufferGuestName = null;
-        if (heldSpk != null) {
-            postGuestDirective("guest_speaking", heldSpk, null, sentence);
+        // v1.64 earbud mode: same private-relay rule as the normal
+        // flush — a known guest's noise-held words relay, never post.
+        if (heldSpk != null && isEarbudsConnected()) {
+            postGuestDirective("guest_relay", heldSpk, null, sentence);
+            log("guests(earbuds): known guest '" + heldSpk
+                    + "' (noise-held) — private relay only");
+        } else {
+            if (heldSpk != null) {
+                postGuestDirective("guest_speaking", heldSpk, null, sentence);
+            }
+            new Thread(new InputPostTask(this, sentence, true, heldSpk,
+                    snapshotInterruption(sentence))).start();
         }
-        new Thread(new InputPostTask(this, sentence, true, heldSpk)).start();
         // Nick 2026-10-29 v1.59: held dictation sent, buffer empty —
         // release the duck (the watchdog would stale-release anyway;
         // this is the prompt path).
@@ -5553,6 +5718,223 @@ public class VoiceService extends Service
     // ------------------------------------------------------------ v1.62 new-voice flow (group mode)
 
     /**
+     * v1.64: the mode switch for the second-voice system. The mode
+     * is decided by WHICH device is the active output right now —
+     * Nick's earbuds by product-name identity (isEarbudsConnected,
+     * the v1.48 mechanism) mean PRIVATE output → the earbud
+     * sample-hold flow; anything else (phone speaker, truck radio,
+     * car kit — Ford Sync is not earbuds) means SHARED output → the
+     * v1.62 group flow. Never Bluetooth-yes/no.
+     */
+    private void startNewVoiceFlow(String sentence) {
+        if (isEarbudsConnected()) {
+            startEarbudHold(sentence);
+        } else {
+            startNewVoiceAsk(sentence);
+        }
+    }
+
+    /**
+     * v1.64 earbud mode, step 1: a second voice was detected and the
+     * output is private. Say NOTHING. Hold the words, try to grab a
+     * ~3 s sample of the room for later identification playback, and
+     * arm the silent-period identification. The sample capture runs
+     * alongside the recognizer (which is between utterances at flush
+     * time); if the device refuses a parallel capture, the flow
+     * continues without a sample — fail open, logged.
+     */
+    private void startEarbudHold(String sentence) {
+        pendingGuestSentence = sentence;
+        pendingGuestEarbud = true;
+        earbudHoldSinceMs = System.currentTimeMillis();
+        guestAskCooldownUntilMs = System.currentTimeMillis()
+                + GUEST_ASK_COOLDOWN_MS;
+        if (guestProfiles != null && pendingGuestFeats != null) {
+            guestProfiles.noteUnmatched(this, pendingGuestFeats);
+        }
+        log("guests(earbuds): new voice held silently (" + sentence.length()
+                + " chars) — identification at the next quiet moment");
+        updateNotification("🗣️ Heard someone new — I'll ask you about it shortly");
+        new Thread(() -> captureGuestSample(), "guest-sample").start();
+        if (earbudIdentifyTask != null) {
+            handler.removeCallbacks(earbudIdentifyTask);
+        }
+        earbudIdentifyTask = () -> earbudIdentifyTick();
+        handler.postDelayed(earbudIdentifyTask, EARBUD_IDENTIFY_POLL_MS);
+    }
+
+    /** v1.64: the transient ~3 s room sample. Memory only; nulled
+     *  the moment identification resolves. Never written to disk
+     *  except the momentary WAV the player needs (cache dir, deleted
+     *  by the normal unreferenced-file cleanup after playback). */
+    private void captureGuestSample() {
+        AudioRecord rec = null;
+        try {
+            int total = EARBUD_SAMPLE_RATE * EARBUD_SAMPLE_SECONDS;
+            int minBuf = AudioRecord.getMinBufferSize(EARBUD_SAMPLE_RATE,
+                    AudioFormat.CHANNEL_IN_MONO,
+                    AudioFormat.ENCODING_PCM_16BIT);
+            if (minBuf <= 0) {
+                log("guests(earbuds): sample capture unsupported (minBuf)");
+                return;
+            }
+            rec = new AudioRecord(MediaRecorder.AudioSource.VOICE_RECOGNITION,
+                    EARBUD_SAMPLE_RATE, AudioFormat.CHANNEL_IN_MONO,
+                    AudioFormat.ENCODING_PCM_16BIT,
+                    Math.max(minBuf, total * 2));
+            if (rec.getState() != AudioRecord.STATE_INITIALIZED) {
+                log("guests(earbuds): sample recorder not initialized "
+                        + "(mic busy?) — identification goes without a sample");
+                return;
+            }
+            short[] buf = new short[total];
+            rec.startRecording();
+            int off = 0;
+            long deadline = System.currentTimeMillis() + 4000;
+            while (off < total && System.currentTimeMillis() < deadline) {
+                int n = rec.read(buf, off, total - off);
+                if (n <= 0) break;
+                off += n;
+            }
+            try { rec.stop(); } catch (Exception ignored) {}
+            if (off < EARBUD_SAMPLE_RATE) {
+                log("guests(earbuds): sample too short (" + off
+                        + " samples) — discarded");
+                return;
+            }
+            short[] trimmed = new short[off];
+            System.arraycopy(buf, 0, trimmed, 0, off);
+            long sumSq = 0;
+            for (short s : trimmed) sumSq += (long) s * s;
+            double rms = Math.sqrt((double) sumSq / trimmed.length) / 32768.0;
+            if (rms < 0.01) {
+                log("guests(earbuds): sample was silence — discarded");
+                return;
+            }
+            if (pendingGuestEarbud) {
+                heldGuestSamplePcm = trimmed;
+                log("guests(earbuds): sample held (" + (off / EARBUD_SAMPLE_RATE)
+                        + "s, transient, memory only)");
+            }
+        } catch (Exception e) {
+            log("guests(earbuds): sample capture failed (fail-open): " + e);
+        } finally {
+            if (rec != null) {
+                try { rec.release(); } catch (Exception ignored) {}
+            }
+        }
+    }
+
+    /** v1.64: poll for a silent period, then run the identification. */
+    private void earbudIdentifyTick() {
+        earbudIdentifyTask = null;
+        if (!pendingGuestEarbud || pendingGuestSentence == null) return;
+        long now = System.currentTimeMillis();
+        boolean capped = now - earbudHoldSinceMs >= EARBUD_IDENTIFY_CAP_MS;
+        boolean quiet = !nickSpeaking && !isPlayingAudio() && !playing
+                && !ttsSpeaking && sentenceBuffer.length() == 0
+                && android.os.SystemClock.uptimeMillis()
+                        - lastDictationActivityMs >= EARBUD_IDENTIFY_QUIET_MS;
+        if (!quiet && !capped) {
+            earbudIdentifyTask = () -> earbudIdentifyTick();
+            handler.postDelayed(earbudIdentifyTask, EARBUD_IDENTIFY_POLL_MS);
+            return;
+        }
+        if (isPlayingAudio() || playing || ttsSpeaking) {
+            // Cap reached but she's mid-sentence — wait for the gap
+            // rather than talk over herself.
+            earbudIdentifyTask = () -> earbudIdentifyTick();
+            handler.postDelayed(earbudIdentifyTask, EARBUD_IDENTIFY_POLL_MS);
+            return;
+        }
+        runEarbudIdentification();
+    }
+
+    /**
+     * v1.64 earbud mode, step 2: ask NICK (the output is his earbuds
+     * only — private by construction) who that was, playing the held
+     * sample first when one exists. Nick's short reply is captured
+     * by the existing name-capture interception and lands in
+     * handleGuestNameReply, whose earbud branch enrolls + relays.
+     */
+    private void runEarbudIdentification() {
+        short[] sample = heldGuestSamplePcm;
+        String line1 = sample != null
+                ? "Quick thing — someone spoke a moment ago that I don't "
+                        + "recognize. Here's them:"
+                : "Quick thing — someone spoke a moment ago that I don't "
+                        + "recognize, and I couldn't grab a sample of "
+                        + "their voice.";
+        log("guests(earbuds): running identification (sample="
+                + (sample != null) + ")");
+        postGuestDirective("guest_identify_ask", null, "Who was that?", null);
+        updateNotification("🗣️ Who was that?");
+        if (tts != null && ttsReady) {
+            int words = Math.max(1, line1.split("\\s+").length);
+            droneSelfTalkUntilMs = System.currentTimeMillis()
+                    + words * 650L + 4500L;
+            // Enqueue (never speakOnDevice directly — it QUEUE_FLUSHes):
+            // line 1 via the TTS pump, the sample via the audio pump,
+            // then the question. The pumps mutually exclude (a pump
+            // won't start while the other path is active, and each
+            // completion pumps the other), so the three play in order.
+            enqueueTts(line1);
+            if (sample != null) {
+                File wav = writeGuestSampleWav(sample);
+                if (wav != null) {
+                    enqueueAudio(wav);
+                }
+            }
+            enqueueTts("Who was that?");
+        } else {
+            log("guests(earbuds): identification ask not spoken (tts "
+                    + "unavailable) — directive + notification only");
+        }
+        guestNameCaptureUntilMs = System.currentTimeMillis()
+                + GUEST_NAME_CAPTURE_MS;
+        if (earbudCaptureTask != null) {
+            handler.removeCallbacks(earbudCaptureTask);
+        }
+        earbudCaptureTask = () -> earbudHoldTimeout();
+        handler.postDelayed(earbudCaptureTask, GUEST_NAME_CAPTURE_MS);
+    }
+
+    /** Minimal 16-bit PCM WAV for the held sample (player needs a file). */
+    private File writeGuestSampleWav(short[] pcm) {
+        try {
+            File f = new File(getCacheDir(), "guest-sample.wav");
+            int dataLen = pcm.length * 2;
+            try (java.io.FileOutputStream os = new java.io.FileOutputStream(f)) {
+                byte[] header = new byte[44];
+                java.nio.ByteBuffer hb = java.nio.ByteBuffer.wrap(header)
+                        .order(java.nio.ByteOrder.LITTLE_ENDIAN);
+                hb.put("RIFF".getBytes("US-ASCII"));
+                hb.putInt(36 + dataLen);
+                hb.put("WAVE".getBytes("US-ASCII"));
+                hb.put("fmt ".getBytes("US-ASCII"));
+                hb.putInt(16);
+                hb.putShort((short) 1); // PCM
+                hb.putShort((short) 1); // mono
+                hb.putInt(EARBUD_SAMPLE_RATE);
+                hb.putInt(EARBUD_SAMPLE_RATE * 2);
+                hb.putShort((short) 2);
+                hb.putShort((short) 16);
+                hb.put("data".getBytes("US-ASCII"));
+                hb.putInt(dataLen);
+                os.write(header);
+                java.nio.ByteBuffer bb = java.nio.ByteBuffer
+                        .allocate(dataLen).order(java.nio.ByteOrder.LITTLE_ENDIAN);
+                for (short s : pcm) bb.putShort(s);
+                os.write(bb.array());
+            }
+            return f;
+        } catch (Exception e) {
+            log("guests(earbuds): sample WAV write failed: " + e);
+            return null;
+        }
+    }
+
+    /**
      * The dictation has stopped and its speaker matched nobody: ask
      * who that was. Form by content (13:54 disambiguation — the
      * slash form is never spoken): a statement gets "Who's
@@ -5636,7 +6018,7 @@ public class VoiceService extends Service
                         sentence);
             }
             new Thread(new InputPostTask(this, sentence, false,
-                    speakerName)).start();
+                    speakerName, snapshotInterruption(sentence))).start();
             noteWakeConversationActivity();
             log("guests: held dictation released"
                     + (speakerName != null
@@ -5662,11 +6044,20 @@ public class VoiceService extends Service
                 || low.equals("nick") || low.equals("this is nick")) {
             log("guests: name reply says it's Nick himself — false "
                     + "alarm, no guest created");
+            if (pendingGuestEarbud) {
+                // v1.64: the "guest" was Nick all along — the held
+                // words are HIS dictation and post as his.
+                clearEarbudHold();
+            }
             releaseHeldGuestSentence(null);
             return;
         }
         String name = cleanGuestName(spoken);
         if (name.isEmpty() || guestProfiles == null) {
+            if (pendingGuestEarbud) {
+                earbudHoldTimeout();
+                return;
+            }
             releaseHeldGuestSentence(null);
             return;
         }
@@ -5675,7 +6066,68 @@ public class VoiceService extends Service
         postGuestDirective("guest_enrolled", g.name, null, null);
         updateNotification("🗣️ Got it — hi, " + g.name);
         log("guests: enrolled '" + g.name + "' from the name reply");
+        if (pendingGuestEarbud) {
+            // v1.64: identification complete — NOW the overheard
+            // content may move, and only as a private relay to Nick
+            // with a consent query (the brain composes it). The held
+            // dictation itself is never posted.
+            String held = pendingGuestSentence;
+            clearEarbudHold();
+            pendingGuestSentence = null;
+            pendingGuestFeats = null;
+            guestNameCaptureUntilMs = 0;
+            postGuestDirective("guest_relay", g.name, null, held);
+            log("guests(earbuds): identified as '" + g.name
+                    + "' — content relayed privately to Nick");
+            maybeReleaseDictationDuck();
+            releasePoliteHold();
+            return;
+        }
         releaseHeldGuestSentence(g.name);
+    }
+
+    /** v1.64: tear down the earbud hold's timers + sample. Does NOT
+     *  touch pendingGuestSentence/pendingGuestFeats — callers decide
+     *  what happens to the held words. */
+    private void clearEarbudHold() {
+        pendingGuestEarbud = false;
+        heldGuestSamplePcm = null; // transient sample: discarded
+        if (earbudIdentifyTask != null) {
+            handler.removeCallbacks(earbudIdentifyTask);
+            earbudIdentifyTask = null;
+        }
+        if (earbudCaptureTask != null) {
+            handler.removeCallbacks(earbudCaptureTask);
+            earbudCaptureTask = null;
+        }
+    }
+
+    /**
+     * v1.64: the earbud hold was never identified (no name in the
+     * capture window, or the reply wasn't a name). The overheard
+     * content is reported as guest_unidentified — the brain may ask
+     * Nick about it later — and is NEVER posted as a dictation,
+     * never executed, never addressed to the speaker.
+     */
+    private void earbudHoldTimeout() {
+        if (earbudCaptureTask != null) {
+            handler.removeCallbacks(earbudCaptureTask);
+            earbudCaptureTask = null;
+        }
+        guestNameCaptureUntilMs = 0;
+        if (pendingGuestSentence == null) {
+            clearEarbudHold();
+            return;
+        }
+        String held = pendingGuestSentence;
+        pendingGuestSentence = null;
+        pendingGuestFeats = null;
+        clearEarbudHold();
+        postGuestDirective("guest_unidentified", null, null, held);
+        log("guests(earbuds): never identified — content reported "
+                + "unidentified, not posted");
+        maybeReleaseDictationDuck();
+        releasePoliteHold();
     }
 
     /** "I'm Amber" / "this is Amber" / "my name is Amber" → "Amber". */
