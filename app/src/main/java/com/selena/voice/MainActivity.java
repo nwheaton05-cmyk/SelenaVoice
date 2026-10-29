@@ -1058,6 +1058,13 @@ public class MainActivity extends Activity {
                 != PackageManager.PERMISSION_GRANTED) {
             needed.add(Manifest.permission.RECORD_AUDIO);
         }
+        // v1.72: call-state watch (the phone-call mic mute). Asked
+        // alongside the mic; if refused, the service logs it once
+        // and the mute simply stays inactive — nothing else changes.
+        if (checkSelfPermission(Manifest.permission.READ_PHONE_STATE)
+                != PackageManager.PERMISSION_GRANTED) {
+            needed.add(Manifest.permission.READ_PHONE_STATE);
+        }
         if (Build.VERSION.SDK_INT >= 33
                 && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS)
                 != PackageManager.PERMISSION_GRANTED) {

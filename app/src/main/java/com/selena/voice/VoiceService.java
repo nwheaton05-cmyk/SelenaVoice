@@ -254,6 +254,17 @@ public class VoiceService extends Service
     // as Nick's input. Inverse of the v1.46 polite-interruption hold
     // (which holds PLAYBACK while Nick speaks).
     private boolean micMutedForPlayback = false;
+    // Nick 2026-10-29 v1.72: PHONE-CALL MIC MUTE — true while a
+    // call is ringing or in progress. Capture is parked at the
+    // capture layer (the same parks the playback mute uses:
+    // recognizer guards, the spotter's and drone session's park
+    // predicates, gate-probe deferral), so nothing said on the
+    // call is dictated, captured, held, or learned (voiceprint
+    // included). Restored exactly on CALL_STATE_IDLE.
+    private boolean phoneCallMuted = false;
+    private PhoneCallCallback phoneCallCallback = null;
+    private boolean phoneCallWatchRegistered = false;
+    private boolean phoneCallWatchWarned = false;
     private MediaPlayer player;
     // Nick 2026-10-28 v1.51: media session for earbud/headset buttons.
     // Before v1.51 the app had NO MediaSession and NO media-button
@@ -781,6 +792,7 @@ public class VoiceService extends Service
         // adaptive kill line starts from the room's history.
         loadGateBaseline();
         startGateWatchdog();
+        registerPhoneCallWatch(); // v1.72: phone-call mic mute
         // Nick 2026-10-29 v1.60: wake word spotter loads async; when
         // it's ready it takes over the idle mic (see onWakeSpotterReady
         // for the handover). Until then the recognizer path above is
@@ -992,6 +1004,7 @@ public class VoiceService extends Service
             wakeStream = null;
         }
         unmuteBeep();
+        unregisterPhoneCallWatch(); // v1.72
         recognizerActive = false;
         destroyRecognizer();
         releasePlayer();
@@ -3822,7 +3835,8 @@ public class VoiceService extends Service
         boolean want = wakeSpotterReady && !wakeSpotterFailed
                 && isAlwaysListening() && !wakeConvoOpen && !manualListening
                 && !destroyed && gateState != GATE_KILLED
-                && gateState != GATE_DRONE && !recognizerActive;
+                && gateState != GATE_DRONE && !recognizerActive
+                && !phoneCallMuted;
         if (want) {
             boolean wasRunning = wakeSpotter.isRunning();
             wakeSpotter.startCapture();
@@ -3831,7 +3845,7 @@ public class VoiceService extends Service
                 log("wakeword: spotter listening — recognizer resting");
             }
         } else if (wakeConvoOpen || manualListening || !isAlwaysListening()
-                || destroyed) {
+                || destroyed || phoneCallMuted) {
             wakeSpotter.stopCapture();
         }
     }
@@ -3845,7 +3859,8 @@ public class VoiceService extends Service
     public boolean wakeSpotterParked() {
         return destroyed || !isAlwaysListening() || wakeConvoOpen
                 || manualListening || recognizerActive || isPlayingAudio()
-                || micMutedForPlayback || gateState == GATE_KILLED
+                || micMutedForPlayback || phoneCallMuted
+                || gateState == GATE_KILLED
                 || gateState == GATE_DRONE;
     }
 
@@ -3908,6 +3923,9 @@ public class VoiceService extends Service
      * then runs the pre-v1.68 cold-start path (fail open).
      */
     private boolean tryZeroGapHandoff(String keyword, String levels) {
+        // v1.72: no handoff during a phone call — the spotter is
+        // parked then anyway; this is the belt to its suspenders.
+        if (phoneCallMuted) return false;
         if (wakeSpotter == null) return false;
         ensureWakeStreamAsync();
         if (wakeStream == null || !wakeStream.isReady()
@@ -4293,7 +4311,8 @@ public class VoiceService extends Service
         if (!recognizerActive || recognizer == null || destroyed) return;
         // Nick 2026-10-23 v1.47: never start listening while muted for
         // Selena playback — unmuteMicAfterPlayback() restarts when done.
-        if (micMutedForPlayback) return;
+        // v1.72: or while a phone call owns the mic (call-end restores).
+        if (micMutedForPlayback || phoneCallMuted) return;
         // Nick 2026-10-28 v1.52: noise gate — while KILLED the
         // recognizer stays OFF (nothing is recorded or sent); the
         // probe loop owns re-arming. Every recognizer start funnels
@@ -4327,7 +4346,9 @@ public class VoiceService extends Service
     private void scheduleRecognizerRestart() {
         // Nick 2026-10-23 v1.47: never restart while muted for Selena
         // playback — the unmute path restarts when she's done.
-        if (destroyed || !recognizerActive || micMutedForPlayback) return;
+        // v1.72: same for the phone-call mute (call-end restores).
+        if (destroyed || !recognizerActive || micMutedForPlayback
+                || phoneCallMuted) return;
         handler.postDelayed(new RecognizerRestartTask(this), RESTART_DELAY_MS);
     }
 
@@ -4340,7 +4361,9 @@ public class VoiceService extends Service
     public void scheduleQuietRestart() {
         // Nick 2026-10-23 v1.47: never restart while muted for Selena
         // playback — the unmute path restarts when she's done.
-        if (destroyed || !recognizerActive || micMutedForPlayback) return;
+        // v1.72: same for the phone-call mute (call-end restores).
+        if (destroyed || !recognizerActive || micMutedForPlayback
+                || phoneCallMuted) return;
         Log.d(TAG, "quiet restart scheduled (" + RESTART_DELAY_MS + "ms)");
         handler.postDelayed(new RecognizerRestartTask(this), RESTART_DELAY_MS);
     }
@@ -4348,6 +4371,9 @@ public class VoiceService extends Service
     /** Called by RecognizerRestartTask on main thread. */
     public void restartRecognizerNow() {
         if (destroyed || !recognizerActive || micMutedForPlayback) return;
+        // v1.72: never restart INTO a phone call. (The call-end path
+        // calls this itself once the flag has cleared.)
+        if (phoneCallMuted) return;
         destroyRecognizer();
         try {
             recognizer = SpeechRecognizer.createSpeechRecognizer(this);
@@ -4366,6 +4392,126 @@ public class VoiceService extends Service
      */
     public boolean isMicMutedForPlayback() {
         return micMutedForPlayback;
+    }
+
+    // ------------------------------------------------------------
+    // v1.72: PHONE-CALL MIC MUTE (Nick, 2026-10-29 ~16:33)
+    // ------------------------------------------------------------
+    // While a phone call is ringing or in progress, the mic is
+    // MUTED at the capture layer — the spotter, the recognizer,
+    // the drone session, and the gate probes all park — so nothing
+    // said on the call is dictated, captured, held, or learned.
+    // When the call goes idle, the exact prior listening state
+    // resumes (conversation still open if it was open; the spotter
+    // if it was the idle owner; drone capture if an episode is on).
+
+    public boolean isPhoneCallMuted() {
+        return phoneCallMuted;
+    }
+
+    private void registerPhoneCallWatch() {
+        if (phoneCallWatchRegistered || destroyed) return;
+        if (android.os.Build.VERSION.SDK_INT < 31) {
+            if (!phoneCallWatchWarned) {
+                phoneCallWatchWarned = true;
+                log("phonecall: call-state watch needs Android 12+ — "
+                        + "the call mute is inactive on this device");
+            }
+            return;
+        }
+        if (checkSelfPermission(
+                android.Manifest.permission.READ_PHONE_STATE)
+                != android.content.pm.PackageManager.PERMISSION_GRANTED) {
+            if (!phoneCallWatchWarned) {
+                phoneCallWatchWarned = true;
+                log("phonecall: READ_PHONE_STATE not granted — the "
+                        + "call mute stays inactive until it is");
+            }
+            return;
+        }
+        try {
+            android.telephony.TelephonyManager tm =
+                    (android.telephony.TelephonyManager)
+                            getSystemService(Context.TELEPHONY_SERVICE);
+            if (tm == null) return;
+            phoneCallCallback = new PhoneCallCallback(this);
+            tm.registerTelephonyCallback(getMainExecutor(),
+                    phoneCallCallback);
+            phoneCallWatchRegistered = true;
+            log("phonecall: call-state watch registered (mic mutes "
+                    + "for the duration of any call)");
+        } catch (Exception e) {
+            Log.w(TAG, "phonecall: registerTelephonyCallback failed", e);
+        }
+    }
+
+    private void unregisterPhoneCallWatch() {
+        if (!phoneCallWatchRegistered) return;
+        try {
+            android.telephony.TelephonyManager tm =
+                    (android.telephony.TelephonyManager)
+                            getSystemService(Context.TELEPHONY_SERVICE);
+            if (tm != null && phoneCallCallback != null) {
+                tm.unregisterTelephonyCallback(phoneCallCallback);
+            }
+        } catch (Exception ignored) {}
+        phoneCallWatchRegistered = false;
+        phoneCallCallback = null;
+    }
+
+    /** PhoneCallCallback lands here (main executor). */
+    public void onPhoneCallStateChanged(int state) {
+        handler.post(() -> {
+            boolean inCall = state
+                            == android.telephony.TelephonyManager.CALL_STATE_RINGING
+                    || state
+                            == android.telephony.TelephonyManager.CALL_STATE_OFFHOOK;
+            if (inCall == phoneCallMuted) {
+                // RINGING → OFFHOOK is ONE mute, not two.
+                return;
+            }
+            if (inCall) {
+                phoneCallMuted = true;
+                log("phonecall: mic muted — call "
+                        + (state
+                                == android.telephony.TelephonyManager.CALL_STATE_RINGING
+                                ? "ringing" : "in progress")
+                        + "; capture parked, nothing is recorded, "
+                        + "held, or learned");
+                // Park every capture owner NOW; the park
+                // predicates + start guards keep them parked for
+                // the whole call.
+                if (recognizer != null) {
+                    try { recognizer.cancel(); } catch (Exception ignored) {}
+                    destroyRecognizer();
+                }
+                if (wakeSpotter != null) wakeSpotter.stopCapture();
+                if (droneSession != null && droneSession.isCapturing()) {
+                    // endCapture abandons any partial utterance —
+                    // it is discarded, never delivered (v1.61 code).
+                    droneSession.endCapture();
+                }
+                refreshWakeMode();
+                broadcastListeningState();
+            } else {
+                phoneCallMuted = false;
+                log("phonecall: mic restored — call ended, resuming "
+                        + "the listening state from before the call");
+                // Resume the exact prior state: the spotter if it
+                // was the idle owner (the arbiter re-decides), the
+                // recognizer if a conversation/manual session was
+                // live, drone capture if an episode is still on.
+                refreshWakeMode();
+                if (gateState == GATE_DRONE && droneSession != null
+                        && !droneSession.isCapturing()) {
+                    droneSession.beginCapture(machineUserKey());
+                }
+                if (recognizerActive && !destroyed) {
+                    restartRecognizerNow();
+                }
+                broadcastListeningState();
+            }
+        });
     }
 
     // Nick 2026-10-23 v1.48: Bluetooth-aware interrupt mode. Nick marks
@@ -5508,6 +5654,13 @@ public class VoiceService extends Service
         holdingNoteTask = null;
         if (!holdingNoteArmed || destroyed) return;
         holdingNoteArmed = false;
+        // v1.72: never talk into his phone call — a note that comes
+        // due mid-call is simply skipped (the answer itself will
+        // still queue and play under the normal rules).
+        if (phoneCallMuted) {
+            log("holdingnote: skipped at fire time (phone call in progress)");
+            return;
+        }
         // The moment has passed if anything is already on its way
         // to his ears, if he's talking again, or if the polite gate
         // would only park the note behind his pause to go stale.
@@ -5889,7 +6042,9 @@ public class VoiceService extends Service
         if (gateState != GATE_KILLED || destroyed || gateDisabled) return;
         // Selena's own voice over the speaker would read as a speech
         // burst — never probe while she is audible.
-        if (isPlayingAudio() || micMutedForPlayback) {
+        // v1.72: never probe during a phone call either — a probe is
+        // a mic capture, and the call owns the mic.
+        if (isPlayingAudio() || micMutedForPlayback || phoneCallMuted) {
             scheduleGateProbe(800);
             return;
         }
@@ -6060,7 +6215,8 @@ public class VoiceService extends Service
         if (noiseHoldActive) armNoiseHoldTimer();
         updateNotification("🎤 Listening…");
         broadcastListeningState();
-        if (recognizerActive && !micMutedForPlayback && !destroyed) {
+        if (recognizerActive && !micMutedForPlayback && !destroyed
+                && !phoneCallMuted) {
             restartRecognizerNow();
         }
     }
@@ -6174,7 +6330,8 @@ public class VoiceService extends Service
         if (noiseHoldActive) armNoiseHoldTimer();
         updateNotification("🎤 Listening…");
         broadcastListeningState();
-        if (recognizerActive && !micMutedForPlayback && !destroyed) {
+        if (recognizerActive && !micMutedForPlayback && !destroyed
+                && !phoneCallMuted) {
             restartRecognizerNow();
         }
     }
@@ -6182,6 +6339,7 @@ public class VoiceService extends Service
     /** DroneSession polls this: park capture while she's talking or we're gone. */
     public boolean droneSessionParked() {
         return destroyed || isPlayingAudio() || micMutedForPlayback
+                || phoneCallMuted
                 || System.currentTimeMillis() < droneSelfTalkUntilMs;
     }
 

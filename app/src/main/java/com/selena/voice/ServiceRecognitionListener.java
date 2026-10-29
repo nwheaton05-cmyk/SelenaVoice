@@ -216,7 +216,10 @@ public class ServiceRecognitionListener implements RecognitionListener {
         // Nick 2026-10-23 v1.47: if the mic is muted for Selena
         // playback, swallow the error (cancel() triggers ERROR_CLIENT)
         // — the unmute path restarts the recognizer when she's done.
-        if (service.isMicMutedForPlayback()) return;
+        // v1.72: the phone-call mute cancels the same way — swallow
+        // identically; the call-end path does the restarting.
+        if (service.isMicMutedForPlayback()
+                || service.isPhoneCallMuted()) return;
         traceActive = false;
         if (error == SpeechRecognizer.ERROR_NO_MATCH
                 || error == SpeechRecognizer.ERROR_SPEECH_TIMEOUT) {
@@ -231,6 +234,16 @@ public class ServiceRecognitionListener implements RecognitionListener {
 
     @Override
     public void onResults(Bundle results) {
+        // v1.72: a result racing in after a call started is dropped
+        // BEFORE any feature extraction — nothing from a call is
+        // dictated OR learned (the trace dies unmeasured).
+        if (service.isPhoneCallMuted()) {
+            Log.d(TAG, "phonecall: dropped a recognizer "
+                    + "result that raced the call start");
+            traceActive = false;
+            traceN = 0;
+            return;
+        }
         ArrayList<String> matches =
                 results.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION);
         String text = (matches != null && !matches.isEmpty()) ? matches.get(0) : "";
