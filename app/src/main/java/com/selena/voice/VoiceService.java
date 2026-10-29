@@ -450,6 +450,32 @@ public class VoiceService extends Service
     private static final long NAMING_CAPTURE_MS = 90000;
     public static final String DURING_DRONE_LINE = "What IS that HORRIBLE noise?!";
 
+    // Nick 2026-10-29 v1.62: NEW-VOICE FLOW (standalone group mode,
+    // 13:52/13:55 rulings). An accepted dictation whose recognizer
+    // envelope matches NEITHER Nick's voiceprint NOR any enrolled
+    // guest is a new-voice candidate: detection happens in
+    // vpLearnAccepted (before anything learns — a guest must never
+    // train Nick's print), the sentence flush HOLDS the post, she
+    // asks "Who's talking?" / "Who's asking?" / "Who wants to
+    // know?" (form by statement-vs-question, question forms
+    // alternate), the reply enrolls the guest, and only then does
+    // the held dictation post — tagged with the guest's name so the
+    // answer addresses them by name. Unanswered (90 s) → the held
+    // dictation posts untagged; no phantom guest is created.
+    private GuestProfiles guestProfiles;
+    private String bufferGuestName = null;
+    private boolean bufferNewVoiceCandidate = false;
+    private float[] pendingGuestFeats = null;
+    private String pendingGuestSentence = null;
+    private long guestNameCaptureUntilMs = 0;
+    private long guestAskCooldownUntilMs = 0;
+    private Runnable guestHoldReleaseTask = null;
+    private static final long GUEST_NAME_CAPTURE_MS = 90000;
+    private static final long GUEST_ASK_COOLDOWN_MS = 600000;
+    /** Clearly-far line for "not Nick": MATCH_DIST is 2.4; a cold
+     *  shifts an envelope, but not this far. Nudge-grade by design. */
+    private static final double NEW_VOICE_MIN_DIST = 3.2;
+
     // Nick 2026-10-19 v1.16: outbound (moved from MainActivity).
     private RealtimeClient realtimeClient;
     private boolean polling = false;
@@ -656,6 +682,7 @@ public class VoiceService extends Service
         // in the background and the extraction session builds when
         // it's ready. Until droneReady, the gate is exactly v1.60.
         machineProfiles = new MachineProfiles();
+        guestProfiles = new GuestProfiles();
         initDroneAsync();
         log("service created (v1.16 background mode)");
     }
@@ -4561,6 +4588,20 @@ public class VoiceService extends Service
             }
             disarmNamingCapture();
         }
+        // Nick 2026-10-29 v1.62 guest-name capture: she just asked
+        // who's talking/asking — a SHORT reply is the new person's
+        // name (enroll + release the held dictation tagged with it).
+        // A longer reply means the ask went unanswered: release the
+        // held dictation untagged and let this chunk flow normally.
+        if (text != null && pendingGuestSentence != null
+                && System.currentTimeMillis() <= guestNameCaptureUntilMs) {
+            String t = text.trim();
+            if (!t.isEmpty() && t.split("\\s+").length <= 6) {
+                handleGuestNameReply(t);
+                return;
+            }
+            releaseHeldGuestSentence(null);
+        }
         // Nick 2026-10-18 v1.9: Nick's words reach the UI instantly, even
         // if the POST later fails (offline, timeout). His inputs are never
         // spoken aloud — playback only plays Selena's reply MP3s.
@@ -4651,6 +4692,51 @@ public class VoiceService extends Service
                 cls = (s[3] >= 1f && s[0] < GATE_LOUD_DB - 4f)
                         ? Voiceprint.CLS_CLEAN : Voiceprint.CLS_NORMAL;
             }
+            // Nick 2026-10-29 v1.62 new-voice attribution — BEFORE
+            // Nick's profile learns anything from this chunk. A chunk
+            // matching an enrolled guest teaches the GUEST only; a
+            // chunk matching nobody (Nick established, distance
+            // clearly beyond the cold-and-off-day grace zone) marks
+            // the buffer as a new-voice candidate and teaches NO
+            // ONE — the flush holds that sentence for the ask, and
+            // the enrollment (if any) seeds from these measurements.
+            if (guestProfiles != null && voiceprint.voiceHasVote()
+                    && voiceprint.verdictRecog(feats) == Voiceprint.NO_MATCH) {
+                GuestProfiles.Guest g = guestProfiles.matchRecog(this, feats);
+                if (g != null) {
+                    guestProfiles.learnRecog(this, g.id, feats,
+                            Voiceprint.weightFor(cls));
+                    if (bufferGuestName == null) bufferGuestName = g.name;
+                    log("guests: chunk attributed to '" + g.name
+                            + "' — Nick's print untouched");
+                    return;
+                }
+                double distNick = voiceprint.distanceRecog(feats);
+                if (distNick >= NEW_VOICE_MIN_DIST
+                        && pendingGuestSentence == null
+                        && System.currentTimeMillis()
+                                >= guestAskCooldownUntilMs) {
+                    float[] lastUn = guestProfiles.lastUnmatchedFeats(this);
+                    if (lastUn == null
+                            || GuestProfiles.distanceBetween(feats, lastUn)
+                                    > 1.2) {
+                        pendingGuestFeats = feats;
+                        bufferNewVoiceCandidate = true;
+                        log("guests: NEW VOICE candidate (distance to Nick "
+                                + String.format(Locale.US, "%.2f", distNick)
+                                + ") — print not trained; the flush will "
+                                + "hold the sentence for the ask");
+                        return;
+                    }
+                    log("guests: unrecognized voice = the signature already "
+                            + "asked about in the last 24h — no re-ask, "
+                            + "print not trained");
+                    return;
+                }
+                // NO_MATCH but inside the grace distance: benefit of
+                // the doubt (Nick with a cold reads exactly like
+                // this) — fall through and learn as his, as before.
+            }
             voiceprint.learnVoice(feats, cls, conf);
             if (Voiceprint.CLS_OVER_NOISE.equals(cls)) {
                 float[] nf = recognitionListener.samplerTraceFeatures();
@@ -4715,6 +4801,23 @@ public class VoiceService extends Service
             handler.postDelayed(sentenceFlushTask, SENTENCE_GAP_MS);
             return;
         }
+        // Nick 2026-10-29 v1.62: a new-voice candidate sits in this
+        // buffer and the dictation has now STOPPED — hold the post
+        // and run the ask. (Pre-wake chatter is exempt: it was never
+        // going to post, so there is no question to preserve.)
+        if (bufferNewVoiceCandidate && pendingGuestSentence == null) {
+            bufferNewVoiceCandidate = false;
+            if (!(wakeGateBlocksPost()
+                    && !sentenceStartsWithWakeWord(
+                            sentenceBuffer.toString()))) {
+                String held = sentenceBuffer.toString();
+                sentenceBuffer.setLength(0);
+                startNewVoiceAsk(held);
+                maybeReleaseDictationDuck();
+                releasePoliteHold();
+                return;
+            }
+        }
         String sentence = sentenceBuffer.toString();
         sentenceBuffer.setLength(0);
         // Nick 2026-10-23 v1.46: his dictations live in the message
@@ -4745,9 +4848,17 @@ public class VoiceService extends Service
             sent.putExtra(EXTRA_TEXT, sentence);
             sendAppBroadcast(sent);
             final String toPost = sentence;
-            new Thread(new InputPostTask(this, toPost)).start();
+            // v1.62: a guest spoke this sentence — bind the name
+            // explicitly (directive in order, then the tagged post).
+            final String spk = bufferGuestName;
+            bufferGuestName = null;
+            if (spk != null) {
+                postGuestDirective("guest_speaking", spk, null, toPost);
+            }
+            new Thread(new InputPostTask(this, toPost, false, spk)).start();
             noteWakeConversationActivity();
         }
+        if (heldByWakeGate) bufferGuestName = null; // v1.62: never leak a tag
         // Nick 2026-10-29 v1.59: the batch is sent and the buffer is
         // empty — the dictation is over; release the duck BEFORE any
         // held playback starts (playback takes its own MAY_DUCK focus,
@@ -4778,6 +4889,19 @@ public class VoiceService extends Service
      * from it. Normal dictations post it as false.
      */
     public void doPostInput(String text, boolean possiblyCutOff) {
+        doPostInput(text, possiblyCutOff, null);
+    }
+
+    /**
+     * Nick 2026-10-29 v1.62: speakerName binds a dictation to an
+     * enrolled guest (standalone group mode) — the responder
+     * addresses them by name. Null = the signed-in user, as always.
+     * The binding is ALSO posted as a guest_speaking directive
+     * immediately before the dictation (ordering preserved), so it
+     * survives even if a consumer ignores these fields.
+     */
+    public void doPostInput(String text, boolean possiblyCutOff,
+                            String speakerName) {
         HttpURLConnection conn = null;
         try {
             URL url = new URL(BASE_URL + "/api/selena-voice/input");
@@ -4791,6 +4915,10 @@ public class VoiceService extends Service
             body.put("text", text);
             body.put("timestamp", System.currentTimeMillis());
             body.put("possiblyCutOff", possiblyCutOff);
+            if (speakerName != null) {
+                body.put("speakerName", speakerName);
+                body.put("speakerKind", "guest");
+            }
             OutputStream os = null;
             try {
                 os = conn.getOutputStream();
@@ -4799,7 +4927,9 @@ public class VoiceService extends Service
                 if (os != null) try { os.close(); } catch (Exception ignored) {}
             }
             int code = conn.getResponseCode();
-            log("input posted (" + code + "): " + text);
+            log("input posted (" + code + "): " + text
+                    + (speakerName != null
+                            ? " [speaker: guest '" + speakerName + "']" : ""));
             // Nick 2026-10-18 v1.9: the INPUT_SENT broadcast now fires in
             // onVoiceInput() before the POST, so the log is instant even
             // when the network is down. Nothing to broadcast here anymore.
@@ -4979,6 +5109,13 @@ public class VoiceService extends Service
         if (sentenceBuffer.length() == 0) return;
         String sentence = sentenceBuffer.toString();
         sentenceBuffer.setLength(0);
+        // v1.62: a new-voice candidate rode the noise hold — the ask
+        // owns this sentence now, not the 60s send.
+        if (bufferNewVoiceCandidate && pendingGuestSentence == null) {
+            bufferNewVoiceCandidate = false;
+            startNewVoiceAsk(sentence);
+            return;
+        }
         log("gate: 60s with no further dictation — sending held dictation"
                 + " flagged possiblyCutOff");
         MessageHistory.addNick(sentence);
@@ -4996,7 +5133,12 @@ public class VoiceService extends Service
         } else {
             noteWakeConversationActivity();
         }
-        new Thread(new InputPostTask(this, sentence, true)).start();
+        final String heldSpk = bufferGuestName;
+        bufferGuestName = null;
+        if (heldSpk != null) {
+            postGuestDirective("guest_speaking", heldSpk, null, sentence);
+        }
+        new Thread(new InputPostTask(this, sentence, true, heldSpk)).start();
         // Nick 2026-10-29 v1.59: held dictation sent, buffer empty —
         // release the duck (the watchdog would stale-release anyway;
         // this is the prompt path).
@@ -5578,6 +5720,211 @@ public class VoiceService extends Service
             log("drone: directive posted (" + code + "): " + action);
         } catch (Exception e) {
             Log.w(TAG, "drone: directive post failed", e);
+        } finally {
+            if (conn != null) conn.disconnect();
+        }
+    }
+
+    // ------------------------------------------------------------ v1.62 new-voice flow (group mode)
+
+    /**
+     * The dictation has stopped and its speaker matched nobody: ask
+     * who that was. Form by content (13:54 disambiguation — the
+     * slash form is never spoken): a statement gets "Who's
+     * talking?"; a question gets "Who's asking?", alternating with
+     * "Who wants to know?". The held dictation is NOT in the ask's
+     * directive — the brain answers the tagged dictation post that
+     * follows enrollment, never the ask itself.
+     */
+    private void startNewVoiceAsk(String sentence) {
+        pendingGuestSentence = sentence;
+        guestAskCooldownUntilMs = System.currentTimeMillis()
+                + GUEST_ASK_COOLDOWN_MS;
+        if (guestProfiles != null && pendingGuestFeats != null) {
+            guestProfiles.noteUnmatched(this, pendingGuestFeats);
+        }
+        String line;
+        if (!isQuestion(sentence)) {
+            line = "Who's talking?";
+        } else {
+            boolean alt = getSharedPreferences(PREFS, MODE_PRIVATE)
+                    .getBoolean("guest_ask_alt", false);
+            getSharedPreferences(PREFS, MODE_PRIVATE).edit()
+                    .putBoolean("guest_ask_alt", !alt).apply();
+            line = alt ? "Who wants to know?" : "Who's asking?";
+        }
+        log("guests: new voice — asking '" + line + "' (held dictation: "
+                + sentence.length() + " chars)");
+        postGuestDirective("new_voice_ask", null, line, null);
+        updateNotification("🗣️ " + line);
+        if (tts != null && ttsReady && !isPlayingAudio() && !playing
+                && !ttsSpeaking) {
+            int words = Math.max(1, line.split("\\s+").length);
+            droneSelfTalkUntilMs = System.currentTimeMillis()
+                    + words * 650L + 1200L;
+            speakOnDevice(line, false);
+        } else {
+            log("guests: ask not spoken (tts busy/unavailable) — "
+                    + "directive + notification only");
+        }
+        guestNameCaptureUntilMs = System.currentTimeMillis()
+                + GUEST_NAME_CAPTURE_MS;
+        if (guestHoldReleaseTask != null) {
+            handler.removeCallbacks(guestHoldReleaseTask);
+        }
+        guestHoldReleaseTask = () -> releaseHeldGuestSentence(null);
+        handler.postDelayed(guestHoldReleaseTask, GUEST_NAME_CAPTURE_MS);
+    }
+
+    /**
+     * Post the held dictation — tagged with the guest's name when
+     * the ask was answered, untagged when it wasn't (the question
+     * still gets answered either way; only the name is missing).
+     * Mirrors flushSentence's post section, wake gate included.
+     */
+    private void releaseHeldGuestSentence(String speakerName) {
+        if (guestHoldReleaseTask != null) {
+            handler.removeCallbacks(guestHoldReleaseTask);
+            guestHoldReleaseTask = null;
+        }
+        guestNameCaptureUntilMs = 0;
+        if (pendingGuestSentence == null) return;
+        String sentence = pendingGuestSentence;
+        pendingGuestSentence = null;
+        pendingGuestFeats = null;
+        MessageHistory.addNick(sentence);
+        boolean heldByWakeGate = false;
+        if (wakeGateBlocksPost()) {
+            if (sentenceStartsWithWakeWord(sentence)) {
+                openWakeConversation("transcript");
+            } else {
+                heldByWakeGate = true;
+                log("guests: held dictation had no wake word — stays local");
+            }
+        }
+        if (!heldByWakeGate) {
+            Intent sent = new Intent(ACTION_INPUT_SENT);
+            sent.putExtra(EXTRA_TEXT, sentence);
+            sendAppBroadcast(sent);
+            if (speakerName != null) {
+                postGuestDirective("guest_speaking", speakerName, null,
+                        sentence);
+            }
+            new Thread(new InputPostTask(this, sentence, false,
+                    speakerName)).start();
+            noteWakeConversationActivity();
+            log("guests: held dictation released"
+                    + (speakerName != null
+                            ? " as guest '" + speakerName + "'" : " untagged"));
+        }
+        maybeReleaseDictationDuck();
+        releasePoliteHold();
+    }
+
+    /**
+     * The name reply landed. "It's me" (or Nick's own name) means the
+     * new-voice flag was a false alarm — Nick with a cold — and the
+     * held dictation simply posts as his, no guest created.
+     * Anything else enrolls a guest seeded from the held speech's
+     * measurements, and the held dictation posts under their name.
+     */
+    private void handleGuestNameReply(String spoken) {
+        String low = spoken.trim().toLowerCase(Locale.US)
+                .replaceAll("[.!?]+$", "").trim();
+        if (low.equals("me") || low.equals("it's me")
+                || low.equals("it is me") || low.equals("that's me")
+                || low.equals("this is me") || low.equals("just me")
+                || low.equals("nick") || low.equals("this is nick")) {
+            log("guests: name reply says it's Nick himself — false "
+                    + "alarm, no guest created");
+            releaseHeldGuestSentence(null);
+            return;
+        }
+        String name = cleanGuestName(spoken);
+        if (name.isEmpty() || guestProfiles == null) {
+            releaseHeldGuestSentence(null);
+            return;
+        }
+        GuestProfiles.Guest g = guestProfiles.enroll(
+                this, name, pendingGuestFeats);
+        postGuestDirective("guest_enrolled", g.name, null, null);
+        updateNotification("🗣️ Got it — hi, " + g.name);
+        log("guests: enrolled '" + g.name + "' from the name reply");
+        releaseHeldGuestSentence(g.name);
+    }
+
+    /** "I'm Amber" / "this is Amber" / "my name is Amber" → "Amber". */
+    static String cleanGuestName(String spoken) {
+        String s = spoken.trim().replaceAll("[.!?]+$", "").trim();
+        String low = s.toLowerCase(Locale.US);
+        String[] prefixes = {
+                "my name is ", "the name is ", "this is ", "i'm ",
+                "im ", "it's ", "it is ", "call me "};
+        for (String pre : prefixes) {
+            if (low.startsWith(pre)) {
+                s = s.substring(pre.length());
+                break;
+            }
+        }
+        s = s.trim();
+        if (!s.isEmpty()) {
+            s = s.substring(0, 1).toUpperCase(Locale.US) + s.substring(1);
+        }
+        return s;
+    }
+
+    /** Statement vs question, for the ask's form (13:54 ruling). */
+    static boolean isQuestion(String sentence) {
+        String s = sentence.trim().toLowerCase(Locale.US);
+        if (s.endsWith("?")) return true;
+        String first = s.split("\\s+")[0].replaceAll("[^a-z']", "");
+        switch (first) {
+            case "who": case "what": case "when": case "where":
+            case "why": case "how": case "can": case "could":
+            case "would": case "will": case "do": case "does":
+            case "did": case "is": case "are": case "was":
+            case "were": case "should": case "may":
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    private void postGuestDirective(String action, String speakerName,
+                                    String line, String text) {
+        new Thread(new GuestDirectiveTask(
+                this, action, speakerName, line, text)).start();
+    }
+
+    /** GuestDirectiveTask's POST — mirrors doPostMachineDirective. */
+    public void doPostGuestDirective(String action, String speakerName,
+                                     String line, String text) {
+        HttpURLConnection conn = null;
+        try {
+            URL url = new URL(BASE_URL + "/api/selena-voice/input");
+            conn = (HttpURLConnection) url.openConnection();
+            conn.setRequestMethod("POST");
+            conn.setRequestProperty("Content-Type", "application/json");
+            conn.setConnectTimeout(8000);
+            conn.setReadTimeout(8000);
+            conn.setDoOutput(true);
+            JSONObject body = new JSONObject();
+            body.put("action", action);
+            if (speakerName != null) body.put("speakerName", speakerName);
+            if (line != null) body.put("line", line);
+            if (text != null) body.put("text", text);
+            body.put("timestamp", System.currentTimeMillis());
+            OutputStream os = null;
+            try {
+                os = conn.getOutputStream();
+                os.write(body.toString().getBytes("UTF-8"));
+            } finally {
+                if (os != null) try { os.close(); } catch (Exception ignored) {}
+            }
+            int code = conn.getResponseCode();
+            log("guests: directive posted (" + code + "): " + action);
+        } catch (Exception e) {
+            Log.w(TAG, "guests: directive post failed", e);
         } finally {
             if (conn != null) conn.disconnect();
         }

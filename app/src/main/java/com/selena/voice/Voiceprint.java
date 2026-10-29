@@ -434,6 +434,22 @@ public class Voiceprint {
         return voiceProfile.hasVote();
     }
 
+    /**
+     * Nick 2026-10-29 v1.62 (new-voice flow): the raw recognizer-
+     * domain distance of a measurement from the signed-in user's
+     * voice profile — the guest attribution needs the number itself,
+     * not just the verdict (a clearly-far NO_MATCH is a new-voice
+     * candidate; a near one is just Nick sounding off today).
+     * -1 when there's no profile to measure against.
+     */
+    public synchronized double distanceRecog(float[] feats) {
+        String key = currentUserKey();
+        if (key == null || feats == null) return -1;
+        ensureUserLoaded(key);
+        if (!voiceProfile.hasVote()) return -1;
+        return voiceProfile.distance(feats);
+    }
+
     public synchronized int voiceSampleCount() {
         String key = currentUserKey();
         if (key == null) return 0;
