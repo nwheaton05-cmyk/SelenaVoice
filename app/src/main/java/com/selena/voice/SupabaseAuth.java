@@ -54,6 +54,11 @@ public class SupabaseAuth {
         return prefs(ctx).getString(K_REFRESH, null) != null;
     }
 
+    /** The public anon key, for read-only REST calls (profiles). */
+    public static String apiKey() {
+        return API_KEY;
+    }
+
     public static String savedEmail(Context ctx) {
         String e = prefs(ctx).getString(K_EMAIL, "");
         return e == null ? "" : e;

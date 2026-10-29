@@ -39,6 +39,7 @@ public class GateProbeTask implements Runnable {
         float peakDbfs = -120f;
         float zcr = 0f;
         float bright = 0f;
+        float[] spectrum = null;
         boolean ok = false;
         AudioRecord rec = null;
         try {
@@ -79,6 +80,18 @@ public class GateProbeTask implements Runnable {
             double pcmEnergy = 0;
             double diffEnergy = 0;
             int prevSample = 0;
+            // Nick 2026-10-29 v1.61: the probe also measures the
+            // drone's power SPECTRUM (FFT 512 windows over the same
+            // transient PCM) so the machine-profile library learns
+            // each machine's signature even while the gate sits in
+            // KILLED — spectra are measurements; the audio is still
+            // discarded the moment the probe ends.
+            float[] specAcc = new float[SpectralSuppressor.BINS];
+            float[] winBuf = new float[SpectralSuppressor.FFT_SIZE];
+            int winFill = 0;
+            int winCount = 0;
+            float[] fftRe = new float[SpectralSuppressor.FFT_SIZE];
+            float[] fftIm = new float[SpectralSuppressor.FFT_SIZE];
             while (frames < framesWanted) {
                 int read = rec.read(frame, 0, frame.length);
                 if (read <= 0) break;
@@ -93,6 +106,17 @@ public class GateProbeTask implements Runnable {
                     pcmEnergy += (double) frame[i] * (double) frame[i];
                     prevSample = frame[i];
                     pcmSamples++;
+                    winBuf[winFill++] = frame[i] / 32768f;
+                    if (winFill == SpectralSuppressor.FFT_SIZE) {
+                        System.arraycopy(winBuf, 0, fftRe, 0, winBuf.length);
+                        java.util.Arrays.fill(fftIm, 0f);
+                        Fft.forward(fftRe, fftIm);
+                        for (int k = 0; k < SpectralSuppressor.BINS; k++) {
+                            specAcc[k] += fftRe[k] * fftRe[k] + fftIm[k] * fftIm[k];
+                        }
+                        winCount++;
+                        winFill = 0;
+                    }
                 }
                 double rms = Math.sqrt(sumSq / read);
                 double db = 20.0 * Math.log10(Math.max(rms, 1.0) / 32768.0);
@@ -104,6 +128,12 @@ public class GateProbeTask implements Runnable {
             }
             if (pcmEnergy > 0) {
                 bright = (float) Math.min(1.0, diffEnergy / (2.0 * pcmEnergy));
+            }
+            if (winCount >= 2) {
+                spectrum = new float[SpectralSuppressor.BINS];
+                for (int k = 0; k < SpectralSuppressor.BINS; k++) {
+                    spectrum[k] = specAcc[k] / winCount;
+                }
             }
             if (frames >= 6) {
                 double sum = 0;
@@ -126,6 +156,7 @@ public class GateProbeTask implements Runnable {
                 try { rec.release(); } catch (Exception ignored) {}
             }
         }
-        service.onGateProbeResult(meanDbfs, stdDb, peakDbfs, zcr, bright, ok);
+        service.onGateProbeResult(meanDbfs, stdDb, peakDbfs, zcr, bright, ok,
+                spectrum);
     }
 }

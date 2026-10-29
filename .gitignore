@@ -5,3 +5,7 @@ build/
 
 # Nick 2026-10-29 v1.60: KWS model bundle (~17MB download) is build input, not source
 kws-model-cache/
+
+# Nick 2026-10-29 v1.61: ASR model bundle (43.6MB) — runtime-downloaded by the
+# app from Supabase storage; the local cache is a staging copy, not source
+asr-model-cache/

@@ -300,6 +300,27 @@ public class VoiceService extends Service
     private static final long DICTATION_DUCK_GRACE_MS = 3000;
     private static final long DICTATION_DUCK_STALE_MS = 20000;
     private static final long DICTATION_DUCK_WATCHDOG_MS = 5000;
+    // Nick 2026-10-29 v1.61 (13:34 — "make music duck further"): the
+    // system MAY_DUCK depth is chosen by the ducked app (~20%) and
+    // Nick ruled it too shallow. DEEP DUCK is ours: while a dictation
+    // is captured or Selena's MP3 voice plays, STREAM_MUSIC is ramped
+    // down to DEEP_DUCK_FRACTION of its prior level (the MAY_DUCK
+    // focus requests stay as the cooperative layer underneath).
+    // Selena's player rides the same stream, so during PLAYBACK her
+    // MediaPlayer gets a compensating LoudnessEnhancer gain (capped
+    // at DEEP_DUCK_COMP_MAX_MB) — she lands near his set level while
+    // the music sits at the duck floor; nothing ever goes ABOVE his
+    // set level (the v1.48 rule). During DICTATION she isn't playing,
+    // so no compensation is needed. Both are named tunables for
+    // Nick's field adjustment.
+    static final double DEEP_DUCK_FRACTION = 0.10;
+    static final int DEEP_DUCK_COMP_MAX_MB = 1000; // +10 dB cap
+    private boolean deepDuckByPlayback = false;
+    private boolean deepDuckByDictation = false;
+    private int deepDuckSavedVolume = -1;
+    private int deepDuckTargetVolume = -1;
+    private int deepDuckGeneration = 0;
+    private Runnable deepDuckWatchdog = null;
     // Nick 2026-10-29 v1.60 (true wake word spike): sherpa-onnx
     // keyword spotter (WakeWordSpotter) + the app-side conversation
     // window it opens. While the spotter is healthy and no
@@ -357,6 +378,13 @@ public class VoiceService extends Service
     // that session (§4.1).
     private static final int GATE_AMBIENT = 0;
     private static final int GATE_KILLED = 1;
+    // Nick 2026-10-29 v1.61: DRONE — the extraction session
+    // (DroneSession) owns the mic and dictation stays alive over a
+    // running machine. Entered instead of KILLED whenever the
+    // extraction pipeline is ready (Nick's order: extraction active
+    // + session alive over kill); any failure inside it falls back
+    // to KILLED, i.e. exact v1.60 behavior.
+    private static final int GATE_DRONE = 2;
     private volatile int gateState = GATE_AMBIENT;
     private boolean gateDisabled = false;
     private boolean gateBypassSession = false;
@@ -400,6 +428,27 @@ public class VoiceService extends Service
     private long vpLastNoiseFeedMs = 0;          // noise-teaching throttle
     private float[] vpPendingBurstFeats = null;  // probe burst awaiting confirmation
     private long vpBurstConfirmUntilMs = 0;
+
+    // Nick 2026-10-29 v1.61: Drone Dictation (extraction over a
+    // running machine) + the per-machine profile library + the
+    // naming prompts (13:21/13:25/13:27/13:28/13:31 rulings).
+    // droneSession is built on a worker thread once the ASR model
+    // download verifies; droneReady is the arm condition. The
+    // naming capture: after a run of an UNNAMED machine ends, the
+    // app asks "Hey, {user}, what was that noise?" and the next
+    // short dictation inside the capture window becomes the name.
+    // During the run it first says the playful line, verbatim with
+    // its emphasis styling: "What IS that HORRIBLE noise?!"
+    // Both prompts fire only while the profile is unnamed; a named
+    // machine is never prompted again, ever.
+    private MachineProfiles machineProfiles;
+    private DroneSession droneSession;
+    private volatile boolean droneReady = false;
+    private volatile long droneSelfTalkUntilMs = 0;
+    private int pendingNameProfileId = -1;
+    private long namingCaptureUntilMs = 0;
+    private static final long NAMING_CAPTURE_MS = 90000;
+    public static final String DURING_DRONE_LINE = "What IS that HORRIBLE noise?!";
 
     // Nick 2026-10-19 v1.16: outbound (moved from MainActivity).
     private RealtimeClient realtimeClient;
@@ -602,6 +651,12 @@ public class VoiceService extends Service
         // for the handover). Until then the recognizer path above is
         // untouched — and stays untouched if init fails (fail open).
         initWakeSpotterAsync();
+        // Nick 2026-10-29 v1.61: Drone Dictation prep — machine
+        // profile store up front; the ASR model downloads/verifies
+        // in the background and the extraction session builds when
+        // it's ready. Until droneReady, the gate is exactly v1.60.
+        machineProfiles = new MachineProfiles();
+        initDroneAsync();
         log("service created (v1.16 background mode)");
     }
 
@@ -663,7 +718,12 @@ public class VoiceService extends Service
                 // recognizer killed, a tap forces a session open,
                 // gate bypassed for that session. (recognizerActive
                 // stays true while killed, so check the gate first.)
-                if (gateState == GATE_KILLED) {
+                if (gateState == GATE_DRONE) {
+                    // Same override over drone mode: exitDroneMode
+                    // sets the bypass session itself for this reason
+                    // (forceGateOverride only acts from KILLED).
+                    exitDroneMode("manual override");
+                } else if (gateState == GATE_KILLED) {
                     forceGateOverride();
                 }
                 if (!recognizerActive) {
@@ -768,6 +828,7 @@ public class VoiceService extends Service
         restoreMusicVolume(); // Nick 2026-10-19 v1.17: safety net — never
         // leave the music stream stuck at the boosted max.
         releaseDictationDuck("service destroyed"); // v1.59 safety net
+        releaseDeepDuckAll("service destroyed"); // v1.61: never leave music ducked
         // Nick 2026-10-29 v1.60: stop + release the wake word spotter.
         if (wakeExpiryTask != null) {
             handler.removeCallbacks(wakeExpiryTask);
@@ -776,6 +837,10 @@ public class VoiceService extends Service
         if (wakeSpotter != null) {
             wakeSpotter.release();
             wakeSpotter = null;
+        }
+        if (droneSession != null) {
+            droneSession.release();
+            droneSession = null;
         }
         unmuteBeep();
         recognizerActive = false;
@@ -1603,6 +1668,10 @@ public class VoiceService extends Service
             log("audio: stream=MUSIC (USAGE_MEDIA)");
             requestAudioFocus();
             boostMusicVolume();
+            // Nick 2026-10-29 v1.61 deep duck: drop the music stream
+            // to the duck floor for her speech; her player compensates
+            // with the LoudnessEnhancer below.
+            acquireDeepDuck(true);
             releasePlayer();
             player = new MediaPlayer();
             player.setAudioAttributes(new AudioAttributes.Builder()
@@ -1623,10 +1692,33 @@ public class VoiceService extends Service
             // (<100ms).
             player.prepare();
             log("audio: MediaPlayer prepared, duration=" + player.getDuration() + "ms");
-            // Nick 2026-10-23 v1.48: LoudnessEnhancer DISABLED — Nick turns
-            // the volume down deliberately (earbuds) and the +6dB boost
-            // was overriding him. Selena now plays at his set volume.
-            // (Was v1.18/v1.19: pushed her past max for margin over Spotify.)
+            // Nick 2026-10-23 v1.48: LoudnessEnhancer as a BOOST stays
+            // disabled — it overrode Nick's set volume. v1.61 reuses it
+            // for one narrow job only: while the deep duck holds
+            // STREAM_MUSIC at DEEP_DUCK_FRACTION, the enhancer gives
+            // HER player back the depth the duck took (capped), so she
+            // lands near — never above — his set level while the music
+            // sits at the floor. No duck active → no enhancer.
+            if (deepDuckByPlayback && deepDuckSavedVolume > 0
+                    && deepDuckTargetVolume >= 0
+                    && deepDuckTargetVolume < deepDuckSavedVolume) {
+                try {
+                    double frac = (double) deepDuckTargetVolume
+                            / (double) deepDuckSavedVolume;
+                    int depthMb = (int) Math.round(
+                            -2000.0 * Math.log10(Math.max(frac, 0.01)));
+                    int gainMb = Math.min(depthMb, DEEP_DUCK_COMP_MAX_MB);
+                    loudnessEnhancer = new LoudnessEnhancer(
+                            player.getAudioSessionId());
+                    loudnessEnhancer.setTargetGain(gainMb);
+                    loudnessEnhancer.setEnabled(true);
+                    log("deepduck: her player compensated +" + gainMb
+                            + " mB against the duck");
+                } catch (Exception e) {
+                    log("deepduck: compensation failed: " + e);
+                    loudnessEnhancer = null;
+                }
+            }
             // Nick 2026-10-23 v1.47: stop the mic BEFORE her voice
             // comes out, so it can't be transcribed as Nick's input.
             muteMicForPlayback();
@@ -1728,6 +1820,7 @@ public class VoiceService extends Service
         reportPlaybackProgress(); // v1.55: before any unwinding below
         abandonAudioFocus();
         restoreMusicVolume(); // Nick 2026-10-19 v1.17: undo the playback boost
+        releaseDeepDuck(true); // v1.61: music back up when she finishes
         releasePlayer();
         playing = false;
         isPlayingAudio = false;
@@ -2433,6 +2526,7 @@ public class VoiceService extends Service
         // Release the MP3 player (also clears playbackPaused and
         // broadcasts state).
         releasePlayer();
+        releaseDeepDuck(true); // v1.61: a stop also un-ducks the music
         playing = false;
         isPlayingAudio = false;
         setPlayingAudio(false);
@@ -2848,6 +2942,7 @@ public class VoiceService extends Service
         // Release the MP3 player (also clears playbackPaused and
         // broadcasts state).
         releasePlayer();
+        releaseDeepDuck(true); // v1.61: the skipped-to play re-acquires
         playing = false;
         isPlayingAudio = false;
         setPlayingAudio(false);
@@ -3376,6 +3471,11 @@ public class VoiceService extends Service
      * as the on-screen mic tap.
      */
     private void startDictationFromEarbud() {
+        if (gateState == GATE_DRONE) {
+            exitDroneMode("manual override");
+            toast("Listening");
+            return;
+        }
         if (gateState == GATE_KILLED) {
             forceGateOverride();
             toast("Listening");
@@ -3468,6 +3568,8 @@ public class VoiceService extends Service
         } catch (Exception e) {
             log("duck: dictation focus request failed: " + e);
         }
+        // v1.61: the manual deep duck rides the same lifecycle.
+        acquireDeepDuck(false);
     }
 
     /** Partials/chunks/speech-end while the duck is held = still capturing. */
@@ -3497,6 +3599,9 @@ public class VoiceService extends Service
     }
 
     private void releaseDictationDuck(String why) {
+        // v1.61: the manual deep duck releases even when the focus
+        // half had nothing to release (it is acquired unconditionally).
+        releaseDeepDuck(false);
         if (!dictationDuckHeld && dictationFocusRequest == null) return;
         try {
             if (dictationFocusRequest != null) {
@@ -3538,6 +3643,141 @@ public class VoiceService extends Service
             armDictationDuckWatchdog();
         };
         handler.postDelayed(dictationDuckWatchdog, DICTATION_DUCK_WATCHDOG_MS);
+    }
+
+    // ------------------------------------------------------------ deep duck (v1.61)
+
+    /**
+     * Acquire the manual deep duck for one holder (playback=true,
+     * dictation=false). First holder in: save the music level and
+     * ramp STREAM_MUSIC down to DEEP_DUCK_FRACTION of it. If his
+     * level is 0 or already at the floor, there is nothing to duck.
+     */
+    private void acquireDeepDuck(boolean playback) {
+        if (playback) {
+            if (deepDuckByPlayback) return;
+            deepDuckByPlayback = true;
+        } else {
+            if (deepDuckByDictation) return;
+            deepDuckByDictation = true;
+        }
+        armDeepDuckWatchdog();
+        if (deepDuckSavedVolume >= 0) return; // other holder already ducked
+        try {
+            int cur = audioManager.getStreamVolume(AudioManager.STREAM_MUSIC);
+            int target = (int) Math.round(cur * DEEP_DUCK_FRACTION);
+            if (cur <= 0 || target >= cur) {
+                log("deepduck: level " + cur + " too low to duck further");
+                return;
+            }
+            if (target < 1) target = 1;
+            deepDuckSavedVolume = cur;
+            deepDuckTargetVolume = target;
+            rampMusicVolume(target);
+            log("deepduck: music " + cur + " → " + target + " ("
+                    + (playback ? "playback" : "dictation") + ")");
+        } catch (Exception e) {
+            log("deepduck: acquire failed: " + e);
+        }
+    }
+
+    /**
+     * Release one holder; the last one out ramps the music back to
+     * the saved level — but only if the stream is still sitting at
+     * our duck target (if Nick changed the volume mid-duck, his
+     * setting wins and we never clobber it; same rule as
+     * restoreMusicVolume).
+     */
+    private void releaseDeepDuck(boolean playback) {
+        if (playback) deepDuckByPlayback = false;
+        else deepDuckByDictation = false;
+        if (deepDuckByPlayback || deepDuckByDictation) return;
+        if (deepDuckWatchdog != null) {
+            handler.removeCallbacks(deepDuckWatchdog);
+            deepDuckWatchdog = null;
+        }
+        if (deepDuckSavedVolume < 0) return;
+        int saved = deepDuckSavedVolume;
+        int target = deepDuckTargetVolume;
+        deepDuckSavedVolume = -1;
+        deepDuckTargetVolume = -1;
+        try {
+            int cur = audioManager.getStreamVolume(AudioManager.STREAM_MUSIC);
+            if (cur == target) {
+                rampMusicVolume(saved);
+                log("deepduck: music restored to " + saved);
+            } else {
+                log("deepduck: volume changed while ducked (" + cur
+                        + ") — keeping his setting");
+            }
+        } catch (Exception e) {
+            log("deepduck: restore failed: " + e);
+        }
+    }
+
+    /** Force-release both holders (service teardown). */
+    private void releaseDeepDuckAll(String why) {
+        deepDuckByPlayback = false;
+        deepDuckByDictation = false;
+        releaseDeepDuck(true);
+        log("deepduck: force-released (" + why + ")");
+    }
+
+    /** Three-step ramp so the fade is a fade, not a click. Generation-guarded. */
+    private void rampMusicVolume(int to) {
+        final int gen = ++deepDuckGeneration;
+        try {
+            final int from = audioManager.getStreamVolume(
+                    AudioManager.STREAM_MUSIC);
+            if (from == to) return;
+            final int step1 = from + (to - from) / 3;
+            final int step2 = from + 2 * (to - from) / 3;
+            audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, step1, 0);
+            handler.postDelayed(() -> {
+                if (gen != deepDuckGeneration) return;
+                try {
+                    audioManager.setStreamVolume(
+                            AudioManager.STREAM_MUSIC, step2, 0);
+                } catch (Exception ignored) {}
+            }, 60);
+            handler.postDelayed(() -> {
+                if (gen != deepDuckGeneration) return;
+                try {
+                    audioManager.setStreamVolume(
+                            AudioManager.STREAM_MUSIC, to, 0);
+                } catch (Exception ignored) {}
+            }, 120);
+        } catch (Exception e) {
+            log("deepduck: ramp failed: " + e);
+        }
+    }
+
+    /**
+     * The stuck-duck watchdog: if a holder claims the duck but
+     * nothing has been playing or dictating for 20 s, the duck is
+     * stale — force it back up. Music must never sit at the floor
+     * because bookkeeping lost track.
+     */
+    private void armDeepDuckWatchdog() {
+        if (deepDuckWatchdog != null) return;
+        deepDuckWatchdog = () -> {
+            deepDuckWatchdog = null;
+            if (!deepDuckByPlayback && !deepDuckByDictation) return;
+            boolean playbackAlive = isPlayingAudio() || playing
+                    || playbackPaused || ttsSpeaking;
+            long dictIdle = android.os.SystemClock.uptimeMillis()
+                    - lastDictationActivityMs;
+            boolean dictAlive = dictationDuckHeld
+                    && dictIdle < DICTATION_DUCK_STALE_MS;
+            if ((deepDuckByPlayback && !playbackAlive)
+                    || (deepDuckByDictation && !dictAlive)) {
+                log("deepduck: watchdog — stale holder, restoring music");
+                releaseDeepDuckAll("watchdog");
+                return;
+            }
+            armDeepDuckWatchdog();
+        };
+        handler.postDelayed(deepDuckWatchdog, DICTATION_DUCK_WATCHDOG_MS);
     }
 
     // ------------------------------------------------------------ v1.60 wake word (sherpa-onnx KWS)
@@ -3596,7 +3836,8 @@ public class VoiceService extends Service
         if (wakeSpotter == null) return;
         boolean want = wakeSpotterReady && !wakeSpotterFailed
                 && isAlwaysListening() && !wakeConvoOpen && !manualListening
-                && !destroyed && gateState != GATE_KILLED && !recognizerActive;
+                && !destroyed && gateState != GATE_KILLED
+                && gateState != GATE_DRONE && !recognizerActive;
         if (want) {
             boolean wasRunning = wakeSpotter.isRunning();
             wakeSpotter.startCapture();
@@ -3619,7 +3860,8 @@ public class VoiceService extends Service
     public boolean wakeSpotterParked() {
         return destroyed || !isAlwaysListening() || wakeConvoOpen
                 || manualListening || recognizerActive || isPlayingAudio()
-                || micMutedForPlayback || gateState == GATE_KILLED;
+                || micMutedForPlayback || gateState == GATE_KILLED
+                || gateState == GATE_DRONE;
     }
 
     /** Spotter thread → main thread shim. */
@@ -3631,7 +3873,7 @@ public class VoiceService extends Service
         if (destroyed || wakeConvoOpen) return;
         String levels = "mean " + String.format(Locale.US, "%.1f", meanDbfs)
                 + " dBFS, std " + String.format(Locale.US, "%.1f", stdDbfs);
-        if (gateState == GATE_KILLED) {
+        if (gateState == GATE_KILLED || gateState == GATE_DRONE) {
             log("wakeword: spot '" + keyword + "' suppressed — gate killed (drone)");
             return;
         }
@@ -3938,6 +4180,12 @@ public class VoiceService extends Service
                 gateProbeScheduleTask = null;
             }
         }
+        if (gateState == GATE_DRONE) {
+            // Listening is ending mid-drone: the extraction session
+            // stands down with everything else.
+            gateState = GATE_AMBIENT;
+            if (droneSession != null) droneSession.endCapture();
+        }
         gateBypassSession = false;
         recognizerActive = false;
         // Nick 2026-10-23 v1.41: last listening session ended — drop the
@@ -3970,7 +4218,8 @@ public class VoiceService extends Service
         // probe loop owns re-arming. Every recognizer start funnels
         // through here, so this one check suppresses them all. The
         // manual override clears the killed state before starting.
-        if (gateState == GATE_KILLED && !gateBypassSession) return;
+        if ((gateState == GATE_KILLED || gateState == GATE_DRONE)
+                && !gateBypassSession) return;
         try {
             muteBeep();
             Intent intent = new Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH);
@@ -4297,6 +4546,21 @@ public class VoiceService extends Service
      * Runs on the main thread (recognizer callback).
      */
     public void onVoiceInput(String text) {
+        // Nick 2026-10-29 v1.61 naming capture: if the naming
+        // question is armed (asked right after an unnamed machine's
+        // run ended), a SHORT reply is the machine's name — consume
+        // it here, never buffer or POST it. A longer reply means the
+        // user just went on dictating; the question was asked once
+        // for this run, so disarm and fall through normally.
+        if (text != null && pendingNameProfileId >= 0
+                && System.currentTimeMillis() <= namingCaptureUntilMs) {
+            String t = text.trim();
+            if (!t.isEmpty() && t.split("\\s+").length <= 6) {
+                applyMachineName(t);
+                return;
+            }
+            disarmNamingCapture();
+        }
         // Nick 2026-10-18 v1.9: Nick's words reach the UI instantly, even
         // if the POST later fails (offline, timeout). His inputs are never
         // spoken aloud — playback only plays Selena's reply MP3s.
@@ -4583,7 +4847,7 @@ public class VoiceService extends Service
      * "results" are the machine talking, not the user.
      */
     public boolean isGateDroneActiveNow() {
-        if (gateState == GATE_KILLED) return true;
+        if (gateState == GATE_KILLED || gateState == GATE_DRONE) return true;
         if (gateDisabled || gateBypassSession) return false;
         return samplerSeesDrone();
     }
@@ -4597,6 +4861,7 @@ public class VoiceService extends Service
         if (destroyed || gateDisabled) return;
         try {
             if (gateState == GATE_KILLED) return; // probes drive exits
+            if (gateState == GATE_DRONE) return; // the drone session drives exits
             if (!recognizerActive || recognizer == null || micMutedForPlayback) {
                 gateDroneSinceMs = 0;
                 return;
@@ -4638,7 +4903,11 @@ public class VoiceService extends Service
                 if (gateDroneSinceMs == 0) {
                     gateDroneSinceMs = gateNow();
                 } else if (gateNow() - gateDroneSinceMs >= GATE_KILL_SUSTAIN_MS) {
-                    enterGateKill();
+                    // Nick 2026-10-29 v1.61: extraction first — if
+                    // the drone pipeline is ready, the session stays
+                    // alive over the machine; the kill is the
+                    // fallback, not the default.
+                    if (!tryEnterDroneMode()) enterGateKill();
                 }
             } else {
                 gateDroneSinceMs = 0;
@@ -4766,14 +5035,14 @@ public class VoiceService extends Service
     /** Called by GateProbeTask on its worker thread. */
     public void onGateProbeResult(float meanDbfs, float stdDb,
                                   float peakDbfs, float zcr, float bright,
-                                  boolean ok) {
+                                  boolean ok, float[] spectrum) {
         handler.post(() -> handleGateProbeResult(
-                meanDbfs, stdDb, peakDbfs, zcr, bright, ok));
+                meanDbfs, stdDb, peakDbfs, zcr, bright, ok, spectrum));
     }
 
     private void handleGateProbeResult(float meanDbfs, float stdDb,
                                        float peakDbfs, float zcr, float bright,
-                                       boolean ok) {
+                                       boolean ok, float[] spectrum) {
         gateProbeInFlight = false;
         if (gateState != GATE_KILLED || destroyed) return;
         if (!ok) {
@@ -4838,6 +5107,24 @@ public class VoiceService extends Service
                 voiceprint.learnNoiseProbe(probeFeats,
                         gateProbeCount < 3 ? 0.7 : 1.0);
             }
+            // Nick 2026-10-29 v1.61 (13:17): near-baseline probes are
+            // the machine itself — teach the MACHINE-PROFILE library
+            // from their spectra (distinct profile per machine), and
+            // once the drone is confirmed + a baseline exists, hand
+            // the session UP to Drone Dictation if the extraction
+            // pipeline is ready: capture stays alive instead of the
+            // recognizer sitting dead until a re-arm.
+            if (machineProfiles != null && spectrum != null
+                    && !Float.isNaN(gateDroneBaselineDbfs)
+                    && Math.abs(meanDbfs - gateDroneBaselineDbfs) < 3f
+                    && (gateProbeCount < 3 || gateProbeCount % 3 == 0)) {
+                machineProfiles.matchOrCreate(this, machineUserKey(),
+                        spectrum, null);
+                if (droneReady && gateProbeCount >= 3
+                        && tryEnterDroneMode()) {
+                    return; // drone session owns the mic now
+                }
+            }
             gateProbeCount++;
             // Re-arm A (§3): the level fell well below the drone
             // baseline and stayed there — the machine stopped.
@@ -4874,11 +5161,425 @@ public class VoiceService extends Service
         }
         log("gate: re-armed (" + reason + ")"
                 + (noiseHoldActive ? " — held dictation resumes" : ""));
+        // Nick 2026-10-29 v1.61: the level just dropped near ambient
+        // after a machine run — if that machine is still unnamed,
+        // this is the ruled moment to ask its name (13:21/13:25).
+        if ("noise stopped".equals(reason)) maybeAskMachineName();
         if (noiseHoldActive) armNoiseHoldTimer();
         updateNotification("🎤 Listening…");
         broadcastListeningState();
         if (recognizerActive && !micMutedForPlayback && !destroyed) {
             restartRecognizerNow();
+        }
+    }
+
+    // ------------------------------------------------------------ v1.61 drone dictation (extraction over a running machine)
+
+    /** Profile the playful during-drone line fired for this run (-1 = not fired). */
+    private int duringLineProfileId = -1;
+
+    private String machineUserKey() {
+        try {
+            return SupabaseAuth.userKey(this);
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    /**
+     * Background prep: fetch the ASR model (43.6 MB checksummed
+     * download into app-private storage — never baked into the APK)
+     * and build the extraction session when it's verified. Until
+     * droneReady flips, the gate behaves exactly as v1.60.
+     */
+    private void initDroneAsync() {
+        fetchUserDisplayNameAsync();
+        final android.content.Context app = getApplicationContext();
+        DroneModelStore.ensureAsync(app, () -> {
+            if (destroyed) return;
+            try {
+                if (!DroneModelStore.isReady(app)) {
+                    log("drone: ASR model unavailable — extraction stays off (gate unchanged)");
+                    return;
+                }
+                DroneSession s = new DroneSession(VoiceService.this,
+                        machineProfiles);
+                if (s.init(app)) {
+                    droneSession = s;
+                    droneReady = true;
+                    log("drone: extraction pipeline READY (own capture + spectral suppression + streaming zipformer)");
+                } else {
+                    log("drone: ASR session init failed — extraction stays off (gate unchanged)");
+                }
+            } catch (Exception e) {
+                log("drone: init failed: " + e);
+            }
+        });
+    }
+
+    /**
+     * Nick's order (2026-10-29): extraction active + session alive
+     * OVER the kill. Called from the gate tick (instead of
+     * enterGateKill) and from the KILLED-side probes (upgrade once a
+     * drone is confirmed). Returns false — caller falls back to the
+     * kill — whenever the pipeline isn't ready.
+     */
+    private boolean tryEnterDroneMode() {
+        if (!droneReady || droneSession == null || destroyed) return false;
+        if (gateState == GATE_DRONE) return true;
+        if (gateDisabled || gateBypassSession) return false;
+        if (gateState == GATE_KILLED && gateProbeScheduleTask != null) {
+            handler.removeCallbacks(gateProbeScheduleTask);
+            gateProbeScheduleTask = null;
+        }
+        enterDroneMode();
+        return gateState == GATE_DRONE;
+    }
+
+    /** Mirrors enterGateKill's holding bookkeeping exactly. */
+    private void enterDroneMode() {
+        gateState = GATE_DRONE;
+        gateDroneSinceMs = 0;
+        duringLineProfileId = -1;
+        boolean holding = sentenceBuffer.length() > 0;
+        if (holding) {
+            noiseHoldActive = true;
+            bufferCutOffFlag = true;
+            if (sentenceFlushTask != null) {
+                handler.removeCallbacks(sentenceFlushTask);
+                sentenceFlushTask = null;
+            }
+            armNoiseHoldTimer();
+            log("drone: loud steady noise — extraction takes the mic ("
+                    + sentenceBuffer.length() + " chars held)");
+        } else {
+            log("drone: loud steady noise — extraction takes the mic");
+        }
+        if (recognizer != null) {
+            try { recognizer.cancel(); } catch (Exception ignored) {}
+        }
+        nickSpeaking = false;
+        gateProbeInFlight = false;
+        updateNotification("🚜 Listening over the noise…");
+        broadcastListeningState();
+        droneSession.beginCapture(machineUserKey());
+    }
+
+    /** Mirrors exitGateKill: grace window, recognizer back, naming ask. */
+    private void exitDroneMode(String reason) {
+        if (gateState != GATE_DRONE) return;
+        if (droneSession != null) droneSession.endCapture();
+        gateState = GATE_AMBIENT;
+        gateDroneSinceMs = 0;
+        gateGraceUntilMs = gateNow() + 6000;
+        if ("manual override".equals(reason)) {
+            gateBypassSession = true;
+            gateDroneAbsentSinceMs = 0;
+        }
+        log("drone: extraction ended (" + reason + ")"
+                + (noiseHoldActive ? " — held dictation resumes" : ""));
+        if ("noise stopped".equals(reason)) maybeAskMachineName();
+        if (noiseHoldActive) armNoiseHoldTimer();
+        updateNotification("🎤 Listening…");
+        broadcastListeningState();
+        if (recognizerActive && !micMutedForPlayback && !destroyed) {
+            restartRecognizerNow();
+        }
+    }
+
+    /** DroneSession polls this: park capture while she's talking or we're gone. */
+    public boolean droneSessionParked() {
+        return destroyed || isPlayingAudio() || micMutedForPlayback
+                || System.currentTimeMillis() < droneSelfTalkUntilMs;
+    }
+
+    /**
+     * The extraction pipeline failed mid-run: fall back to the exact
+     * v1.60 kill bookkeeping (held text keeps its 60 s promise; the
+     * probe cadence takes over from here).
+     */
+    public void onDroneFailed(String why) {
+        handler.post(() -> {
+            if (gateState != GATE_DRONE) return;
+            log("drone: pipeline failed (" + why
+                    + ") — falling back to the gate kill");
+            if (droneSession != null) droneSession.endCapture();
+            gateState = GATE_KILLED;
+            gateProbeCount = 0;
+            gateProbeDropCount = 0;
+            gateDroneBaselineDbfs = Float.NaN;
+            updateNotification(noiseHoldActive
+                    ? "🚜 Paused — loud noise (dictation held)"
+                    : "🚜 Paused — loud noise");
+            broadcastListeningState();
+            scheduleGateProbe(300);
+        });
+    }
+
+    /** DroneSession saw the level drop near ambient: the run is over. */
+    public void onDroneGone(int profileId) {
+        handler.post(() -> {
+            if (gateState != GATE_DRONE) return;
+            exitDroneMode("noise stopped");
+        });
+    }
+
+    public void onDronePartial(String text) {
+        handler.post(() -> {
+            if (gateState != GATE_DRONE || text == null) return;
+            onPartialVoiceInput(text);
+        });
+    }
+
+    /**
+     * A finished utterance from the drone ASR. Feeds the EXISTING
+     * acceptance path (sentence buffer, wake gating, POST) unchanged
+     * — plus the two drone-only extras: a during-drone naming answer
+     * is consumed as a name, and the raw-branch probe features teach
+     * the SEPARATE drone-domain voice profile (never the platform
+     * voiceprint — different measurement domain).
+     */
+    public void onDroneDictation(String text, float[] feats) {
+        handler.post(() -> {
+            if (text == null || text.trim().isEmpty()) return;
+            acquireDictationDuck(); // capture is live — music fades (v1.59 rule)
+            String trimmed = text.trim();
+            // 13:28: an answer to the during-drone line names the
+            // machine on the spot — short, prefix-shaped ("it's the
+            // mower", "the blower") while that line fired this run.
+            if (gateState == GATE_DRONE && machineProfiles != null
+                    && duringLineProfileId >= 0 && droneSession != null
+                    && droneSession.activeProfileId() == duringLineProfileId) {
+                MachineProfiles.Profile p = machineProfiles.get(
+                        this, machineUserKey(), duringLineProfileId);
+                String low = trimmed.toLowerCase(Locale.US);
+                if (p != null && !p.named
+                        && trimmed.split("\\s+").length <= 4
+                        && (low.startsWith("it's ") || low.startsWith("it is ")
+                                || low.startsWith("that's ")
+                                || low.startsWith("that is ")
+                                || low.startsWith("the "))) {
+                    String name = cleanMachineName(trimmed);
+                    if (!name.isEmpty()) {
+                        machineProfiles.rename(this, machineUserKey(),
+                                p.id, name);
+                        log("drone: machine " + p.id + " named '" + name
+                                + "' (during-drone answer)");
+                        updateNotification("🚜 Got it — that was the " + name);
+                        if (pendingNameProfileId == p.id) {
+                            disarmNamingCapture();
+                        }
+                        duringLineProfileId = -1;
+                        return;
+                    }
+                }
+            }
+            onVoiceInput(text);
+            if (machineProfiles != null && feats != null) {
+                String low = trimmed.toLowerCase(Locale.US);
+                if (low.startsWith("ignore that")
+                        || low.startsWith("that wasn't me")
+                        || low.startsWith("that wasnt me")
+                        || low.startsWith("not me")
+                        || low.startsWith("disregard that")) {
+                    machineProfiles.undoLastVoiceSample(
+                            this, machineUserKey());
+                } else {
+                    machineProfiles.learnVoiceSample(
+                            this, machineUserKey(), feats);
+                }
+            }
+        });
+    }
+
+    /**
+     * DroneSession: an UNNAMED machine has been running a while —
+     * say the playful line (Nick 13:28/13:31, verbatim with its
+     * emphasis styling). Non-blocking; nothing waits on an answer.
+     */
+    public void onDroneSustainedUnnamed(int profileId, String profileName) {
+        handler.post(() -> {
+            if (gateState != GATE_DRONE) return;
+            duringLineProfileId = profileId;
+            speakDronePrompt(DURING_DRONE_LINE, "machine_during_drone",
+                    profileId, profileName);
+        });
+    }
+
+    // ------------------------------------------------------------ machine naming (13:21/13:25/13:27)
+
+    /**
+     * After a run of a still-unnamed machine, ask its name — exactly
+     * "Hey, {user}, what was that noise?" — once per run, on every
+     * run, until it's named; never again after. The reply is
+     * captured in onVoiceInput (short) / onDroneDictation.
+     */
+    private void maybeAskMachineName() {
+        if (machineProfiles == null) return;
+        MachineProfiles.Profile p = machineProfiles.lastActiveUnnamed(
+                this, machineUserKey());
+        if (p == null) return;
+        pendingNameProfileId = p.id;
+        namingCaptureUntilMs = System.currentTimeMillis() + NAMING_CAPTURE_MS;
+        String name = userDisplayName();
+        String q = (name != null && !name.isEmpty())
+                ? "Hey, " + name + ", what was that noise?"
+                : "Hey, what was that noise?";
+        log("drone: naming ask for profile " + p.id + " (" + p.name
+                + "): " + q);
+        speakDronePrompt(q, "machine_naming_ask", p.id, p.name);
+        fetchUserDisplayNameAsync(); // keep the name fresh for next time
+    }
+
+    /**
+     * Deliver a drone prompt: a durable directive POST through the
+     * normal input path (the brain sees the question and the naming
+     * context), the notification line, and the on-device voice when
+     * she's not already speaking — never over a queued reply.
+     */
+    private void speakDronePrompt(String text, String action,
+                                  int profileId, String profileName) {
+        new Thread(new MachineNameDirectiveTask(
+                this, action, profileId, profileName, text)).start();
+        updateNotification("🚜 " + text);
+        if (tts != null && ttsReady && !isPlayingAudio() && !playing
+                && !ttsSpeaking) {
+            // Park her own ears while she talks: the drone capture
+            // stands down for the estimated utterance so she can't
+            // transcribe herself (the platform side is echo-guarded
+            // inside speakOnDevice).
+            int words = Math.max(1, text.split("\\s+").length);
+            droneSelfTalkUntilMs = System.currentTimeMillis()
+                    + words * 650L + 1200L;
+            speakOnDevice(text, false);
+        } else {
+            log("drone: prompt not spoken (tts busy/unavailable) — "
+                    + "directive + notification only: " + text);
+        }
+    }
+
+    private void applyMachineName(String spoken) {
+        int pid = pendingNameProfileId;
+        disarmNamingCapture();
+        if (machineProfiles == null || pid < 0) return;
+        String name = cleanMachineName(spoken);
+        if (name.isEmpty()) return;
+        machineProfiles.rename(this, machineUserKey(), pid, name);
+        log("drone: machine " + pid + " named '" + name + "' (voice reply)");
+        updateNotification("🚜 Got it — that was the " + name);
+    }
+
+    private void disarmNamingCapture() {
+        pendingNameProfileId = -1;
+        namingCaptureUntilMs = 0;
+    }
+
+    /** Light cleanup of a spoken machine name ("that was the mower." → "mower"). */
+    static String cleanMachineName(String spoken) {
+        String s = spoken.trim().replaceAll("[.!?]+$", "").trim();
+        String low = s.toLowerCase(Locale.US);
+        String[] prefixes = {
+                "that was the ", "that was a ", "that was ",
+                "it was the ", "it was a ", "it was ",
+                "it's the ", "it's a ", "it's ",
+                "it is the ", "it is a ", "it is ",
+                "that's the ", "that's a ", "that's ", "the "};
+        for (String pre : prefixes) {
+            if (low.startsWith(pre)) {
+                s = s.substring(pre.length());
+                break;
+            }
+        }
+        return s.trim();
+    }
+
+    /** First name of the signed-in user, cached from their Siteview profile. */
+    private String userDisplayName() {
+        String full = getSharedPreferences(PREFS, MODE_PRIVATE)
+                .getString("user_display_name", "");
+        if (full == null || full.isEmpty()) return null;
+        int sp = full.indexOf(' ');
+        return sp > 0 ? full.substring(0, sp) : full;
+    }
+
+    /**
+     * One-shot profiles fetch for the naming prompt's {user}. Quiet
+     * failure by design: the prompt falls back to the nameless form
+     * and the next run tries again.
+     */
+    private void fetchUserDisplayNameAsync() {
+        new Thread(() -> {
+            try {
+                String have = getSharedPreferences(PREFS, MODE_PRIVATE)
+                        .getString("user_display_name", "");
+                if (have != null && !have.isEmpty()) return;
+                String userKey = SupabaseAuth.userKey(this);
+                if (userKey == null || userKey.startsWith("em_")) return;
+                String token = SupabaseAuth.validAccessToken(this);
+                if (token == null) return;
+                URL url = new URL("https://api.siteviewoperations.com"
+                        + "/rest/v1/profiles?id=eq." + userKey
+                        + "&select=display_name");
+                HttpURLConnection c = (HttpURLConnection) url.openConnection();
+                c.setRequestProperty("apikey", SupabaseAuth.apiKey());
+                c.setRequestProperty("Authorization", "Bearer " + token);
+                c.setConnectTimeout(8000);
+                c.setReadTimeout(8000);
+                if (c.getResponseCode() != 200) return;
+                java.io.InputStream in = c.getInputStream();
+                StringBuilder sb = new StringBuilder();
+                byte[] buf = new byte[1024];
+                int n;
+                while ((n = in.read(buf)) > 0) {
+                    sb.append(new String(buf, 0, n, "UTF-8"));
+                }
+                org.json.JSONArray arr = new org.json.JSONArray(sb.toString());
+                if (arr.length() > 0) {
+                    String dn = arr.getJSONObject(0)
+                            .optString("display_name", "");
+                    if (!dn.isEmpty()) {
+                        getSharedPreferences(PREFS, MODE_PRIVATE).edit()
+                                .putString("user_display_name", dn).apply();
+                        log("drone: user display name cached for prompts");
+                    }
+                }
+            } catch (Exception e) {
+                log("drone: display-name fetch failed: " + e);
+            }
+        }).start();
+    }
+
+    /** MachineNameDirectiveTask's POST — mirrors doPostWakeDirective. */
+    public void doPostMachineDirective(String action, int profileId,
+                                       String profileName, String line) {
+        HttpURLConnection conn = null;
+        try {
+            URL url = new URL(BASE_URL + "/api/selena-voice/input");
+            conn = (HttpURLConnection) url.openConnection();
+            conn.setRequestMethod("POST");
+            conn.setRequestProperty("Content-Type", "application/json");
+            conn.setConnectTimeout(8000);
+            conn.setReadTimeout(8000);
+            conn.setDoOutput(true);
+            JSONObject body = new JSONObject();
+            body.put("action", action);
+            body.put("profileId", profileId);
+            body.put("profileName", profileName);
+            body.put("line", line);
+            body.put("timestamp", System.currentTimeMillis());
+            OutputStream os = null;
+            try {
+                os = conn.getOutputStream();
+                os.write(body.toString().getBytes("UTF-8"));
+            } finally {
+                if (os != null) try { os.close(); } catch (Exception ignored) {}
+            }
+            int code = conn.getResponseCode();
+            log("drone: directive posted (" + code + "): " + action);
+        } catch (Exception e) {
+            Log.w(TAG, "drone: directive post failed", e);
+        } finally {
+            if (conn != null) conn.disconnect();
         }
     }
 

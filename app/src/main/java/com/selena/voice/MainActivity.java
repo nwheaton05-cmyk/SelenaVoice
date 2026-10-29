@@ -83,6 +83,7 @@ public class MainActivity extends Activity {
     private Button signInButton;
     private Button deleteKeyButton;
     private Button voiceprintButton;
+    private Button machinesButton;
 
     // Nick 2026-10-22 v1.33: in-app auto-updater banner. Hidden until the
     // version check finds a newer APK; tap downloads + installs it.
@@ -379,6 +380,9 @@ public class MainActivity extends Activity {
         voiceprintButton = findViewById(R.id.voiceprintButton);
         voiceprintButton.setEnabled(true);
         voiceprintButton.setOnClickListener(v -> showVoiceprintDialog());
+        machinesButton = findViewById(R.id.machinesButton);
+        machinesButton.setEnabled(true);
+        machinesButton.setOnClickListener(v -> showMachinesDialog());
         refreshSignInButton();
 
         // Nick 2026-10-22 v1.33: in-app auto-updater. Hidden until the
@@ -775,6 +779,62 @@ public class MainActivity extends Activity {
                             android.widget.Toast.LENGTH_SHORT).show();
                 })
                 .setNegativeButton("Keep", null)
+                .show();
+    }
+
+    /**
+     * Nick 2026-10-29 v1.61: the learned machine-sound library. The
+     * app names new machines by VOICE first (it asks after the noise
+     * stops); this dialog is the fallback label path — tap a machine
+     * to rename it. Renaming here counts as named: the voice prompts
+     * stop for that machine.
+     */
+    private void showMachinesDialog() {
+        java.util.List<MachineProfiles.Profile> profiles =
+                MachineProfiles.listForUi(this);
+        if (profiles == null || profiles.isEmpty()) {
+            new android.app.AlertDialog.Builder(this)
+                    .setTitle("Machine sounds")
+                    .setMessage("No machine sounds learned yet.\n\n"
+                            + "When something loud and steady runs — the"
+                            + " mower, a weed whacker, a blower — the app"
+                            + " learns its sound as its own profile, and"
+                            + " after it stops she'll ask you what it was.")
+                    .setPositiveButton("OK", null)
+                    .show();
+            return;
+        }
+        String[] labels = new String[profiles.size()];
+        for (int i = 0; i < profiles.size(); i++) {
+            labels[i] = MachineProfiles.describe(profiles.get(i));
+        }
+        new android.app.AlertDialog.Builder(this)
+                .setTitle("Machine sounds (tap to rename)")
+                .setItems(labels, (d, which) ->
+                        showMachineRenameDialog(profiles.get(which)))
+                .setNegativeButton("Close", null)
+                .show();
+    }
+
+    private void showMachineRenameDialog(MachineProfiles.Profile p) {
+        final android.widget.EditText nameIn =
+                new android.widget.EditText(this);
+        nameIn.setHint("Machine name");
+        nameIn.setText(p.name);
+        nameIn.setSelection(nameIn.getText().length());
+        new android.app.AlertDialog.Builder(this)
+                .setTitle("Name this machine")
+                .setView(nameIn)
+                .setPositiveButton("Save", (d, w) -> {
+                    String name = nameIn.getText().toString().trim();
+                    if (!name.isEmpty()
+                            && MachineProfiles.renameForUi(this, p.id, name)) {
+                        android.widget.Toast.makeText(MainActivity.this,
+                                "Saved: " + name,
+                                android.widget.Toast.LENGTH_SHORT).show();
+                    }
+                })
+                .setNegativeButton("Cancel", null)
                 .show();
     }
 
