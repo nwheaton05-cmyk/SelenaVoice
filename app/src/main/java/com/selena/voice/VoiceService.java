@@ -300,6 +300,29 @@ public class VoiceService extends Service
     private static final long DICTATION_DUCK_GRACE_MS = 3000;
     private static final long DICTATION_DUCK_STALE_MS = 20000;
     private static final long DICTATION_DUCK_WATCHDOG_MS = 5000;
+    // Nick 2026-10-29 v1.60 (true wake word spike): sherpa-onnx
+    // keyword spotter (WakeWordSpotter) + the app-side conversation
+    // window it opens. While the spotter is healthy and no
+    // conversation is open, the spotter is the SOLE mic consumer and
+    // the SpeechRecognizer rests; a spot (or the transcript fallback)
+    // opens the window for WAKE_CONVO_WINDOW_MS — the same 2 minutes
+    // as the web rule — during which dictations post exactly as they
+    // did pre-v1.60. Outside the window, dictations without the wake
+    // word are held (never posted). If the spotter fails to init,
+    // wakeSpotterFailed fails the whole mode OPEN: recognizer always
+    // on, everything posts, exactly v1.59 behavior.
+    private WakeWordSpotter wakeSpotter = null;
+    private volatile boolean wakeSpotterReady = false;
+    private volatile boolean wakeSpotterFailed = false;
+    private volatile boolean wakeConvoOpen = false;
+    private volatile long wakeConvoUntilMs = 0;
+    private Runnable wakeExpiryTask = null;
+    private static final long WAKE_CONVO_WINDOW_MS = 120000;
+    // Drone mirror for spot suppression, on the spotter's PCM scale
+    // (dBFS — NOT the recognizer's RMS scale the gate constants use):
+    // a mower at earbud distance is very loud and very flat.
+    private static final float WAKE_DRONE_MEAN_DBFS = -25.0f;
+    private static final float WAKE_DRONE_STD_DB = 2.0f;
     private NotificationManager notificationManager;
     private ServiceRecognitionListener recognitionListener;
     private PowerManager.WakeLock wakeLock;
@@ -574,6 +597,11 @@ public class VoiceService extends Service
         // Nick 2026-10-28 v1.52: noise-gate watchdog (250ms tick,
         // near-free when nothing is being listened to).
         startGateWatchdog();
+        // Nick 2026-10-29 v1.60: wake word spotter loads async; when
+        // it's ready it takes over the idle mic (see onWakeSpotterReady
+        // for the handover). Until then the recognizer path above is
+        // untouched — and stays untouched if init fails (fail open).
+        initWakeSpotterAsync();
         log("service created (v1.16 background mode)");
     }
 
@@ -585,9 +613,24 @@ public class VoiceService extends Service
                 setAlwaysListening(on);
                 if (on) {
                     manualListening = false; // switch owns the mic now
-                    startContinuousListening();
+                    // Nick 2026-10-29 v1.60: with a healthy spotter,
+                    // switch-on now means spotter mode (the recognizer
+                    // rests until a wake opens a conversation); without
+                    // one, exactly the pre-v1.60 behavior.
+                    refreshWakeMode();
+                    if (wakeSpotter == null || !wakeSpotter.isRunning()) {
+                        startContinuousListening();
+                    }
                 } else {
                     manualListening = false;
+                    // v1.60: switching off also closes any wake-opened
+                    // conversation and stands the spotter down.
+                    wakeConvoOpen = false;
+                    if (wakeExpiryTask != null) {
+                        handler.removeCallbacks(wakeExpiryTask);
+                        wakeExpiryTask = null;
+                    }
+                    if (wakeSpotter != null) wakeSpotter.stopCapture();
                     stopContinuousListening();
                 }
                 broadcastListeningState();
@@ -725,6 +768,15 @@ public class VoiceService extends Service
         restoreMusicVolume(); // Nick 2026-10-19 v1.17: safety net — never
         // leave the music stream stuck at the boosted max.
         releaseDictationDuck("service destroyed"); // v1.59 safety net
+        // Nick 2026-10-29 v1.60: stop + release the wake word spotter.
+        if (wakeExpiryTask != null) {
+            handler.removeCallbacks(wakeExpiryTask);
+            wakeExpiryTask = null;
+        }
+        if (wakeSpotter != null) {
+            wakeSpotter.release();
+            wakeSpotter = null;
+        }
         unmuteBeep();
         recognizerActive = false;
         destroyRecognizer();
@@ -3488,6 +3540,262 @@ public class VoiceService extends Service
         handler.postDelayed(dictationDuckWatchdog, DICTATION_DUCK_WATCHDOG_MS);
     }
 
+    // ------------------------------------------------------------ v1.60 wake word (sherpa-onnx KWS)
+
+    /**
+     * Load the spotter off the main thread. Until it is ready, the
+     * recognizer path runs exactly as before; if it never becomes
+     * ready, it stays that way (fail open).
+     */
+    private void initWakeSpotterAsync() {
+        new Thread(() -> {
+            WakeWordSpotter candidate = new WakeWordSpotter(this);
+            if (candidate.init(this)) {
+                wakeSpotter = candidate;
+                wakeSpotterReady = true;
+                handler.post(this::onWakeSpotterReady);
+            } else {
+                wakeSpotterFailed = true;
+                log("wakeword: spotter unavailable (init failed) — "
+                        + "transcript wake word remains the only path");
+            }
+        }, "SelenaWakeInit").start();
+    }
+
+    /**
+     * Main thread, spotter ready: if the assistant is in the plain
+     * idle state (always-listening on, no conversation, nobody
+     * mid-dictation, nothing playing), hand the mic over — recognizer
+     * rests, spotter listens. Any busier state is left alone; the
+     * spotter joins at the next natural transition (window expiry,
+     * toggle) via refreshWakeMode().
+     */
+    private void onWakeSpotterReady() {
+        log("wakeword: spotter ready — 'Insight' / 'Hey Insight' (sherpa-onnx KWS, on-device)");
+        if (destroyed || !isAlwaysListening() || wakeConvoOpen
+                || manualListening) {
+            return;
+        }
+        if (recognizerActive && !nickSpeaking && sentenceBuffer.length() == 0
+                && !isPlayingAudio() && gateState != GATE_KILLED) {
+            stopContinuousListening();
+        }
+        refreshWakeMode();
+    }
+
+    /**
+     * The mode arbiter: start the spotter capture iff it should be
+     * the idle listener right now; stop it when a conversation is
+     * open, a manual session owns the mic, always-listening is off,
+     * or the service is going away. The recognizer-active and gate
+     * conditions are ALSO re-checked per-chunk inside the capture
+     * loop (wakeSpotterParked), so a transition this method misses
+     * can never produce two live mic consumers.
+     */
+    private void refreshWakeMode() {
+        if (wakeSpotter == null) return;
+        boolean want = wakeSpotterReady && !wakeSpotterFailed
+                && isAlwaysListening() && !wakeConvoOpen && !manualListening
+                && !destroyed && gateState != GATE_KILLED && !recognizerActive;
+        if (want) {
+            boolean wasRunning = wakeSpotter.isRunning();
+            wakeSpotter.startCapture();
+            if (!wasRunning && wakeSpotter.isRunning()) {
+                updateNotification("👂 Waiting for 'Insight'…");
+                log("wakeword: spotter listening — recognizer resting");
+            }
+        } else if (wakeConvoOpen || manualListening || !isAlwaysListening()
+                || destroyed) {
+            wakeSpotter.stopCapture();
+        }
+    }
+
+    /**
+     * Called from the spotter's capture thread per chunk: park (mic
+     * released, nothing fed, nothing captured) whenever anything else
+     * owns the moment — the recognizer, Selena's own playback (echo),
+     * the playback mic-mute, or a gate-killed drone session.
+     */
+    public boolean wakeSpotterParked() {
+        return destroyed || !isAlwaysListening() || wakeConvoOpen
+                || manualListening || recognizerActive || isPlayingAudio()
+                || micMutedForPlayback || gateState == GATE_KILLED;
+    }
+
+    /** Spotter thread → main thread shim. */
+    public void onWakeWordSpotted(String keyword, float meanDbfs, float stdDbfs) {
+        handler.post(() -> handleWakeSpot(keyword, meanDbfs, stdDbfs));
+    }
+
+    private void handleWakeSpot(String keyword, float meanDbfs, float stdDbfs) {
+        if (destroyed || wakeConvoOpen) return;
+        String levels = "mean " + String.format(Locale.US, "%.1f", meanDbfs)
+                + " dBFS, std " + String.format(Locale.US, "%.1f", stdDbfs);
+        if (gateState == GATE_KILLED) {
+            log("wakeword: spot '" + keyword + "' suppressed — gate killed (drone)");
+            return;
+        }
+        // The gate's principle, mirrored on the spotter's own levels:
+        // loud AND steady = machine, not a wake word. (The capture
+        // loop parks while the gate is KILLED; this guards the window
+        // where the drone is present but the gate — which samples the
+        // recognizer, now resting — has not killed.)
+        if (meanDbfs >= WAKE_DRONE_MEAN_DBFS && stdDbfs <= WAKE_DRONE_STD_DB) {
+            log("wakeword: spot '" + keyword + "' suppressed — loud steady drone ("
+                    + levels + ")");
+            return;
+        }
+        log("wakeword: spotted '" + keyword + "' (" + levels
+                + ") — opening conversation, recognizer taking over");
+        openWakeConversation("spotter");
+        new Thread(new WakeDirectiveTask(this, keyword)).start();
+    }
+
+    /**
+     * Open (or re-open) the app-side conversation window and make
+     * sure the recognizer is the live mic consumer. The window lasts
+     * WAKE_CONVO_WINDOW_MS from the last posted dictation — the same
+     * 2 minutes as the web rule.
+     */
+    private void openWakeConversation(String source) {
+        wakeConvoOpen = true;
+        wakeConvoUntilMs = gateNow() + WAKE_CONVO_WINDOW_MS;
+        armWakeExpiry();
+        if (wakeSpotter != null) wakeSpotter.stopCapture();
+        // No-op when the recognizer is already running (transcript /
+        // noise-hold sources); the entry point for the spotter source.
+        startContinuousListening();
+        log("wakeword: conversation open (" + source + ") — 2m window");
+    }
+
+    /** A posted dictation inside the window extends it. */
+    private void noteWakeConversationActivity() {
+        if (!wakeConvoOpen) return;
+        wakeConvoUntilMs = gateNow() + WAKE_CONVO_WINDOW_MS;
+        armWakeExpiry();
+    }
+
+    private void armWakeExpiry() {
+        if (wakeExpiryTask != null) handler.removeCallbacks(wakeExpiryTask);
+        wakeExpiryTask = () -> onWakeConvoExpiry();
+        long delay = Math.max(1000L, wakeConvoUntilMs - gateNow());
+        handler.postDelayed(wakeExpiryTask, delay);
+    }
+
+    private void onWakeConvoExpiry() {
+        wakeExpiryTask = null;
+        if (!wakeConvoOpen) return;
+        // Mid-flow never closes: he's dictating, composing, in a
+        // manual session, or she's mid-answer. Re-check shortly.
+        if (nickSpeaking || sentenceBuffer.length() > 0 || manualListening
+                || isPlayingAudio()) {
+            wakeExpiryTask = () -> onWakeConvoExpiry();
+            handler.postDelayed(wakeExpiryTask, 30000);
+            return;
+        }
+        wakeConvoOpen = false;
+        log("wakeword: conversation window closed (2m idle) — spotter resuming");
+        if (isAlwaysListening() && !destroyed && gateState != GATE_KILLED
+                && recognizerActive) {
+            // stopContinuousListening first sends any noise-held
+            // dictation — and that send RE-OPENS this window (the
+            // exchange is still live). Honor the re-open: bring the
+            // recognizer back instead of handing over to the spotter.
+            stopContinuousListening();
+            if (wakeConvoOpen) {
+                startContinuousListening();
+                return;
+            }
+        }
+        refreshWakeMode();
+    }
+
+    /**
+     * True when the v1.60 wake gate should hold a flushed dictation:
+     * spotter engaged, no conversation open, not a manual/deliberate
+     * session. Spotter-failed mode never blocks (fail open).
+     */
+    private boolean wakeGateBlocksPost() {
+        if (wakeSpotter == null || !wakeSpotterReady || wakeSpotterFailed) {
+            return false;
+        }
+        if (wakeConvoOpen) return false;
+        if (manualListening || gateBypassSession) return false;
+        return true;
+    }
+
+    /**
+     * The transcript fallback, mirroring the web layer's detectWakeWord
+     * placement rule: the wake word counts as the first word(s) of the
+     * sentence — "insight" or "hey insight", case-insensitive, light
+     * punctuation tolerated.
+     */
+    private boolean sentenceStartsWithWakeWord(String sentence) {
+        if (sentence == null) return false;
+        String t = sentence.trim().toLowerCase(Locale.US);
+        t = t.replaceAll("^[^a-z]+", "");
+        return t.equals("insight") || t.startsWith("insight ")
+                || t.startsWith("insight,") || t.startsWith("insight.")
+                || t.equals("hey insight") || t.startsWith("hey insight ")
+                || t.startsWith("hey insight,") || t.startsWith("hey insight.");
+    }
+
+    /**
+     * Spotter failure (init or runtime): fail OPEN — the mode
+     * disables itself and the recognizer path resumes, exactly the
+     * pre-v1.60 behavior. Called from any thread.
+     */
+    public void onWakeSpotterFailed(String reason) {
+        if (wakeSpotterFailed) return;
+        wakeSpotterFailed = true;
+        log("wakeword: spotter failed (" + reason + ") — falling back to "
+                + "always-recognizer; transcript wake word only");
+        handler.post(() -> {
+            if (wakeSpotter != null) wakeSpotter.stopCapture();
+            if (!destroyed && isAlwaysListening() && !recognizerActive
+                    && !manualListening) {
+                startContinuousListening();
+            }
+        });
+    }
+
+    /**
+     * POST the wake directive: {action:'wake_word_spotted', keyword}.
+     * The input route records any string action into
+     * selena_voice_directives (user_id null for app posts, same as the
+     * app's dictation posts today) — the durable server-side record of
+     * the spot; the brain treats the unknown kind gracefully.
+     */
+    public void doPostWakeDirective(String keyword) {
+        HttpURLConnection conn = null;
+        try {
+            URL url = new URL(BASE_URL + "/api/selena-voice/input");
+            conn = (HttpURLConnection) url.openConnection();
+            conn.setRequestMethod("POST");
+            conn.setRequestProperty("Content-Type", "application/json");
+            conn.setConnectTimeout(8000);
+            conn.setReadTimeout(8000);
+            conn.setDoOutput(true);
+            JSONObject body = new JSONObject();
+            body.put("action", "wake_word_spotted");
+            body.put("keyword", keyword);
+            body.put("timestamp", System.currentTimeMillis());
+            OutputStream os = null;
+            try {
+                os = conn.getOutputStream();
+                os.write(body.toString().getBytes("UTF-8"));
+            } finally {
+                if (os != null) try { os.close(); } catch (Exception ignored) {}
+            }
+            int code = conn.getResponseCode();
+            log("wakeword: directive posted (" + code + "): '" + keyword + "'");
+        } catch (Exception e) {
+            Log.w(TAG, "wakeword: directive post failed", e);
+        } finally {
+            if (conn != null) conn.disconnect();
+        }
+    }
+
     private boolean isPhoneVoiceMode() {
         return VOICE_PHONE.equals(getSharedPreferences(PREFS, MODE_PRIVATE)
                 .getString(KEY_VOICE_MODE, VOICE_PHONE));
@@ -3587,6 +3895,11 @@ public class VoiceService extends Service
 
     private void startContinuousListening() {
         if (recognizerActive || destroyed) return;
+        // Nick 2026-10-29 v1.60: the recognizer taking the mic always
+        // stands the wake spotter down first — never two live mic
+        // consumers (the spotter's own capture loop also parks itself
+        // whenever the recognizer is active, as a backstop).
+        if (wakeSpotter != null) wakeSpotter.stopCapture();
         // Nick 2026-10-23 v1.41: never claim the mic (recognizer or FGS
         // type) without RECORD_AUDIO. Refuse loudly instead of crashing.
         if (!hasMicPermission()) {
@@ -4143,11 +4456,34 @@ public class VoiceService extends Service
         // Nick 2026-10-23 v1.46: his dictations live in the message
         // history as from-Nick entries, in the same list as her replies.
         MessageHistory.addNick(sentence);
-        Intent sent = new Intent(ACTION_INPUT_SENT);
-        sent.putExtra(EXTRA_TEXT, sentence);
-        sendAppBroadcast(sent);
-        final String toPost = sentence;
-        new Thread(new InputPostTask(this, toPost)).start();
+        // Nick 2026-10-29 v1.60 (true wake word): while the spotter is
+        // engaged and no conversation is open, a dictation is SENT
+        // only when it carries the wake word itself (the transcript
+        // fallback — the spotter is the primary path). Anything else
+        // is pre-wake chatter: it stays in his local history above and
+        // is never posted. An open conversation, a manual session, and
+        // spotter-failed mode all post exactly as before.
+        boolean heldByWakeGate = false;
+        if (wakeGateBlocksPost()) {
+            if (sentenceStartsWithWakeWord(sentence)) {
+                log("wakeword: transcript wake word — conversation opened (fallback path)");
+                openWakeConversation("transcript");
+            } else {
+                heldByWakeGate = true;
+                String preview = sentence.length() > 30
+                        ? sentence.substring(0, 30) + "…" : sentence;
+                log("wakeword: dictation held — conversation closed, no wake word: '"
+                        + preview + "'");
+            }
+        }
+        if (!heldByWakeGate) {
+            Intent sent = new Intent(ACTION_INPUT_SENT);
+            sent.putExtra(EXTRA_TEXT, sentence);
+            sendAppBroadcast(sent);
+            final String toPost = sentence;
+            new Thread(new InputPostTask(this, toPost)).start();
+            noteWakeConversationActivity();
+        }
         // Nick 2026-10-29 v1.59: the batch is sent and the buffer is
         // empty — the dictation is over; release the duck BEFORE any
         // held playback starts (playback takes its own MAY_DUCK focus,
@@ -4380,6 +4716,17 @@ public class VoiceService extends Service
         Intent sent = new Intent(ACTION_INPUT_SENT);
         sent.putExtra(EXTRA_TEXT, sentence);
         sendAppBroadcast(sent);
+        // Nick 2026-10-29 v1.60: a noise-held dictation BYPASSES the
+        // wake gate (the §3 60-second send is a promise — the words
+        // were dictated inside a live exchange the drone interrupted).
+        // It also re-opens/extends the wake conversation: the exchange
+        // it belongs to is still live.
+        if (wakeSpotter != null && wakeSpotterReady && !wakeSpotterFailed
+                && !wakeConvoOpen && isAlwaysListening()) {
+            openWakeConversation("noise-hold");
+        } else {
+            noteWakeConversationActivity();
+        }
         new Thread(new InputPostTask(this, sentence, true)).start();
         // Nick 2026-10-29 v1.59: held dictation sent, buffer empty —
         // release the duck (the watchdog would stale-release anyway;

@@ -2,3 +2,6 @@
 *.jks
 *.p12
 build/
+
+# Nick 2026-10-29 v1.60: KWS model bundle (~17MB download) is build input, not source
+kws-model-cache/
