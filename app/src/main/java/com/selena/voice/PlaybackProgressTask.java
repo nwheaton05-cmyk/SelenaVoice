@@ -36,8 +36,13 @@ import java.nio.charset.StandardCharsets;
  * same wire also reports a user STOP (action 'playback_stopped').
  * Delete-once-heard (Nick, 2026-10-29): a stopped message never
  * resumes, so the brain deletes the owning item's queue rows +
- * stored audio at stop. A PAUSE is never reported on this wire —
- * paused messages keep everything.
+ * stored audio at stop. A plain PAUSE is never reported on this
+ * wire — paused messages keep everything.
+ *
+ * v1.57 (2026-10-29): a third action, 'playback_pause_dictate' —
+ * pause-then-dictate counts as heard (Nick, 2026-10-29 08:40): when
+ * a dictation is sent while a message sits paused, the brain
+ * deletes that item's rows + audio at that point.
  */
 public class PlaybackProgressTask implements Runnable {
     private static final String TAG = "SelenaVoice";

@@ -1561,6 +1561,28 @@ public class VoiceService extends Service
         }
     }
 
+    /**
+     * v1.57 (2026-10-29): pause-then-dictate counts as heard (Nick,
+     * 2026-10-29 08:40). Called at the top of doPostInput — the one
+     * choke point every sent dictation passes through. If a message
+     * sits PAUSED at that moment, the user has moved on: report it
+     * (playback_pause_dictate) and the brain deletes ALL of the item's
+     * queue rows + stored audio right then, unplayed remainder
+     * included — the message is NOT held for resume and does NOT wait
+     * for the rework merge. A plain pause with no dictation sent never
+     * reaches this code and keeps the message for resume. Deletion
+     * ledger only: the brain leaves the played fraction literal, and
+     * the item's pending text still rolls into the rework as before.
+     * Priority interjections are not server rows — never reported.
+     */
+    private void reportPauseDictateIfPaused() {
+        if (!playbackPaused && !ttsPaused) return;
+        String rowId = currentPlayServerId;
+        if (rowId == null || rowId.isEmpty() || "priority".equals(rowId)) return;
+        log("pause-dictate: reporting paused row as heard: " + rowId);
+        new Thread(new PlaybackProgressTask(rowId, "playback_pause_dictate")).start();
+    }
+
     /** Called by PlayerCompletionListener / PlayerErrorListener. */
     public void onPlaybackDone() {
         handler.post(new PlaybackDoneTask(this));
@@ -3757,6 +3779,11 @@ public class VoiceService extends Service
      * from it. Normal dictations post it as false.
      */
     public void doPostInput(String text, boolean possiblyCutOff) {
+        // v1.57: pause-then-dictate counts as heard — if a message is
+        // paused right now, this dictation retires it (see helper).
+        // Fired BEFORE the POST so the heard-deletion is on its way
+        // before the dictation itself lands.
+        reportPauseDictateIfPaused();
         HttpURLConnection conn = null;
         try {
             URL url = new URL(BASE_URL + "/api/selena-voice/input");
