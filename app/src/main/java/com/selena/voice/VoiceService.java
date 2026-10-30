@@ -3831,8 +3831,8 @@ public class VoiceService extends Service
         // while he talks into his earbuds. (Media-duck mode keeps
         // the normal duck — Nick's 14:44 refinement.)
         if (laneHeadsetActive()) {
-            log("lane: focus skipped (dictation duck) — other audio "
-                    + "untouched");
+            log("lane: case B split no-focus — dictation duck "
+                    + "skipped, other audio untouched");
             return;
         }
         lastDictationActivityMs = android.os.SystemClock.uptimeMillis();
@@ -5039,8 +5039,8 @@ public class VoiceService extends Service
         // the media route, the duck is wanted — decline the lane
         // and let the caller take the normal media + MAY_DUCK path.
         if (earbudsHoldMediaRoute()) {
-            log("lane: earbuds hold the media route — normal "
-                    + "playback with duck (single-device case)");
+            log("lane: case A same-device duck — earbuds hold the "
+                    + "media route, normal playback with duck");
             return false;
         }
         AudioDeviceInfo dev = findEarbudsCommDevice();
@@ -5056,9 +5056,9 @@ public class VoiceService extends Service
             }
             laneDevice = dev;
             lanePlaybackActive = true;
-            log("lane: playing to " + dev.getProductName()
-                    + " via headset channel — no media focus, "
-                    + "other audio untouched");
+            log("lane: case B split no-focus — playing to "
+                    + dev.getProductName()
+                    + " via headset channel, other audio untouched");
             return true;
         } catch (Exception e) {
             log("lane: begin failed: " + e);
