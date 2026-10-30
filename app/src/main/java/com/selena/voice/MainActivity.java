@@ -110,6 +110,7 @@ public class MainActivity extends Activity {
     private Switch noReadoutSwitch;
     private Switch btSwitch;
     private Switch spkSwitch;
+    private Switch earbudsOnlySwitch;
 
     public MainActivity() {
         receiver = new MessageReceiver(this);
@@ -516,6 +517,29 @@ public class MainActivity extends Activity {
             VoiceService.setForceSpeaker(this, on); // clears BT pref
             VoiceService.log("voice: output=speaker" + (on ? " (exclusive)" : " (auto)"));
             syncOutputSwitches();
+        });
+
+        // Nick 2026-10-30 v1.73: earbuds-only playback lane. ON
+        // (the default): Selena plays ONLY into the named earbuds
+        // (headset channel, Spotify untouched) and not at all when
+        // they're disconnected. Needs the earbuds name (long-press
+        // the version text) — without one the lane stays inert.
+        earbudsOnlySwitch = findViewById(R.id.earbudsOnlySwitch);
+        earbudsOnlySwitch.setChecked(VoiceService.getEarbudsOnly(this));
+        earbudsOnlySwitch.setOnCheckedChangeListener((v, on) -> {
+            VoiceService.setEarbudsOnly(this, on);
+            VoiceService.log("lane: earbuds-only=" + on);
+            if (on) {
+                String name = getSharedPreferences(
+                        "selena_voice_prefs", MODE_PRIVATE)
+                        .getString("earbuds_device_name", "");
+                if (name == null || name.isEmpty()) {
+                    android.widget.Toast.makeText(this,
+                            "Set your earbuds name first "
+                                    + "(long-press the version text)",
+                            android.widget.Toast.LENGTH_LONG).show();
+                }
+            }
         });
 
         requestPermissions();
@@ -1412,7 +1436,10 @@ public class MainActivity extends Activity {
                 .setTitle("Earbuds device")
                 .setMessage("Enter the Bluetooth name of your earbuds "
                         + "(as shown in Android Bluetooth settings). "
-                        + "When connected, you can interrupt Selena by voice.")
+                        + "When connected, you can interrupt Selena by voice. "
+                        + "This name also drives earbuds-only playback: "
+                        + "with that switch on, she plays only into these "
+                        + "earbuds and stays silent while they're away.")
                 .setView(input)
                 .setPositiveButton("Save", (d, w) -> {
                     String name = input.getText().toString().trim();

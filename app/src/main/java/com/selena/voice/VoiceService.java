@@ -151,6 +151,10 @@ public class VoiceService extends Service
     public static final String KEY_NO_AUTO_READOUT = "no_auto_readout";
     public static final String KEY_FORCE_BLUETOOTH = "force_bluetooth";
     public static final String KEY_FORCE_SPEAKER = "force_speaker";
+    // Nick 2026-10-30 v1.73: earbuds-only playback lane. Default ON
+    // (his explicit order) — but it only takes effect once an earbuds
+    // name is saved (see the lane section near isEarbudsConnected).
+    public static final String KEY_EARBUDS_ONLY = "earbuds_only_playback";
 
     // v1.50 (2026-10-26, OVH batch): owned-domain addresses replace
     // the DuckDNS bridge names (same OVH server, permanent names).
@@ -793,6 +797,11 @@ public class VoiceService extends Service
         loadGateBaseline();
         startGateWatchdog();
         registerPhoneCallWatch(); // v1.72: phone-call mic mute
+        registerLaneDeviceWatch(); // v1.73: earbuds-only lane watch
+        log("lane: earbuds-only state at create: " + laneModeName()
+                + (getEarbudsDeviceName() != null
+                        ? " (earbuds '" + getEarbudsDeviceName() + "')"
+                        : ""));
         // Nick 2026-10-29 v1.60: wake word spotter loads async; when
         // it's ready it takes over the idle mic (see onWakeSpotterReady
         // for the handover). Until then the recognizer path above is
@@ -1005,6 +1014,8 @@ public class VoiceService extends Service
         }
         unmuteBeep();
         unregisterPhoneCallWatch(); // v1.72
+        unregisterLaneDeviceWatch(); // v1.73
+        laneEnd(); // v1.73: never leave the headset channel pinned
         recognizerActive = false;
         destroyRecognizer();
         releasePlayer();
@@ -1647,6 +1658,13 @@ public class VoiceService extends Service
             log("polite: holding MP3 playback for Nick's pause");
             return;
         }
+        // Nick 2026-10-30 v1.73: earbuds-only lane armed but no
+        // earbuds — the file stays queued, unplayed and unreported;
+        // the device watch pumps again when the earbuds connect.
+        if (laneBlocked()) {
+            logLaneHeld("MP3 playback");
+            return;
+        }
         File f;
         synchronized (audioQueue) {
             f = audioQueue.poll();
@@ -1741,6 +1759,12 @@ public class VoiceService extends Service
     /** Undo what routeAudioForPlayback() did (no-op when BT routed). */
     @SuppressWarnings("deprecation") // setSpeakerphoneOn
     private void restoreAudioRouting() {
+        // Nick 2026-10-30 v1.73: a laned play never touched the
+        // speakerphone or media focus — its teardown is laneEnd.
+        if (lanePlaybackActive) {
+            laneEnd();
+            return;
+        }
         if (btRouted) {
             btRouted = false;
             return; // speakerphone was never touched
@@ -1770,6 +1794,18 @@ public class VoiceService extends Service
             purgeQueuedHoldingNote();
             cancelHoldingNote("playback started");
         }
+        // Nick 2026-10-30 v1.73: backstop — the pumps and priority
+        // gates already hold items while the earbuds-only lane is
+        // armed without earbuds; a direct caller (e.g. a replay tap)
+        // must still never sound out loud. The item is NOT reported
+        // played; queue-owned items were never polled (gate is
+        // upstream), so nothing is lost by returning here.
+        if (laneBlocked()) {
+            log("lane: armed-held — direct play attempt held off: "
+                    + f.getName());
+            playing = false;
+            return;
+        }
         try {
             // Nick 2026-10-18 v1.7: THE SILENT-PLAYBACK FIX. v1.5/v1.6 used
             // USAGE_VOICE_COMMUNICATION, which Android routes to the
@@ -1790,17 +1826,38 @@ public class VoiceService extends Service
             // ducked only by the MAY_DUCK focus request below.
             unmuteBeep();
             log("audio: using device volume (no override)");
-            // Nick 2026-10-18 v1.11: Bluetooth-aware — earbuds win over the
-            // speakerphone when connected.
-            routeAudioForPlayback();
-            log("audio: stream=MUSIC (USAGE_MEDIA)");
-            requestAudioFocus();
+            // Nick 2026-10-30 v1.73: earbuds-only lane — when engaged,
+            // she plays ONLY into the named earbuds' headset channel
+            // (laneBegin set the communication device) with
+            // voice-communication attributes and NO media focus
+            // request, so Spotify on the truck radio is untouched.
+            // Otherwise the v1.11 routing + MAY_DUCK focus, unchanged.
+            final boolean laneNow = laneBegin();
+            if (!laneNow) {
+                // Nick 2026-10-18 v1.11: Bluetooth-aware — earbuds win
+                // over the speakerphone when connected.
+                routeAudioForPlayback();
+                log("audio: stream=MUSIC (USAGE_MEDIA)");
+                requestAudioFocus();
+            }
             releasePlayer();
             player = new MediaPlayer();
             player.setAudioAttributes(new AudioAttributes.Builder()
-                    .setUsage(AudioAttributes.USAGE_MEDIA)
+                    .setUsage(laneNow
+                            ? AudioAttributes.USAGE_VOICE_COMMUNICATION
+                            : AudioAttributes.USAGE_MEDIA)
                     .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
                     .build());
+            if (laneNow && laneDevice != null
+                    && android.os.Build.VERSION.SDK_INT >= 28) {
+                // Belt and braces alongside the communication device:
+                // pin this player to the same named earbuds.
+                try {
+                    player.setPreferredDevice(laneDevice);
+                } catch (Exception e) {
+                    log("lane: setPreferredDevice failed: " + e);
+                }
+            }
             // Nick 2026-10-19 v1.16: keep the CPU awake through playback
             // with the screen locked.
             player.setWakeMode(getApplicationContext(),
@@ -1841,6 +1898,21 @@ public class VoiceService extends Service
             isPlayingAudio = true;
             playbackPaused = false;
             log("playback started (echo guard on)");
+            // v1.73: in the field test, this line is the ground
+            // truth for where she actually landed.
+            if (isEarbudsOnlyOn()
+                    && android.os.Build.VERSION.SDK_INT >= 28) {
+                try {
+                    AudioDeviceInfo routed = player.getRoutedDevice();
+                    log("lane: player routed to "
+                            + (routed != null
+                                    ? routed.getProductName()
+                                            + " (type " + routed.getType()
+                                            + ")"
+                                    : "unknown")
+                            + " — mode " + laneModeName());
+                } catch (Exception ignored) {}
+            }
             currentAudioFile = f;
             // v1.55: adopt the row id that rode with this file, when
             // one did (the priority path sets it explicitly beforehand
@@ -2335,6 +2407,12 @@ public class VoiceService extends Service
             log("polite: holding TTS playback for Nick's pause");
             return;
         }
+        // Nick 2026-10-30 v1.73: earbuds-only lane armed but no
+        // earbuds — the text stays queued, unspoken and unreported.
+        if (laneBlocked()) {
+            logLaneHeld("TTS playback");
+            return;
+        }
         String text;
         String rowId;
         String segGroup;
@@ -2358,6 +2436,21 @@ public class VoiceService extends Service
         if (!isResume) {
             purgeQueuedHoldingNote();
             cancelHoldingNote("local speech started");
+        }
+        // Nick 2026-10-30 v1.73: backstop (see playFileNow) — never
+        // speak out loud while the lane is armed without earbuds.
+        // Unwind WITHOUT a progress report: nothing was heard.
+        if (laneBlocked()) {
+            log("lane: armed-held — direct TTS attempt held off");
+            ttsSpeaking = false;
+            isPlayingAudio = false;
+            setPlayingAudio(false);
+            pendingTtsServerId = null;
+            pendingTtsSegmentGroup = null;
+            currentPlayServerId = null;
+            currentPlaySegmentGroup = null;
+            broadcastPlaybackState();
+            return;
         }
         if (tts == null || !ttsReady) {
             log("tts: on-device not ready, dropping text");
@@ -2390,11 +2483,28 @@ public class VoiceService extends Service
         // absolute in v1.63: nothing here writes the media volume;
         // the v1.17 boost call that lived in this spot is deleted).
         unmuteBeep();
-        // Nick 2026-10-18 v1.11: Bluetooth-aware — earbuds win over the
-        // speakerphone when connected, same as MP3 playback.
-        routeAudioForPlayback();
-        log("tts: stream=MUSIC");
-        requestAudioFocus();
+        // Nick 2026-10-30 v1.73: earbuds-only lane — when engaged,
+        // the TTS speaks over the earbuds' headset channel with
+        // voice-communication attributes and NO media focus request.
+        // Otherwise the v1.11 routing + focus, unchanged.
+        final boolean laneNow = laneBegin();
+        if (laneNow) {
+            try {
+                tts.setAudioAttributes(new AudioAttributes.Builder()
+                        .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
+                        .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                        .build());
+                laneTtsAttrsSet = true;
+            } catch (Exception e) {
+                log("lane: tts attributes failed: " + e);
+            }
+        } else {
+            // Nick 2026-10-18 v1.11: Bluetooth-aware — earbuds win
+            // over the speakerphone when connected, same as MP3.
+            routeAudioForPlayback();
+            log("tts: stream=MUSIC");
+            requestAudioFocus();
+        }
         // Nick 2026-10-23 v1.47: stop the mic BEFORE she speaks, so
         // her voice can't be transcribed as Nick's input.
         muteMicForPlayback();
@@ -2565,6 +2675,14 @@ public class VoiceService extends Service
     private void resumePlayback() {
         log("resume: requested ttsPaused=" + ttsPaused
                 + " mp3Paused=" + playbackPaused);
+        // Nick 2026-10-30 v1.73: a paused item must not resume out
+        // loud while the earbuds-only lane is armed without earbuds
+        // (the paused player would re-route to the speaker).
+        if (laneBlocked() && (playbackPaused || ttsPaused)) {
+            log("lane: armed-held — resume held off (no earbuds)");
+            toast("Earbuds-only is on — connect your earbuds to listen");
+            return;
+        }
         boolean didResume = false;
         // MP3 path (Aria/quality mode, replays).
         if (player != null && playbackPaused) {
@@ -2800,6 +2918,17 @@ public class VoiceService extends Service
             toast("Priority message queued");
             return;
         }
+        // Nick 2026-10-30 v1.73: earbuds-only lane armed but no
+        // earbuds — even a priority item parks; it must not burst
+        // out of the speaker or the truck radio.
+        if (laneBlocked()) {
+            waitingPriority.offer(new WaitingPriority(f, text, serverId,
+                    segmentGroup));
+            log("lane: priority MP3 parked — earbuds-only, no earbuds ("
+                    + waitingPriority.size() + " waiting)");
+            toast("Priority message queued");
+            return;
+        }
         playPriorityMp3(f, text, serverId, segmentGroup);
     }
 
@@ -2833,6 +2962,16 @@ public class VoiceService extends Service
             toast("Priority message queued");
             return;
         }
+        // Nick 2026-10-30 v1.73: earbuds-only lane armed but no
+        // earbuds — park instead of speaking out loud (see MP3 twin).
+        if (laneBlocked()) {
+            waitingPriority.offer(new WaitingPriority(null, text, serverId,
+                    segmentGroup));
+            log("lane: priority TTS parked — earbuds-only, no earbuds ("
+                    + waitingPriority.size() + " waiting)");
+            toast("Priority message queued");
+            return;
+        }
         playPriorityTts(text, serverId, segmentGroup);
     }
 
@@ -2849,6 +2988,12 @@ public class VoiceService extends Service
         // hold releases on his pause.
         if (politeHoldActive()) {
             log("priority: holding queued item for Nick's pause");
+            return;
+        }
+        // Nick 2026-10-30 v1.73: earbuds-only lane armed but no
+        // earbuds — the queued priority item waits for the earbuds.
+        if (laneBlocked()) {
+            logLaneHeld("queued priority playback");
             return;
         }
         WaitingPriority wp = waitingPriority.poll();
@@ -2889,6 +3034,13 @@ public class VoiceService extends Service
      * Runs on the main thread.
      */
     private void resumeNextInterrupted() {
+        // Nick 2026-10-30 v1.73: earbuds-only lane armed but no
+        // earbuds — the interrupted item stays on the stack,
+        // unresumed, until the earbuds return.
+        if (laneBlocked()) {
+            logLaneHeld("interrupted-item resume");
+            return;
+        }
         InterruptedState st = interruptStack.poll();
         if (st == null) {
             pumpAudioQueue();
@@ -3650,6 +3802,10 @@ public class VoiceService extends Service
     }
 
     private void abandonAudioFocus() {
+        // Nick 2026-10-30 v1.73: a laned play never requested focus —
+        // there is nothing to abandon (its teardown is laneEnd via
+        // restoreAudioRouting).
+        if (lanePlaybackActive) return;
         try {
             if (focusRequest != null) audioManager.abandonAudioFocusRequest(focusRequest);
         } catch (Exception ignored) {}
@@ -3669,6 +3825,16 @@ public class VoiceService extends Service
      * of one dictation never pop the music back up.
      */
     private void acquireDictationDuck() {
+        // Nick 2026-10-30 v1.73: while the earbuds-only lane is in
+        // HEADSET mode (split case), the dictation takes NO media
+        // focus either — Spotify on the truck radio must not dip
+        // while he talks into his earbuds. (Media-duck mode keeps
+        // the normal duck — Nick's 14:44 refinement.)
+        if (laneHeadsetActive()) {
+            log("lane: focus skipped (dictation duck) — other audio "
+                    + "untouched");
+            return;
+        }
         lastDictationActivityMs = android.os.SystemClock.uptimeMillis();
         armDictationDuckWatchdog();
         if (dictationDuckHeld) return;
@@ -4591,6 +4757,465 @@ public class VoiceService extends Service
                 || saved.toLowerCase().contains(connected.toLowerCase());
     }
 
+    // ------------------------------------------------------------ v1.73 earbuds-only lane
+
+    /**
+     * Nick 2026-10-30 v1.73: EARBUDS-ONLY PLAYBACK LANE (his order,
+     * 14:33 EDT). His scenario, verbatim: earbuds AND the truck radio
+     * both connected over Bluetooth, Spotify playing on the radio —
+     * Selena plays ONLY through the earbuds and does not affect
+     * Spotify. Plus his first ask: she only plays audio at all when
+     * his earbuds are connected.
+     *
+     * Shape:
+     *  - CONFIGURED = the earbuds-only toggle is on (default on) AND
+     *    an earbuds name is saved. No name = the lane is inert and
+     *    playback behaves exactly as pre-v1.73 (logged once).
+     *  - MEDIA-DUCK mode (Nick's refinement, 2026-10-30 14:44): the
+     *    earbuds themselves hold the media route (single-device
+     *    case — Spotify in the same earbuds) → she plays exactly as
+     *    she always has (media attributes + MAY_DUCK focus): the
+     *    duck is WANTED there. The no-touch rule is only for the
+     *    split case below.
+     *  - HEADSET mode (split case: a DIFFERENT device — the truck
+     *    radio — holds the media route, earbuds connected): every
+     *    playback path routes ONLY to the named earbuds over their
+     *    headset/call channel — MODE_IN_COMMUNICATION +
+     *    setCommunicationDevice(matching device) for the duration
+     *    of the play, USAGE_VOICE_COMMUNICATION player/TTS
+     *    attributes — and NO media audio-focus is requested
+     *    (playback or dictation duck), so Spotify on the truck is
+     *    never ducked, paused, or re-routed by her. The device is
+     *    chosen by the saved NAME among ALL connected outputs,
+     *    never "any Bluetooth": the truck radio can never be
+     *    selected (his A17 holds both connections at once — field
+     *    confirmed 2026-10-30 14:40).
+     *  - ARMED-HELD (configured + earbuds absent entirely): nothing
+     *    plays out loud anywhere. Queued messages hold in their
+     *    queues — unplayed, unreported, undeleted — and play when
+     *    the earbuds connect (AudioDeviceCallback below). Transient
+     *    bundled clips (holding notes, offline/saved/reconnected
+     *    clips) are DROPPED instead: a stale "hold on" must never
+     *    burst out late. Fast-lane answers stay written in the
+     *    window. (Also held: earbuds present for media only with no
+     *    headset channel while another device holds the route —
+     *    she must not land on the truck, and there is no lane.)
+     *  - Earbuds lost MID-PLAY in headset mode: playback stops at
+     *    once and the item returns to the head of its queue
+     *    unplayed; it replays from the start on reconnection.
+     *  - Toggle OFF (or no name): pre-v1.73 behavior, untouched.
+     *  While configured, the lane outranks the legacy v1.17 output
+     *  toggles (force speaker / force Bluetooth) — it is the newer,
+     *  explicit rule. The phone-call mic mute (v1.72) still outranks
+     *  the lane: fireHoldingNote's call check runs first, and no
+     *  playback path starts during a call under the existing rules.
+     *  setCommunicationDevice needs API 31+; below that the lane
+     *  cannot engage and stays inert (fleet is Android 14+).
+     */
+    private boolean lanePlaybackActive = false;
+    private int lanePrevMode = AudioManager.MODE_NORMAL;
+    private AudioDeviceInfo laneDevice = null;
+    private boolean laneTtsAttrsSet = false;
+    private boolean laneNoNameLogged = false;
+    private long laneHeldLogAtMs = 0;
+    private LaneDeviceCallback laneDeviceCallback = null;
+
+    private boolean isEarbudsOnlyOn() {
+        return getEarbudsOnly(this);
+    }
+
+    /** Toggle on + name saved + API 31+. No name → inert by design. */
+    private boolean laneConfigured() {
+        if (!isEarbudsOnlyOn()) return false;
+        String name = getEarbudsDeviceName();
+        if (name == null || name.isEmpty()) {
+            if (!laneNoNameLogged) {
+                laneNoNameLogged = true;
+                log("lane: earbuds-only is ON but no earbuds name is "
+                        + "saved yet — playback unchanged until a name "
+                        + "is set (long-press the version text)");
+            }
+            return false;
+        }
+        return android.os.Build.VERSION.SDK_INT >= 31;
+    }
+
+    /** Fuzzy name match (same rule as isEarbudsConnected). */
+    private boolean nameMatchesEarbuds(CharSequence productName) {
+        String saved = getEarbudsDeviceName();
+        if (saved == null || saved.isEmpty() || productName == null) {
+            return false;
+        }
+        String n = productName.toString();
+        return n.toLowerCase().contains(saved.toLowerCase())
+                || saved.toLowerCase().contains(n.toLowerCase());
+    }
+
+    /**
+     * The named earbuds as a COMMUNICATION device (BT SCO / BLE
+     * headset output whose product name matches the saved name), or
+     * null. A2DP-only presence does not count: Android cannot stream
+     * two different media outputs at once, so her lane is the
+     * headset channel — the same split a phone call uses while the
+     * truck keeps the media channel.
+     */
+    private AudioDeviceInfo findEarbudsCommDevice() {
+        if (audioManager == null) return null;
+        try {
+            for (AudioDeviceInfo d :
+                    audioManager.getDevices(AudioManager.GET_DEVICES_OUTPUTS)) {
+                int t = d.getType();
+                if (t == AudioDeviceInfo.TYPE_BLUETOOTH_SCO
+                        || t == AudioDeviceInfo.TYPE_BLE_HEADSET) {
+                    if (nameMatchesEarbuds(d.getProductName())) return d;
+                }
+            }
+        } catch (Exception e) {
+            log("lane: comm device query failed: " + e);
+        }
+        return null;
+    }
+
+    /**
+     * True when the named earbuds hold the MEDIA route right now
+     * (Nick's 14:44 refinement: that is the single-device case and
+     * she should play + duck exactly as always). Decider: a silent
+     * PROBE track — a zero-filled AudioTrack with USAGE_MEDIA
+     * attributes, played for a few ms; getRoutedDevice() then names
+     * exactly where media policy would send her voice. (The direct
+     * APIs are not public: BluetoothA2dp.getActiveDevice is
+     * @SystemApi and AudioManager has no per-attributes device
+     * query on API 34.) The probe is inaudible by construction and
+     * its result is cached for a few seconds; device add/remove
+     * events invalidate the cache. Probe failure (or API < 28)
+     * falls back to the conservative presence rule: the earbuds
+     * hold the route only if present with NO other Bluetooth audio
+     * device around — with two candidates she never guesses her
+     * way onto the truck.
+     */
+    private AudioDeviceInfo laneRouteCache = null;
+    private long laneRouteCacheMs = 0;
+    private static final long LANE_ROUTE_CACHE_MS = 4000;
+
+    private void invalidateLaneRouteCache() {
+        laneRouteCacheMs = 0;
+        laneRouteCache = null;
+    }
+
+    private AudioDeviceInfo probeMediaRoutedDevice() {
+        long now = android.os.SystemClock.uptimeMillis();
+        if (laneRouteCacheMs > 0
+                && now - laneRouteCacheMs < LANE_ROUTE_CACHE_MS) {
+            return laneRouteCache;
+        }
+        if (android.os.Build.VERSION.SDK_INT < 28) return null;
+        android.media.AudioTrack probe = null;
+        try {
+            int minBuf = android.media.AudioTrack.getMinBufferSize(
+                    8000, android.media.AudioFormat.CHANNEL_OUT_MONO,
+                    android.media.AudioFormat.ENCODING_PCM_16BIT);
+            probe = new android.media.AudioTrack.Builder()
+                    .setAudioAttributes(new AudioAttributes.Builder()
+                            .setUsage(AudioAttributes.USAGE_MEDIA)
+                            .setContentType(
+                                    AudioAttributes.CONTENT_TYPE_SPEECH)
+                            .build())
+                    .setAudioFormat(new android.media.AudioFormat.Builder()
+                            .setSampleRate(8000)
+                            .setEncoding(
+                                    android.media.AudioFormat.ENCODING_PCM_16BIT)
+                            .setChannelMask(
+                                    android.media.AudioFormat.CHANNEL_OUT_MONO)
+                            .build())
+                    .setBufferSizeInBytes(Math.max(minBuf, 1024))
+                    .setTransferMode(android.media.AudioTrack.MODE_STATIC)
+                    .build();
+            byte[] silence = new byte[1024];
+            probe.write(silence, 0, silence.length,
+                    android.media.AudioTrack.WRITE_BLOCKING);
+            probe.play();
+            AudioDeviceInfo routed = null;
+            for (int i = 0; i < 10 && routed == null; i++) {
+                routed = probe.getRoutedDevice();
+                if (routed == null) {
+                    try {
+                        Thread.sleep(20);
+                    } catch (InterruptedException ignored) {}
+                }
+            }
+            try {
+                probe.stop();
+            } catch (Exception ignored) {}
+            laneRouteCache = routed;
+            laneRouteCacheMs = android.os.SystemClock.uptimeMillis();
+            return routed;
+        } catch (Exception e) {
+            log("lane: media-route probe failed: " + e);
+            return null;
+        } finally {
+            if (probe != null) {
+                try {
+                    probe.release();
+                } catch (Exception ignored) {}
+            }
+        }
+    }
+
+    private boolean anyOtherBtAudioPresent() {
+        if (audioManager == null) return false;
+        try {
+            for (AudioDeviceInfo d :
+                    audioManager.getDevices(AudioManager.GET_DEVICES_OUTPUTS)) {
+                int t = d.getType();
+                if (t == AudioDeviceInfo.TYPE_BLUETOOTH_A2DP
+                        || t == AudioDeviceInfo.TYPE_BLUETOOTH_SCO
+                        || t == AudioDeviceInfo.TYPE_BLE_HEADSET
+                        || t == AudioDeviceInfo.TYPE_BLE_SPEAKER) {
+                    if (!nameMatchesEarbuds(d.getProductName())) {
+                        return true;
+                    }
+                }
+            }
+        } catch (Exception ignored) {}
+        return false;
+    }
+
+    private boolean earbudsHoldMediaRoute() {
+        AudioDeviceInfo routed = probeMediaRoutedDevice();
+        if (routed != null) {
+            // The probe names the route holder exactly: a name
+            // match is the ONLY way the earbuds hold it — any
+            // other device (truck BT, speaker, earpiece) is a no.
+            return nameMatchesEarbuds(routed.getProductName());
+        }
+        return isEarbudsConnected() && !anyOtherBtAudioPresent();
+    }
+
+    /** Configured AND the split case is live: another device holds
+     *  the media route and the earbuds' headset channel is present. */
+    private boolean laneHeadsetActive() {
+        return laneConfigured() && !earbudsHoldMediaRoute()
+                && findEarbudsCommDevice() != null;
+    }
+
+    /**
+     * Nothing may play out loud: configured, the earbuds do not
+     * hold the media route, and no headset channel exists (earbuds
+     * absent entirely, or present media-only while the route sits
+     * elsewhere).
+     */
+    private boolean laneBlocked() {
+        return laneConfigured() && !earbudsHoldMediaRoute()
+                && findEarbudsCommDevice() == null;
+    }
+
+    /** Human-readable lane state for logs. */
+    private String laneModeName() {
+        if (!isEarbudsOnlyOn()) return "off";
+        if (!laneConfigured()) return "inert (no earbuds name)";
+        if (earbudsHoldMediaRoute()) return "media-duck (earbuds)";
+        if (findEarbudsCommDevice() != null) return "headset (split)";
+        return "armed-held (no earbuds)";
+    }
+
+    /** Throttled held-state log so the pumps can call it freely. */
+    private void logLaneHeld(String what) {
+        long now = android.os.SystemClock.uptimeMillis();
+        if (now - laneHeldLogAtMs < 60_000) return;
+        laneHeldLogAtMs = now;
+        log("lane: armed-held — " + what + " waiting for earbuds ("
+                + getEarbudsDeviceName() + "); nothing plays out loud");
+    }
+
+    /**
+     * Begin an engaged play: pin output to the named earbuds'
+     * headset channel. Returns false (lane not engaged) when the
+     * caller should use the legacy routing + focus path instead.
+     * Requests NO audio focus — Spotify et al. stay untouched.
+     */
+    private boolean laneBegin() {
+        if (!laneConfigured()) return false;
+        // Nick 2026-10-30 14:44: when the earbuds themselves hold
+        // the media route, the duck is wanted — decline the lane
+        // and let the caller take the normal media + MAY_DUCK path.
+        if (earbudsHoldMediaRoute()) {
+            log("lane: earbuds hold the media route — normal "
+                    + "playback with duck (single-device case)");
+            return false;
+        }
+        AudioDeviceInfo dev = findEarbudsCommDevice();
+        if (dev == null) return false;
+        try {
+            lanePrevMode = audioManager.getMode();
+            audioManager.setMode(AudioManager.MODE_IN_COMMUNICATION);
+            if (!audioManager.setCommunicationDevice(dev)) {
+                audioManager.setMode(lanePrevMode);
+                log("lane: setCommunicationDevice refused for "
+                        + dev.getProductName());
+                return false;
+            }
+            laneDevice = dev;
+            lanePlaybackActive = true;
+            log("lane: playing to " + dev.getProductName()
+                    + " via headset channel — no media focus, "
+                    + "other audio untouched");
+            return true;
+        } catch (Exception e) {
+            log("lane: begin failed: " + e);
+            lanePlaybackActive = false;
+            laneDevice = null;
+            return false;
+        }
+    }
+
+    /** Release the headset channel and restore the previous mode. */
+    private void laneEnd() {
+        if (!lanePlaybackActive) return;
+        try {
+            audioManager.clearCommunicationDevice();
+        } catch (Exception ignored) {}
+        try {
+            audioManager.setMode(lanePrevMode);
+        } catch (Exception ignored) {}
+        lanePlaybackActive = false;
+        laneDevice = null;
+        // If the TTS engine's attributes were switched to the
+        // voice-communication usage for a laned utterance, put them
+        // back to the media default so later non-lane speech is
+        // exactly as before.
+        if (laneTtsAttrsSet) {
+            laneTtsAttrsSet = false;
+            try {
+                if (tts != null) {
+                    tts.setAudioAttributes(new AudioAttributes.Builder()
+                            .setUsage(AudioAttributes.USAGE_MEDIA)
+                            .setContentType(
+                                    AudioAttributes.CONTENT_TYPE_SPEECH)
+                            .build());
+                }
+            } catch (Exception ignored) {}
+        }
+        log("lane: headset channel released");
+    }
+
+    /**
+     * Earbuds vanished mid-play (AudioDeviceCallback): stop NOW and
+     * return the item to the head of its queue UNPLAYED — no
+     * progress report, so delete-on-heard never fires; it replays
+     * from the start when the earbuds reconnect.
+     */
+    private void laneAbortPlayback() {
+        if (!lanePlaybackActive) return;
+        log("lane: earbuds lost mid-play — message returned to "
+                + "queue unplayed");
+        if (playing && currentAudioFile != null) {
+            File f = currentAudioFile;
+            String sid = currentPlayServerId;
+            String grp = currentPlaySegmentGroup;
+            releasePlayer(); // a synchronous release fires no completion
+            playing = false;
+            isPlayingAudio = false;
+            setPlayingAudio(false);
+            if (sid != null) {
+                audioFileServerIds.put(f.getAbsolutePath(), sid);
+            }
+            if (grp != null) {
+                audioFileSegmentGroups.put(f.getAbsolutePath(), grp);
+            }
+            synchronized (audioQueue) {
+                ((LinkedList<File>) audioQueue).addFirst(f);
+            }
+            currentAudioFile = null;
+            currentPlayServerId = null;
+            currentPlaySegmentGroup = null;
+        } else if (ttsSpeaking && ttsCurrentText != null) {
+            String text = ttsCurrentText;
+            String sid = currentPlayServerId;
+            String grp = currentPlaySegmentGroup;
+            suppressNextTtsDone = true;
+            try {
+                if (tts != null) tts.stop();
+            } catch (Exception ignored) {}
+            ttsSpeaking = false;
+            isPlayingAudio = false;
+            setPlayingAudio(false);
+            synchronized (ttsQueue) {
+                ((LinkedList<String>) ttsQueue).addFirst(text);
+                ((LinkedList<String>) ttsServerIdQueue).addFirst(sid);
+                ((LinkedList<String>) ttsSegmentGroupQueue).addFirst(grp);
+            }
+            ttsCurrentText = null;
+            ttsResumeAtChar = 0;
+            currentPlayServerId = null;
+            currentPlaySegmentGroup = null;
+        }
+        laneEnd();
+        unmuteMicAfterPlayback();
+        broadcastPlaybackState();
+    }
+
+    /**
+     * Watch for the named earbuds coming and going: arrival releases
+     * held playback; departure mid-play aborts it (above). Registered
+     * in onCreate, unregistered in onDestroy. The callback object is
+     * LaneDeviceCallback (top-level, per the standing d8 rule).
+     */
+    private void registerLaneDeviceWatch() {
+        if (audioManager == null || laneDeviceCallback != null) return;
+        laneDeviceCallback = new LaneDeviceCallback(this);
+        try {
+            audioManager.registerAudioDeviceCallback(
+                    laneDeviceCallback, handler);
+            log("lane: device watch registered");
+        } catch (Exception e) {
+            log("lane: device watch failed: " + e);
+            laneDeviceCallback = null;
+        }
+    }
+
+    private void unregisterLaneDeviceWatch() {
+        if (audioManager != null && laneDeviceCallback != null) {
+            try {
+                audioManager.unregisterAudioDeviceCallback(
+                        laneDeviceCallback);
+            } catch (Exception ignored) {}
+        }
+        laneDeviceCallback = null;
+    }
+
+    /** LaneDeviceCallback: an output device appeared. */
+    public void onLaneDevicesAdded(AudioDeviceInfo[] added) {
+        invalidateLaneRouteCache();
+        if (!laneConfigured()) return;
+        for (AudioDeviceInfo d : added) {
+            if (nameMatchesEarbuds(d.getProductName())) {
+                log("lane: earbuds connected (" + d.getProductName()
+                        + ") — releasing held playback");
+                handler.post(() -> {
+                    pumpAudioQueue();
+                    pumpTtsQueue();
+                    if (!playing && !ttsSpeaking
+                            && !waitingPriority.isEmpty()) {
+                        playNextWaitingPriority();
+                    }
+                });
+                return;
+            }
+        }
+    }
+
+    /** LaneDeviceCallback: an output device went away. */
+    public void onLaneDevicesRemoved(AudioDeviceInfo[] removed) {
+        invalidateLaneRouteCache();
+        if (!lanePlaybackActive) return;
+        for (AudioDeviceInfo d : removed) {
+            if (nameMatchesEarbuds(d.getProductName())) {
+                handler.post(this::laneAbortPlayback);
+                return;
+            }
+        }
+    }
+
     /**
      * Nick 2026-10-23 v1.47: stop the recognizer entirely when Selena
      * starts speaking, so her voice can't be transcribed as Nick's
@@ -5142,6 +5767,15 @@ public class VoiceService extends Service
         log("fastlane: answered locally — '" + answer + "'");
         broadcastMessage(answer);
         MessageHistory.add(answer, null);
+        // Nick 2026-10-30 v1.73: earbuds-only lane armed but no
+        // earbuds — the answer stays WRITTEN in the window and is
+        // not spoken later (a spoken time/date answer goes stale
+        // in minutes; bursting it out on reconnect would be wrong).
+        if (laneBlocked()) {
+            log("lane: fast-lane answer left written (earbuds-only, "
+                    + "no earbuds)");
+            return true;
+        }
         // Park the drone capture for the utterance, same as the
         // other local prompts, so she can't transcribe herself.
         int words = Math.max(1, answer.split("\\s+").length);
@@ -5536,6 +6170,17 @@ public class VoiceService extends Service
     /** Play a bundled pre-rendered clip through the normal audio
      *  queue (her player, her gain, no stream writes). */
     private void playBundledFallback(String assetPath, String cacheName) {
+        // Nick 2026-10-30 v1.73: bundled clips are transient notices
+        // (offline / saved / reconnected) — while the earbuds-only
+        // lane is armed without earbuds they are dropped, never
+        // queued to burst out late. The information itself is not
+        // lost: held text still waits in the text box and the
+        // notification still shows.
+        if (laneBlocked()) {
+            log("lane: bundled clip dropped (earbuds-only, no "
+                    + "earbuds): " + assetPath);
+            return;
+        }
         try {
             File out = new File(getCacheDir(), cacheName);
             try (java.io.InputStream in = getAssets().open(assetPath);
@@ -5659,6 +6304,14 @@ public class VoiceService extends Service
         // still queue and play under the normal rules).
         if (phoneCallMuted) {
             log("holdingnote: skipped at fire time (phone call in progress)");
+            return;
+        }
+        // v1.73: earbuds-only lane armed but no earbuds — the note
+        // is DROPPED for this dictation, never queued: a stale
+        // "hold on" must not burst out when the earbuds connect.
+        // (Lane ENGAGED: the note plays through the lane normally.)
+        if (laneBlocked()) {
+            log("lane: holding note dropped (earbuds-only, no earbuds)");
             return;
         }
         // The moment has passed if anything is already on its way
@@ -7314,6 +7967,19 @@ public class VoiceService extends Service
         ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
                 .edit().putBoolean(KEY_FORCE_SPEAKER, on)
                 .putBoolean(KEY_FORCE_BLUETOOTH, false).apply();
+    }
+
+    // Nick 2026-10-30 v1.73: earbuds-only playback toggle. Default
+    // TRUE — Nick ordered the behavior; the lane still stays inert
+    // until an earbuds name is saved (laneConfigured()).
+    public static boolean getEarbudsOnly(Context ctx) {
+        return ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                .getBoolean(KEY_EARBUDS_ONLY, true);
+    }
+
+    public static void setEarbudsOnly(Context ctx, boolean on) {
+        ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                .edit().putBoolean(KEY_EARBUDS_ONLY, on).apply();
     }
 
     private boolean isNoAutoReadout() {
