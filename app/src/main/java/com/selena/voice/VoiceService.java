@@ -5409,8 +5409,8 @@ public class VoiceService extends Service
 
     /**
      * v1.76: the named earbuds as an A2DP media device ONLY (no BLE
-     * fallback) — the pin target when a foreign device stands in
-     * the communication lane (see evaluateLane's CASE_MEDIA_PIN).
+     * fallback) — the pin target for CASE_MEDIA_PIN (v1.78:
+     * pin-first in non-AA splits; see evaluateLane).
      */
     private AudioDeviceInfo findEarbudsA2dpDevice() {
         AudioManager am = laneAudioManager();
@@ -5626,13 +5626,24 @@ public class VoiceService extends Service
      *               head unit (field failure 2026-10-30 16:18:
      *               setCommunicationDevice refused, playback treated
      *               as a call, Spotify paused on the radio).
-     *  CASE_MEDIA_PIN (v1.76) — split case without AA, but a
-     *               FOREIGN device stands in the communication
-     *               lane (another SCO claimant in the comm list):
-     *               do not fight it for the call lane — pin her
-     *               media to the earbuds' A2DP instead (same pin
-     *               discipline as CASE_B_AA); no A2DP presence →
-     *               PARK.
+     *  CASE_MEDIA_PIN — split case without AA: her media is
+     *               pinned per-player to the earbuds' A2DP (same
+     *               pin discipline as CASE_B_AA: no focus, no mode
+     *               change, route proven before output). v1.76
+     *               introduced it for the sub-case where a FOREIGN
+     *               device stands in the communication lane (do not
+     *               fight it for the call lane); v1.78 (Nick
+     *               2026-10-30 19:30) makes it PIN-FIRST for EVERY
+     *               non-AA split where the earbuds have an A2DP
+     *               device among the outputs — the pin is the only
+     *               channel that can leave the truck's own media
+     *               (Spotify) untouched on the truck, so it is
+     *               attempted before the headset channel. No A2DP
+     *               target (earbuds present SCO-only) → no pin is
+     *               possible: the v1.76/77 branches stand (foreign
+     *               incumbent → PARK; otherwise the headset
+     *               channel). A refused/unprovable pin converts
+     *               per the v1.77 headset-fallback setting.
      *  PARK       — configured but cannot play (earbuds absent, or
      *               present media-only with no usable channel while
      *               another device holds the route): hold silently.
@@ -5642,9 +5653,10 @@ public class VoiceService extends Service
     private static final int LANE_CASE_B_HEADSET = 2;
     private static final int LANE_CASE_B_AA = 3;
     private static final int LANE_PARK = 4;
-    // v1.76: split case WITHOUT Android Auto, but a foreign device
-    // stands in the communication lane — her media is pinned to
-    // the earbuds' A2DP instead of fighting for the call lane.
+    // Split case WITHOUT Android Auto — her media is pinned to
+    // the earbuds' A2DP. v1.76: only when a foreign device stood
+    // in the communication lane. v1.78: pin-first for any non-AA
+    // split with an A2DP target among the outputs.
     private static final int LANE_CASE_B_PIN = 5;
 
     private boolean lanePinActive = false;
@@ -5673,6 +5685,10 @@ public class VoiceService extends Service
     // pin is never re-attempted per item (no retry storms).
     private int laneCurrentVerdict = LANE_OFF;
     private int laneFallbackVerdict = LANE_OFF;
+    // v1.78: why the current CASE_MEDIA_PIN verdict was chosen
+    // ("pin-first (non-AA split)" or the v1.76 foreign-incumbent
+    // reason) — set by evaluateLane, read by laneBegin's log.
+    private String lanePinWhy = null;
     private long laneTransitionUntilMs = 0;
     private Runnable lanePendingAbort = null;
     private String laneLastDecisionSig = "";
@@ -5767,11 +5783,13 @@ public class VoiceService extends Service
      */
     private int evaluateLane(String why) {
         if (!isEarbudsOnlyOn()) {
-            logLaneDecision(why, LANE_OFF, false, null, null, null);
+            logLaneDecision(why, LANE_OFF, false, null, null, null,
+                    false);
             return LANE_OFF;
         }
         if (!laneConfigured()) {
-            logLaneDecision(why, LANE_OFF, false, null, null, null);
+            logLaneDecision(why, LANE_OFF, false, null, null, null,
+                    false);
             return LANE_OFF;
         }
         boolean present = earbudsPresent();
@@ -5784,6 +5802,21 @@ public class VoiceService extends Service
         // regardless — the comm channel is never opened under AA).
         AudioDeviceInfo foreign = (present && !routeEarbuds
                 && aa == null) ? foreignCommIncumbent() : null;
+        // v1.78 PIN-FIRST (Nick 2026-10-30 19:30): in a NON-AA
+        // split, the pin question is asked BEFORE the headset and
+        // foreign-incumbent branches. The per-player pin is the
+        // only channel that can put her in the earbuds while the
+        // truck's own media (Spotify) stays on the truck
+        // untouched: Case A drags Spotify along the shared A2DP
+        // river, and opening the call channel makes head units
+        // hand the whole river to the earbuds (Chevy field tests
+        // 2026-10-30 19:21–19:29). Android Auto refused the pin
+        // (v1.76) — whether a plain-Bluetooth head unit accepts
+        // it is exactly what this ordering finds out. The pin
+        // target is the same A2DP-only device laneBegin pins to.
+        AudioDeviceInfo pinTarget = (present && !routeEarbuds
+                && aa == null) ? findEarbudsA2dpDevice() : null;
+        lanePinWhy = null;
         int verdict;
         if (routeEarbuds) {
             verdict = LANE_CASE_A;
@@ -5792,14 +5825,22 @@ public class VoiceService extends Service
         } else if (aa != null) {
             verdict = LANE_CASE_B_AA;
             laneAaSignal = aa;
+        } else if (pinTarget != null) {
+            verdict = LANE_CASE_B_PIN;
+            // Distinguish the v1.78 plain pin-first from the
+            // v1.76 sub-case (a foreign device in the call lane
+            // is still a reason not to fight for that lane — the
+            // two HFP claimants tore each other's SCO link down
+            // in the 2026-10-30 18:25 field test).
+            lanePinWhy = foreign != null
+                    ? "a foreign device holds the communication "
+                            + "lane"
+                    : "pin-first (non-AA split)";
         } else if (foreign != null) {
-            // v1.76: another device stands in the communication
-            // lane — do NOT fight it for the call lane (two HFP
-            // claimants tear each other's SCO link down; field
-            // logs 2026-10-30 18:25). If the earbuds have an A2DP
-            // presence, pin her media to them; otherwise park.
-            verdict = findEarbudsA2dpDevice() != null
-                    ? LANE_CASE_B_PIN : LANE_PARK;
+            // No A2DP target and another device stands in the
+            // communication lane — do NOT fight it for the call
+            // lane; park (v1.76/77, unchanged).
+            verdict = LANE_PARK;
         } else if (findEarbudsCommDevice() != null) {
             verdict = LANE_CASE_B_HEADSET;
         } else {
@@ -5807,13 +5848,22 @@ public class VoiceService extends Service
             // route sits elsewhere: she must not land on the truck.
             verdict = LANE_PARK;
         }
-        logLaneDecision(why, verdict, present, routed, aa, foreign);
+        // v1.78: a non-AA split that reached the headset/park
+        // branches did so because the pin had no target — the
+        // earbuds are present SCO-only. The decision log says so,
+        // so the field logs show the pin-attempted vs pin-skipped
+        // ratio.
+        boolean pinSkippedScoOnly = present && !routeEarbuds
+                && aa == null && pinTarget == null
+                && verdict != LANE_CASE_A;
+        logLaneDecision(why, verdict, present, routed, aa, foreign,
+                pinSkippedScoOnly);
         return verdict;
     }
 
     private void logLaneDecision(String why, int verdict,
             boolean present, AudioDeviceInfo routed, String aa,
-            AudioDeviceInfo foreign) {
+            AudioDeviceInfo foreign, boolean pinSkippedScoOnly) {
         String saved = getEarbudsDeviceName();
         String routeDesc = routed != null
                 ? "'" + routed.getProductName() + "'("
@@ -5822,7 +5872,8 @@ public class VoiceService extends Service
         String sig = saved + "|" + present + "|" + routeDesc + "|"
                 + aa + "|" + verdict + "|" + describeBtOutputs()
                 + "|" + (foreign != null
-                        ? foreign.getProductName() : "");
+                        ? foreign.getProductName() : "")
+                + "|" + pinSkippedScoOnly;
         long now = android.os.SystemClock.uptimeMillis();
         if (sig.equals(laneLastDecisionSig)
                 && now - laneLastDecisionLogMs < 30_000) {
@@ -5838,6 +5889,10 @@ public class VoiceService extends Service
                 + (foreign != null
                         ? " foreignComm='"
                                 + foreign.getProductName() + "'"
+                        : "")
+                + (pinSkippedScoOnly
+                        ? " pin-first skipped — no earbuds A2DP "
+                                + "target (SCO only)"
                         : "")
                 + " outputs=" + describeBtOutputs()
                 + " comm=" + describeCommDevices());
@@ -6265,8 +6320,10 @@ public class VoiceService extends Service
                         + "), no focus, no mode change, other audio "
                         + "untouched");
             } else {
-                log("lane: media pin — a foreign device holds the "
-                        + "communication lane; playing to "
+                log("lane: media pin — "
+                        + (lanePinWhy != null ? lanePinWhy
+                                : "pin-first (non-AA split)")
+                        + "; playing to "
                         + dev.getProductName()
                         + " as media (A2DP pin), no focus, no mode "
                         + "change, other audio untouched");
@@ -6300,6 +6357,17 @@ public class VoiceService extends Service
         AudioDeviceInfo dev =
                 startHeadsetSession(LANE_BEGIN_HEADSET);
         if (dev == null) return LANE_BEGIN_PARK;
+        // v1.78: under pin-first ordering, a fresh plain-headset
+        // session in a non-AA split means the pin had no target
+        // (it is attempted first whenever one exists) — say so
+        // once per session, so the field logs show the
+        // pin-attempted vs pin-skipped ratio. (Checked fresh: a
+        // target that appeared since the decision is honored
+        // silently — no skip line is logged then.)
+        if (findEarbudsA2dpDevice() == null) {
+            log("lane: pin-first skipped — no earbuds A2DP "
+                    + "target (SCO only); headset channel");
+        }
         log("lane: case B split no-focus — playing to "
                 + dev.getProductName()
                 + " via headset channel, other audio untouched");
