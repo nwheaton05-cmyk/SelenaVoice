@@ -111,6 +111,7 @@ public class MainActivity extends Activity {
     private Switch btSwitch;
     private Switch spkSwitch;
     private Switch earbudsOnlySwitch;
+    private Switch headsetFallbackSwitch;
 
     public MainActivity() {
         receiver = new MessageReceiver(this);
@@ -540,6 +541,20 @@ public class MainActivity extends Activity {
                             android.widget.Toast.LENGTH_LONG).show();
                 }
             }
+        });
+
+        // Nick 2026-10-30 v1.77: headset fallback for the earbuds
+        // lane. ON (the default): when the clean earbuds route is
+        // refused or unprovable in a split case (Android Auto
+        // refuses the media pin), Selena falls back to the earbuds'
+        // headset channel instead of staying silent. OFF restores
+        // the v1.76 park-on-refusal behavior.
+        headsetFallbackSwitch = findViewById(R.id.headsetFallbackSwitch);
+        headsetFallbackSwitch.setChecked(
+                VoiceService.getHeadsetFallback(this));
+        headsetFallbackSwitch.setOnCheckedChangeListener((v, on) -> {
+            VoiceService.setHeadsetFallback(this, on);
+            VoiceService.log("lane: headset-fallback=" + on);
         });
 
         requestPermissions();

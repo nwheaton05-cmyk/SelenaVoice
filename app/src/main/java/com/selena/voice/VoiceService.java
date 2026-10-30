@@ -155,6 +155,12 @@ public class VoiceService extends Service
     // (his explicit order) — but it only takes effect once an earbuds
     // name is saved (see the lane section near isEarbudsConnected).
     public static final String KEY_EARBUDS_ONLY = "earbuds_only_playback";
+    // Nick 2026-10-30 v1.77: headset fallback for the earbuds lane.
+    // Default ON (his stated preference): when the clean media pin
+    // is refused or unprovable in a split case (Android Auto does
+    // exactly this), the lane falls back to the earbuds' headset
+    // channel instead of parking in silence.
+    public static final String KEY_HEADSET_FALLBACK = "headset_fallback";
 
     // v1.50 (2026-10-26, OVH batch): owned-domain addresses replace
     // the DuckDNS bridge names (same OVH server, permanent names).
@@ -1856,20 +1862,23 @@ public class VoiceService extends Service
             // pinned to the earbuds with NO focus and NO routing
             // calls (Android Auto owns the car's lanes; the BT media
             // lane to the earbuds is free).
-            final int laneBegin = laneBegin();
+            int laneBegin = laneBegin();
             if (laneBegin == LANE_BEGIN_PARK) {
                 playing = false;
                 isPlayingAudio = false;
                 setPlayingAudio(false);
                 return false;
             }
-            final boolean laneNow = laneBegin == LANE_BEGIN_HEADSET;
-            final boolean laneAa = laneBegin == LANE_BEGIN_AA;
+            // v1.77: not final — a refused pin flips these to the
+            // headset fallback mid-method (laneNow on, lanePin off).
+            boolean laneNow = laneBegin == LANE_BEGIN_HEADSET
+                    || laneBegin == LANE_BEGIN_HEADSET_FALLBACK;
+            boolean laneAa = laneBegin == LANE_BEGIN_AA;
             // v1.76: both pin flavors (AA-present, and the
             // foreign-comm-incumbent media pin) share the pin
             // discipline below: per-player pin, pre-play route
             // proof, NO focus, NO routing calls.
-            final boolean lanePin = laneAa
+            boolean lanePin = laneAa
                     || laneBegin == LANE_BEGIN_PIN;
             final String pinCaseName =
                     laneAa ? "AA-present" : "media-pin";
@@ -1901,31 +1910,79 @@ public class VoiceService extends Service
                     && android.os.Build.VERSION.SDK_INT >= 28) {
                 // Headset: belt and braces alongside the comm device.
                 // Pins: this pin IS the lane — if the system refuses
-                // it, park rather than risk the car speakers.
+                // it, she falls back to the headset channel when the
+                // v1.77 user setting allows, else parks rather than
+                // risk the car speakers.
                 try {
                     boolean pinned =
                             player.setPreferredDevice(laneDevice);
                     if (lanePin && !pinned) {
                         log("lane: " + pinFail + " — "
                                 + "setPreferredDevice refused for "
-                                + laneDevice.getProductName()
-                                + "; parked");
-                        releasePlayer();
-                        laneEnd();
-                        playing = false;
-                        isPlayingAudio = false;
-                        setPlayingAudio(false);
-                        return false;
+                                + laneDevice.getProductName());
+                        if (isHeadsetFallbackOn()
+                                && laneFallbackToHeadset(
+                                        "lane: pin refused — "
+                                        + "headset fallback (user "
+                                        + "setting on)")) {
+                            lanePin = false;
+                            laneAa = false;
+                            laneNow = true;
+                            laneBegin =
+                                    LANE_BEGIN_HEADSET_FALLBACK;
+                            player.setAudioAttributes(
+                                    new AudioAttributes.Builder()
+                                            .setUsage(AudioAttributes
+                                                    .USAGE_VOICE_COMMUNICATION)
+                                            .setContentType(AudioAttributes
+                                                    .CONTENT_TYPE_SPEECH)
+                                            .build());
+                            try {
+                                player.setPreferredDevice(laneDevice);
+                            } catch (Exception ignored) {}
+                        } else {
+                            log("lane: " + pinFail + " — parked");
+                            releasePlayer();
+                            laneEnd();
+                            playing = false;
+                            isPlayingAudio = false;
+                            setPlayingAudio(false);
+                            return false;
+                        }
                     }
                 } catch (Exception e) {
                     log("lane: setPreferredDevice failed: " + e);
                     if (lanePin) {
-                        releasePlayer();
-                        laneEnd();
-                        playing = false;
-                        isPlayingAudio = false;
-                        setPlayingAudio(false);
-                        return false;
+                        if (isHeadsetFallbackOn()
+                                && laneFallbackToHeadset(
+                                        "lane: pin refused — "
+                                        + "headset fallback (user "
+                                        + "setting on)")) {
+                            lanePin = false;
+                            laneAa = false;
+                            laneNow = true;
+                            laneBegin =
+                                    LANE_BEGIN_HEADSET_FALLBACK;
+                            try {
+                                player.setAudioAttributes(
+                                        new AudioAttributes.Builder()
+                                                .setUsage(AudioAttributes
+                                                        .USAGE_VOICE_COMMUNICATION)
+                                                .setContentType(AudioAttributes
+                                                        .CONTENT_TYPE_SPEECH)
+                                                .build());
+                            } catch (Exception ignored) {}
+                            try {
+                                player.setPreferredDevice(laneDevice);
+                            } catch (Exception ignored) {}
+                        } else {
+                            releasePlayer();
+                            laneEnd();
+                            playing = false;
+                            isPlayingAudio = false;
+                            setPlayingAudio(false);
+                            return false;
+                        }
                     }
                 }
             }
@@ -1984,7 +2041,28 @@ public class VoiceService extends Service
                             + (proven != null
                                     ? proven.getProductName()
                                     : "unknown")
-                            + ") — parked, no output");
+                            + ")");
+                    // v1.77: an unprovable pin is a refused pin —
+                    // with the fallback setting on, the headset
+                    // channel serves instead. The player was built
+                    // for the pin (media attributes, prepared), so
+                    // release it and re-enter once: the sticky
+                    // fallback session makes the re-entry begin as
+                    // HEADSET_FALLBACK and play cleanly.
+                    if (isHeadsetFallbackOn()
+                            && laneFallbackToHeadset(
+                                    "lane: pin unprovable — "
+                                    + "headset fallback (user "
+                                    + "setting on)")) {
+                        releasePlayer();
+                        playing = false;
+                        isPlayingAudio = false;
+                        setPlayingAudio(false);
+                        return playFileNow(f);
+                    }
+                    log("lane: " + pinCaseName
+                            + " route NOT earbuds — parked, "
+                            + "no output");
                     releasePlayer();
                     laneEnd();
                     playing = false;
@@ -2655,7 +2733,7 @@ public class VoiceService extends Service
         // e.g. the comm device was refused) unwinds exactly like
         // the backstop: nothing was heard, no report. AA cannot be
         // pinned for TTS and is treated the same.
-        final int laneBegin = laneBegin();
+        final int laneBegin = laneBeginInternal(true);
         if (laneBegin == LANE_BEGIN_PARK
                 || laneBegin == LANE_BEGIN_AA
                 || laneBegin == LANE_BEGIN_PIN) {
@@ -2672,7 +2750,8 @@ public class VoiceService extends Service
             broadcastPlaybackState();
             return;
         }
-        if (laneBegin == LANE_BEGIN_HEADSET) {
+        if (laneBegin == LANE_BEGIN_HEADSET
+                || laneBegin == LANE_BEGIN_HEADSET_FALLBACK) {
             try {
                 tts.setAudioAttributes(new AudioAttributes.Builder()
                         .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
@@ -5171,6 +5250,11 @@ public class VoiceService extends Service
         return getEarbudsOnly(this);
     }
 
+    /** v1.77: the headset-fallback user setting (default on). */
+    private boolean isHeadsetFallbackOn() {
+        return getHeadsetFallback(this);
+    }
+
     /** Toggle on + name saved + API 31+. No name → inert by design. */
     private boolean laneConfigured() {
         if (!isEarbudsOnlyOn()) return false;
@@ -5583,6 +5667,12 @@ public class VoiceService extends Service
     private Runnable laneSessionReleaseTask = null;
     private int laneSessionGen = 0;
     private boolean laneSessionHoldLogged = false;
+    // v1.77: the verdict the current begin/play is serving, and
+    // the verdict a live headset-fallback session was acquired
+    // under — a fallback session is STICKY for its verdict, so the
+    // pin is never re-attempted per item (no retry storms).
+    private int laneCurrentVerdict = LANE_OFF;
+    private int laneFallbackVerdict = LANE_OFF;
     private long laneTransitionUntilMs = 0;
     private Runnable lanePendingAbort = null;
     private String laneLastDecisionSig = "";
@@ -5782,8 +5872,14 @@ public class VoiceService extends Service
      */
     private boolean laneTtsBlocked() {
         int d = evaluateLane("tts-gate");
-        return d == LANE_PARK || d == LANE_CASE_B_AA
-                || d == LANE_CASE_B_PIN;
+        if (d == LANE_PARK) return true;
+        // v1.77: under a pin verdict, TTS holds only while the
+        // headset fallback is OFF — with it on, the begin converts
+        // to a headset-fallback session and the TTS speaks.
+        if (d == LANE_CASE_B_AA || d == LANE_CASE_B_PIN) {
+            return !isHeadsetFallbackOn();
+        }
+        return false;
     }
 
     /** Human-readable lane state for logs. */
@@ -5814,12 +5910,19 @@ public class VoiceService extends Service
     private static final int LANE_BEGIN_AA = 2;
     private static final int LANE_BEGIN_PARK = 3;
     private static final int LANE_BEGIN_PIN = 4;
+    // v1.77: a session that began as a pin verdict but fell back
+    // to the headset channel (user setting) after the pin was
+    // refused or unprovable. Plays exactly like HEADSET; the kind
+    // exists so logs and session reuse can tell the two apart.
+    private static final int LANE_BEGIN_HEADSET_FALLBACK = 5;
 
     private static String laneBeginName(int b) {
         switch (b) {
             case LANE_BEGIN_HEADSET: return "headset";
             case LANE_BEGIN_AA: return "aa-pin";
             case LANE_BEGIN_PIN: return "media-pin";
+            case LANE_BEGIN_HEADSET_FALLBACK:
+                return "headset-fallback";
             default: return "legacy";
         }
     }
@@ -5828,7 +5931,8 @@ public class VoiceService extends Service
     private boolean laneSessionHeld() {
         return laneSessionKind == LANE_BEGIN_HEADSET
                 || laneSessionKind == LANE_BEGIN_AA
-                || laneSessionKind == LANE_BEGIN_PIN;
+                || laneSessionKind == LANE_BEGIN_PIN
+                || laneSessionKind == LANE_BEGIN_HEADSET_FALLBACK;
     }
 
     private void cancelLaneSessionRelease() {
@@ -5937,6 +6041,77 @@ public class VoiceService extends Service
     }
 
     /**
+     * v1.77: acquire a headset-channel session of the given kind
+     * (LANE_BEGIN_HEADSET or LANE_BEGIN_HEADSET_FALLBACK): mode +
+     * communication device to the name-matched earbuds, session
+     * fields set. Returns the device, or null when there is no
+     * earbuds comm device or the system refused the selection —
+     * the caller parks; there is never a legacy fallback and never
+     * a retry burst.
+     */
+    private AudioDeviceInfo startHeadsetSession(int kind) {
+        AudioDeviceInfo dev = findEarbudsCommDevice();
+        if (dev == null) return null;
+        try {
+            lanePrevMode = audioManager.getMode();
+            audioManager.setMode(AudioManager.MODE_IN_COMMUNICATION);
+            if (!audioManager.setCommunicationDevice(dev)) {
+                audioManager.setMode(lanePrevMode);
+                log("lane: setCommunicationDevice refused for "
+                        + dev.getProductName()
+                        + " — parking (no legacy fallback, no retry)");
+                return null;
+            }
+            laneDevice = dev;
+            laneHeadsetLive = true;
+            lanePlaybackActive = true;
+            laneSessionKind = kind;
+            laneSessionDeviceName =
+                    String.valueOf(dev.getProductName());
+            laneSessionAcquiredMs =
+                    android.os.SystemClock.uptimeMillis();
+            laneSessionItems = 1;
+            laneSessionHoldLogged = false;
+            laneTransitionUntilMs =
+                    android.os.SystemClock.uptimeMillis() + 1500;
+            return dev;
+        } catch (Exception e) {
+            log("lane: begin failed: " + e);
+            lanePlaybackActive = false;
+            laneHeadsetLive = false;
+            laneDevice = null;
+            return null;
+        }
+    }
+
+    /**
+     * v1.77: the pin path failed or cannot run — fall back to the
+     * headset channel (Nick's 2026-10-30 19:09 decision: audible
+     * in the earbuds beats parked silence; the fallback switch is
+     * his, default ON). Releases any live pin session first, then
+     * acquires a headset-fallback session under the current
+     * verdict (sticky: later items for the same verdict reuse it
+     * instead of re-attempting the pin). The audio still goes ONLY
+     * to the earbuds; if the headset acquisition also fails, the
+     * caller parks with zero output.
+     */
+    private boolean laneFallbackToHeadset(String reasonLog) {
+        log(reasonLog);
+        laneEnd();
+        AudioDeviceInfo dev =
+                startHeadsetSession(LANE_BEGIN_HEADSET_FALLBACK);
+        if (dev == null) {
+            log("lane: headset fallback unavailable — "
+                    + "parking, no output");
+            return false;
+        }
+        laneFallbackVerdict = laneCurrentVerdict;
+        log("lane: session acquired — headset-fallback to "
+                + laneSessionDeviceName);
+        return true;
+    }
+
+    /**
      * Begin an engaged play. LEGACY = the caller takes the normal
      * routing + focus path (lane off, or Case A where the duck is
      * wanted). HEADSET = the communication device is live; play
@@ -5947,9 +6122,18 @@ public class VoiceService extends Service
      * setCommunicationDevice degrades to PARK with a clear log —
      * never to the legacy path (v1.74 fell through and played on
      * the truck) and never to a retry burst.
+     * v1.77: with the headset-fallback setting ON, a pin verdict
+     * whose pin is refused/unprovable — or a TTS item, which can
+     * never be pinned — converts to a HEADSET_FALLBACK session
+     * instead of parking.
      */
     private int laneBegin() {
+        return laneBeginInternal(false);
+    }
+
+    private int laneBeginInternal(boolean forTts) {
         int d = evaluateLane("begin");
+        laneCurrentVerdict = d;
         if (d == LANE_OFF || d == LANE_CASE_A) {
             // A session left over from an earlier split verdict
             // must never leak its route into a legacy play.
@@ -5968,6 +6152,26 @@ public class VoiceService extends Service
         if (d == LANE_PARK) {
             if (laneSessionHeld()) laneEnd();
             return LANE_BEGIN_PARK;
+        }
+        // v1.77 STICKINESS: a live headset-fallback session serves
+        // every later item for the verdict it was acquired under
+        // (and a plain headset verdict, which it can serve as-is)
+        // WITHOUT re-attempting the pin — one pin attempt per
+        // verdict/presence change, never a per-item retry storm.
+        if (laneSessionHeld()
+                && laneSessionKind == LANE_BEGIN_HEADSET_FALLBACK
+                && (d == laneFallbackVerdict
+                        || d == LANE_CASE_B_HEADSET)) {
+            if (!laneSessionCommIntact()) {
+                laneEnd();
+                return LANE_BEGIN_PARK;
+            }
+            cancelLaneSessionRelease();
+            laneSessionItems++;
+            log("lane: session continuing — item "
+                    + laneSessionItems + " (headset-fallback to "
+                    + laneSessionDeviceName + ")");
+            return LANE_BEGIN_HEADSET_FALLBACK;
         }
         final int want = d == LANE_CASE_B_AA ? LANE_BEGIN_AA
                 : d == LANE_CASE_B_PIN ? LANE_BEGIN_PIN
@@ -5998,6 +6202,20 @@ public class VoiceService extends Service
                         + laneSessionItems + " ("
                         + laneBeginName(want) + " to "
                         + laneSessionDeviceName + ")");
+                if (forTts && (want == LANE_BEGIN_AA
+                        || want == LANE_BEGIN_PIN)) {
+                    // v1.77: TTS can never be pinned — with the
+                    // fallback setting on it converts to the
+                    // headset channel; off, it holds as in v1.76
+                    // (the caller treats AA/PIN begins as held).
+                    if (isHeadsetFallbackOn()
+                            && laneFallbackToHeadset(
+                                    "lane: TTS cannot be pinned — "
+                                    + "headset fallback (user "
+                                    + "setting on)")) {
+                        return LANE_BEGIN_HEADSET_FALLBACK;
+                    }
+                }
                 return want;
             }
             laneEnd(); // earbuds device changed — reacquire below
@@ -6011,6 +6229,15 @@ public class VoiceService extends Service
                     ? findEarbudsMediaDevice()
                     : findEarbudsA2dpDevice();
             if (dev == null) {
+                // v1.77: no pin target at all — with the fallback
+                // setting on, the headset channel serves instead
+                // of parking (Nick 2026-10-30 19:09).
+                if (isHeadsetFallbackOn()
+                        && laneFallbackToHeadset(
+                                "lane: pin unavailable — headset "
+                                + "fallback (user setting on)")) {
+                    return LANE_BEGIN_HEADSET_FALLBACK;
+                }
                 log("lane: "
                         + (want == LANE_BEGIN_AA
                                 ? "AA preferred-device FAILED — no "
@@ -6046,6 +6273,18 @@ public class VoiceService extends Service
             }
             log("lane: session acquired — " + laneBeginName(want)
                     + " to " + laneSessionDeviceName);
+            if (forTts) {
+                // v1.77: TTS can never be pinned — with the
+                // fallback setting on it converts to the headset
+                // channel; off, it holds as in v1.76.
+                if (isHeadsetFallbackOn()
+                        && laneFallbackToHeadset(
+                                "lane: TTS cannot be pinned — "
+                                + "headset fallback (user "
+                                + "setting on)")) {
+                    return LANE_BEGIN_HEADSET_FALLBACK;
+                }
+            }
             return want;
         }
         // CASE_B_HEADSET (plain Bluetooth split, no Android Auto,
@@ -6058,41 +6297,15 @@ public class VoiceService extends Service
                     + "under AA; parking");
             return LANE_BEGIN_PARK;
         }
-        AudioDeviceInfo dev = findEarbudsCommDevice();
+        AudioDeviceInfo dev =
+                startHeadsetSession(LANE_BEGIN_HEADSET);
         if (dev == null) return LANE_BEGIN_PARK;
-        try {
-            lanePrevMode = audioManager.getMode();
-            audioManager.setMode(AudioManager.MODE_IN_COMMUNICATION);
-            if (!audioManager.setCommunicationDevice(dev)) {
-                audioManager.setMode(lanePrevMode);
-                log("lane: setCommunicationDevice refused for "
-                        + dev.getProductName()
-                        + " — parking (no legacy fallback, no retry)");
-                return LANE_BEGIN_PARK;
-            }
-            laneDevice = dev;
-            laneHeadsetLive = true;
-            lanePlaybackActive = true;
-            laneSessionKind = LANE_BEGIN_HEADSET;
-            laneSessionDeviceName =
-                    String.valueOf(dev.getProductName());
-            laneSessionAcquiredMs =
-                    android.os.SystemClock.uptimeMillis();
-            laneSessionItems = 1;
-            laneSessionHoldLogged = false;
-            log("lane: case B split no-focus — playing to "
-                    + dev.getProductName()
-                    + " via headset channel, other audio untouched");
-            log("lane: session acquired — headset to "
-                    + laneSessionDeviceName);
-            return LANE_BEGIN_HEADSET;
-        } catch (Exception e) {
-            log("lane: begin failed: " + e);
-            lanePlaybackActive = false;
-            laneHeadsetLive = false;
-            laneDevice = null;
-            return LANE_BEGIN_PARK;
-        }
+        log("lane: case B split no-focus — playing to "
+                + dev.getProductName()
+                + " via headset channel, other audio untouched");
+        log("lane: session acquired — headset to "
+                + laneSessionDeviceName);
+        return LANE_BEGIN_HEADSET;
     }
 
     /** Release the lane: headset teardown only if the comm channel
@@ -9099,6 +9312,19 @@ public class VoiceService extends Service
     public static void setEarbudsOnly(Context ctx, boolean on) {
         ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
                 .edit().putBoolean(KEY_EARBUDS_ONLY, on).apply();
+    }
+
+    // Nick 2026-10-30 v1.77: headset fallback toggle. Default TRUE
+    // — Nick's stated preference (v1.75's audible half-and-half over
+    // v1.76's parked silence). OFF restores v1.76 park-on-refusal.
+    public static boolean getHeadsetFallback(Context ctx) {
+        return ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                .getBoolean(KEY_HEADSET_FALLBACK, true);
+    }
+
+    public static void setHeadsetFallback(Context ctx, boolean on) {
+        ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                .edit().putBoolean(KEY_HEADSET_FALLBACK, on).apply();
     }
 
     private boolean isNoAutoReadout() {
