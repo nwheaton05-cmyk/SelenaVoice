@@ -1768,7 +1768,16 @@ public class VoiceService extends Service
     @SuppressWarnings("deprecation") // setSpeakerphoneOn
     private void restoreAudioRouting() {
         // Nick 2026-10-30 v1.73: a laned play never touched the
-        // speakerphone or media focus — its teardown is laneEnd.
+        // speakerphone or media focus.
+        // v1.76: the lane is a SESSION — an item ending schedules
+        // the session's idle release (scheduleLaneSessionRelease)
+        // instead of tearing the route down; per-segment teardown
+        // is what made Android Auto announce "call ended" at
+        // every segment seam in the 2026-10-30 18:25 field test.
+        if (laneSessionHeld()) {
+            scheduleLaneSessionRelease();
+            return;
+        }
         if (lanePlaybackActive) {
             laneEnd();
             return;
@@ -1856,6 +1865,16 @@ public class VoiceService extends Service
             }
             final boolean laneNow = laneBegin == LANE_BEGIN_HEADSET;
             final boolean laneAa = laneBegin == LANE_BEGIN_AA;
+            // v1.76: both pin flavors (AA-present, and the
+            // foreign-comm-incumbent media pin) share the pin
+            // discipline below: per-player pin, pre-play route
+            // proof, NO focus, NO routing calls.
+            final boolean lanePin = laneAa
+                    || laneBegin == LANE_BEGIN_PIN;
+            final String pinCaseName =
+                    laneAa ? "AA-present" : "media-pin";
+            final String pinFail = laneAa
+                    ? "AA preferred-device FAILED" : "media-pin FAILED";
             if (laneBegin == LANE_BEGIN_LEGACY) {
                 // Nick 2026-10-18 v1.11: Bluetooth-aware — earbuds win
                 // over the speakerphone when connected.
@@ -1866,6 +1885,9 @@ public class VoiceService extends Service
                 log("audio: stream=MUSIC pinned to earbuds "
                         + "(AA-present pin — no focus, no routing "
                         + "change)");
+            } else if (lanePin) {
+                log("audio: stream=MUSIC pinned to earbuds "
+                        + "(media pin — no focus, no routing change)");
             }
             releasePlayer();
             player = new MediaPlayer();
@@ -1875,16 +1897,16 @@ public class VoiceService extends Service
                             : AudioAttributes.USAGE_MEDIA)
                     .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
                     .build());
-            if ((laneNow || laneAa) && laneDevice != null
+            if ((laneNow || lanePin) && laneDevice != null
                     && android.os.Build.VERSION.SDK_INT >= 28) {
                 // Headset: belt and braces alongside the comm device.
-                // AA: this pin IS the lane — if the system refuses
+                // Pins: this pin IS the lane — if the system refuses
                 // it, park rather than risk the car speakers.
                 try {
                     boolean pinned =
                             player.setPreferredDevice(laneDevice);
-                    if (laneAa && !pinned) {
-                        log("lane: AA preferred-device FAILED — "
+                    if (lanePin && !pinned) {
+                        log("lane: " + pinFail + " — "
                                 + "setPreferredDevice refused for "
                                 + laneDevice.getProductName()
                                 + "; parked");
@@ -1897,7 +1919,7 @@ public class VoiceService extends Service
                     }
                 } catch (Exception e) {
                     log("lane: setPreferredDevice failed: " + e);
-                    if (laneAa) {
+                    if (lanePin) {
                         releasePlayer();
                         laneEnd();
                         playing = false;
@@ -1940,11 +1962,11 @@ public class VoiceService extends Service
                 log("voice: her gain failed (plays ungained): " + e);
                 loudnessEnhancer = null;
             }
-            if (laneAa) {
+            if (lanePin) {
                 // Nick 2026-10-30 16:40 — HARD RULE: she must NEVER
                 // output through Android Auto / the truck radio /
                 // car speakers, not as a fallback and not for a
-                // split second. So in the AA-present case the route
+                // split second. So in the pin cases the route
                 // is PROVEN before start(): a silent probe track
                 // pinned to the same earbuds must report the
                 // earbuds as its routed device. The car route, any
@@ -1957,7 +1979,8 @@ public class VoiceService extends Service
                 if (proven == null
                         || !nameMatchesEarbuds(
                                 proven.getProductName())) {
-                    log("lane: AA-present route NOT earbuds ("
+                    log("lane: " + pinCaseName
+                            + " route NOT earbuds ("
                             + (proven != null
                                     ? proven.getProductName()
                                     : "unknown")
@@ -1969,7 +1992,7 @@ public class VoiceService extends Service
                     setPlayingAudio(false);
                     return false;
                 }
-                log("lane: AA-present route verified — "
+                log("lane: " + pinCaseName + " route verified — "
                         + proven.getProductName()
                         + " proven before start");
             }
@@ -1993,14 +2016,14 @@ public class VoiceService extends Service
                                             + ")"
                                     : "unknown")
                             + " — mode " + laneModeName());
-                    if (laneAa && routed != null
+                    if (lanePin && routed != null
                             && !nameMatchesEarbuds(
                                     routed.getProductName())) {
                         // v1.75: the pin did not hold — she is
                         // headed somewhere that is NOT the earbuds
                         // (the car). Stop and park; the caller
                         // keeps the item unplayed.
-                        log("lane: AA preferred-device FAILED — "
+                        log("lane: " + pinFail + " — "
                                 + "player routed to "
                                 + routed.getProductName()
                                 + ", not the earbuds; parked");
@@ -2011,13 +2034,13 @@ public class VoiceService extends Service
                         setPlayingAudio(false);
                         return false;
                     }
-                    if (laneAa && routed == null) {
+                    if (lanePin && routed == null) {
                         // Route not assigned yet at start; verify
                         // shortly — a late non-earbuds route aborts
                         // to park via the normal mid-play path.
                         final File aaFile = f;
                         handler.postDelayed(() -> {
-                            if (!laneAaActive || !playing
+                            if (!lanePinActive || !playing
                                     || currentAudioFile != aaFile
                                     || player == null) return;
                             try {
@@ -2026,8 +2049,8 @@ public class VoiceService extends Service
                                 if (r2 != null
                                         && !nameMatchesEarbuds(
                                                 r2.getProductName())) {
-                                    log("lane: AA preferred-device "
-                                            + "FAILED — late route to "
+                                    log("lane: " + pinFail + " "
+                                            + "— late route to "
                                             + r2.getProductName()
                                             + "; aborting to park");
                                     laneAbortPlayback();
@@ -2572,8 +2595,13 @@ public class VoiceService extends Service
         // cannot be pinned to the earbuds, so the spoken form waits
         // and the text stays written in the window.
         if (laneTtsBlocked()) {
-            if (evaluateLane("tts-speak") == LANE_CASE_B_AA) {
-                log("lane: AA split — TTS cannot be pinned to the "
+            int ttsVerdict = evaluateLane("tts-speak");
+            if (ttsVerdict == LANE_CASE_B_AA
+                    || ttsVerdict == LANE_CASE_B_PIN) {
+                log("lane: "
+                        + (ttsVerdict == LANE_CASE_B_AA
+                                ? "AA split" : "media-pin split")
+                        + " — TTS cannot be pinned to the "
                         + "earbuds; speech held (text stays written)");
             } else {
                 log("lane: armed-held — direct TTS attempt held off");
@@ -2629,7 +2657,8 @@ public class VoiceService extends Service
         // pinned for TTS and is treated the same.
         final int laneBegin = laneBegin();
         if (laneBegin == LANE_BEGIN_PARK
-                || laneBegin == LANE_BEGIN_AA) {
+                || laneBegin == LANE_BEGIN_AA
+                || laneBegin == LANE_BEGIN_PIN) {
             log("lane: TTS held at begin — not spoken");
             ttsSpeaking = false;
             isPlayingAudio = false;
@@ -2923,6 +2952,9 @@ public class VoiceService extends Service
         playing = false;
         isPlayingAudio = false;
         setPlayingAudio(false);
+        // v1.76: a user stop ends the lane session immediately —
+        // the idle hold-over is for queue flow, not for a stop.
+        laneEnd();
         // Nick 2026-10-23 v1.47: stopped = she's not speaking —
         // restart the mic if we muted it.
         unmuteMicAfterPlayback();
@@ -4972,6 +5004,7 @@ public class VoiceService extends Service
             case AudioDeviceInfo.TYPE_USB_ACCESSORY: return "USB_ACC";
             case AudioDeviceInfo.TYPE_BUILTIN_SPEAKER: return "SPEAKER";
             case AudioDeviceInfo.TYPE_BUILTIN_EARPIECE: return "EARPIECE";
+            case AudioDeviceInfo.TYPE_REMOTE_SUBMIX: return "REMOTE_SUBMIX";
             case AudioDeviceInfo.TYPE_WIRED_HEADSET: return "WIRED";
             default: return "T" + t;
         }
@@ -5034,7 +5067,10 @@ public class VoiceService extends Service
             for (AudioDeviceInfo d :
                     am.getDevices(AudioManager.GET_DEVICES_OUTPUTS)) {
                 int t = d.getType();
-                if (!isBtAudioType(t) && !isUsbAudioType(t)) continue;
+                if (!isBtAudioType(t) && !isUsbAudioType(t)
+                        && t != AudioDeviceInfo.TYPE_REMOTE_SUBMIX) {
+                    continue;
+                }
                 if (!first) sb.append(", ");
                 first = false;
                 sb.append(d.getProductName())
@@ -5240,6 +5276,76 @@ public class VoiceService extends Service
     }
 
     /**
+     * v1.76: the communication lane's incumbency check. Returns a
+     * NON-earbuds Bluetooth call device (SCO / BLE headset) that
+     * stands between her and the call lane, or null when the lane
+     * is hers or free:
+     *  - if a communication device is CURRENTLY selected and it is
+     *    a non-earbuds BT call device, that device is the incumbent;
+     *  - if the currently selected device IS the earbuds (her own
+     *    live session), there is no foreign incumbent — other
+     *    devices merely being available must not tear her session
+     *    down;
+     *  - otherwise, any non-earbuds BT call device in the available
+     *    communication list counts: another HFP claimant (a car)
+     *    will fight her for the phone's single call lane — the
+     *    2026-10-30 18:25 field test, where truck SYNC and the
+     *    earbuds tore each other's SCO link down in turn.
+     */
+    private AudioDeviceInfo foreignCommIncumbent() {
+        if (android.os.Build.VERSION.SDK_INT < 31) return null;
+        AudioManager am = laneAudioManager();
+        if (am == null) return null;
+        try {
+            AudioDeviceInfo current = am.getCommunicationDevice();
+            if (current != null) {
+                if (nameMatchesEarbuds(current.getProductName())) {
+                    return null; // her own session holds the lane
+                }
+                int ct = current.getType();
+                if (ct == AudioDeviceInfo.TYPE_BLUETOOTH_SCO
+                        || ct == AudioDeviceInfo.TYPE_BLE_HEADSET) {
+                    return current;
+                }
+            }
+            for (AudioDeviceInfo d :
+                    am.getAvailableCommunicationDevices()) {
+                int t = d.getType();
+                if ((t == AudioDeviceInfo.TYPE_BLUETOOTH_SCO
+                        || t == AudioDeviceInfo.TYPE_BLE_HEADSET)
+                        && !nameMatchesEarbuds(d.getProductName())) {
+                    return d;
+                }
+            }
+        } catch (Exception e) {
+            log("lane: comm incumbency query failed: " + e);
+        }
+        return null;
+    }
+
+    /**
+     * v1.76: the named earbuds as an A2DP media device ONLY (no BLE
+     * fallback) — the pin target when a foreign device stands in
+     * the communication lane (see evaluateLane's CASE_MEDIA_PIN).
+     */
+    private AudioDeviceInfo findEarbudsA2dpDevice() {
+        AudioManager am = laneAudioManager();
+        if (am == null) return null;
+        try {
+            for (AudioDeviceInfo d :
+                    am.getDevices(AudioManager.GET_DEVICES_OUTPUTS)) {
+                if (d.getType() == AudioDeviceInfo.TYPE_BLUETOOTH_A2DP
+                        && nameMatchesEarbuds(d.getProductName())) {
+                    return d;
+                }
+            }
+        } catch (Exception e) {
+            log("lane: media device query failed: " + e);
+        }
+        return null;
+    }
+
+    /**
      * True when the named earbuds hold the MEDIA route right now
      * (Nick's 14:44 refinement: that is the single-device case and
      * she should play + duck exactly as always). Decider: a silent
@@ -5420,12 +5526,14 @@ public class VoiceService extends Service
     // ------------------------------------------------ v1.75 decision core
 
     /**
-     * v1.75: the lane decision, evaluated fresh at every gate.
+     * The lane decision, evaluated fresh at every gate.
+     * (v1.75 core; v1.76 additions marked.)
      *  OFF        — toggle off / no name saved: pre-lane behavior.
      *  CASE_A     — the earbuds hold the media route (single-device
      *               case): legacy media playback + MAY_DUCK.
-     *  CASE_B_HEADSET — split case, no Android Auto: headset/call
-     *               channel to the earbuds, no focus, no duck.
+     *  CASE_B_HEADSET — split case, no Android Auto, no foreign
+     *               comm incumbent: headset/call channel to the
+     *               earbuds, no focus, no duck.
      *  CASE_B_AA  — split case WITH Android Auto on stage: media
      *               pinned per-player to the earbuds, NO focus, NO
      *               mode changes, NEVER the communication channel —
@@ -5434,6 +5542,13 @@ public class VoiceService extends Service
      *               head unit (field failure 2026-10-30 16:18:
      *               setCommunicationDevice refused, playback treated
      *               as a call, Spotify paused on the radio).
+     *  CASE_MEDIA_PIN (v1.76) — split case without AA, but a
+     *               FOREIGN device stands in the communication
+     *               lane (another SCO claimant in the comm list):
+     *               do not fight it for the call lane — pin her
+     *               media to the earbuds' A2DP instead (same pin
+     *               discipline as CASE_B_AA); no A2DP presence →
+     *               PARK.
      *  PARK       — configured but cannot play (earbuds absent, or
      *               present media-only with no usable channel while
      *               another device holds the route): hold silently.
@@ -5443,10 +5558,31 @@ public class VoiceService extends Service
     private static final int LANE_CASE_B_HEADSET = 2;
     private static final int LANE_CASE_B_AA = 3;
     private static final int LANE_PARK = 4;
+    // v1.76: split case WITHOUT Android Auto, but a foreign device
+    // stands in the communication lane — her media is pinned to
+    // the earbuds' A2DP instead of fighting for the call lane.
+    private static final int LANE_CASE_B_PIN = 5;
 
-    private boolean laneAaActive = false;
+    private boolean lanePinActive = false;
     private boolean laneHeadsetLive = false;
     private String laneAaSignal = null;
+    // v1.76: the lane is a SESSION, not a per-item rental. One
+    // acquisition serves a whole message (all its segments) and
+    // any immediately-following queued items; it releases only
+    // after the playback queues have been idle for
+    // LANE_SESSION_HOLD_MS. (v1.75 set and cleared the
+    // communication device per segment; under Android Auto every
+    // set/clear looked like a phone call starting and ending —
+    // the truck announced "call ended" at every segment seam,
+    // field logs 2026-10-30 18:25–18:28.)
+    private static final long LANE_SESSION_HOLD_MS = 5000;
+    private int laneSessionKind = 0; // LANE_BEGIN_LEGACY (declared below)
+    private String laneSessionDeviceName = null;
+    private long laneSessionAcquiredMs = 0;
+    private int laneSessionItems = 0;
+    private Runnable laneSessionReleaseTask = null;
+    private int laneSessionGen = 0;
+    private boolean laneSessionHoldLogged = false;
     private long laneTransitionUntilMs = 0;
     private Runnable lanePendingAbort = null;
     private String laneLastDecisionSig = "";
@@ -5457,13 +5593,22 @@ public class VoiceService extends Service
             case LANE_CASE_A: return "CASE_A";
             case LANE_CASE_B_HEADSET: return "CASE_B_HEADSET";
             case LANE_CASE_B_AA: return "CASE_AA_PIN";
+            case LANE_CASE_B_PIN: return "CASE_MEDIA_PIN";
             case LANE_PARK: return "PARK";
             default: return "OFF";
         }
     }
 
     /**
-     * v1.75: Android Auto on stage? Signals (logged when one fires):
+     * Android Auto on stage? Signals (logged when one fires):
+     *  "remote-submix" (v1.76) — the media route holder IS a
+     *    remote-submix device (type 25): wireless AA holds its
+     *    media there. The ONLY signal present in Nick's Ford
+     *    F-250 (field logs 2026-10-30 18:25) — v1.75 missed it
+     *    and every decision fell through to the headset case.
+     *  "remote-submix-present+bt-vehicle" (v1.76) — a remote-
+     *    submix output exists while a non-earbuds Bluetooth
+     *    vehicle device is connected.
      *  "usb-route" — the media route holder IS a USB audio device
      *    (wired AA carries its audio over USB; the phone's Bluetooth
      *    media lane to the earbuds is genuinely free).
@@ -5471,25 +5616,55 @@ public class VoiceService extends Service
      *    outputs while a non-earbuds Bluetooth device holds the
      *    route (AA head unit connected over USB for projection,
      *    its HFP/Bluetooth side holding the phone's route).
-     * Wireless-AA-only setups with neither signal fall through to
-     * the plain-Bluetooth rules — and the comm-refusal park (see
-     * laneBegin) keeps even that case from bursting onto the car.
+     * AA setups with no signal fall through to the plain-Bluetooth
+     * rules — and the comm-incumbency pin + comm-refusal park keep
+     * even that case from bursting onto the car.
      */
     private String androidAutoSignal(AudioDeviceInfo routed) {
+        // v1.76 signal (a): the route holder IS a remote-submix
+        // device (AudioDeviceInfo type 25). Wireless Android Auto
+        // holds its media on a remote-submix output — Nick's Ford
+        // F-250 / Ford SYNC setup, field logs 2026-10-30 18:25:
+        // the probe reported route='remote-submix' on EVERY
+        // decision while v1.75's USB-only detection said aa=none,
+        // so the verdict never became CASE_AA_PIN and every
+        // segment took the headset channel instead.
+        if (routed != null
+                && routed.getType()
+                        == AudioDeviceInfo.TYPE_REMOTE_SUBMIX) {
+            return "remote-submix";
+        }
         if (routed != null && isUsbAudioType(routed.getType())) {
             return "usb-route";
         }
         AudioManager am = laneAudioManager();
-        if (am == null || routed == null) return null;
-        if (!isBtAudioType(routed.getType())) return null;
+        if (am == null) return null;
+        boolean submixPresent = false;
+        boolean usbPresent = false;
+        boolean vehicleBtPresent = false;
         try {
             for (AudioDeviceInfo d :
                     am.getDevices(AudioManager.GET_DEVICES_OUTPUTS)) {
-                if (isUsbAudioType(d.getType())) {
-                    return "usb-present+bt-route";
+                if (d.getType()
+                        == AudioDeviceInfo.TYPE_REMOTE_SUBMIX) {
+                    submixPresent = true;
+                } else if (isUsbAudioType(d.getType())) {
+                    usbPresent = true;
+                } else if (isBtAudioType(d.getType())
+                        && !nameMatchesEarbuds(d.getProductName())) {
+                    vehicleBtPresent = true;
                 }
             }
         } catch (Exception ignored) {}
+        // v1.76 signal (c): a remote-submix output exists while a
+        // non-earbuds Bluetooth vehicle device is connected.
+        if (submixPresent && vehicleBtPresent) {
+            return "remote-submix-present+bt-vehicle";
+        }
+        if (usbPresent && routed != null
+                && isBtAudioType(routed.getType())) {
+            return "usb-present+bt-route";
+        }
         return null;
     }
 
@@ -5502,11 +5677,11 @@ public class VoiceService extends Service
      */
     private int evaluateLane(String why) {
         if (!isEarbudsOnlyOn()) {
-            logLaneDecision(why, LANE_OFF, false, null, null);
+            logLaneDecision(why, LANE_OFF, false, null, null, null);
             return LANE_OFF;
         }
         if (!laneConfigured()) {
-            logLaneDecision(why, LANE_OFF, false, null, null);
+            logLaneDecision(why, LANE_OFF, false, null, null, null);
             return LANE_OFF;
         }
         boolean present = earbudsPresent();
@@ -5514,6 +5689,11 @@ public class VoiceService extends Service
         boolean routeEarbuds = earbudsHoldMediaRoute();
         String aa = (present && !routeEarbuds)
                 ? androidAutoSignal(routed) : null;
+        // v1.76: the comm-lane incumbency question is asked only
+        // when AA is not already on stage (AA takes the pin path
+        // regardless — the comm channel is never opened under AA).
+        AudioDeviceInfo foreign = (present && !routeEarbuds
+                && aa == null) ? foreignCommIncumbent() : null;
         int verdict;
         if (routeEarbuds) {
             verdict = LANE_CASE_A;
@@ -5522,6 +5702,14 @@ public class VoiceService extends Service
         } else if (aa != null) {
             verdict = LANE_CASE_B_AA;
             laneAaSignal = aa;
+        } else if (foreign != null) {
+            // v1.76: another device stands in the communication
+            // lane — do NOT fight it for the call lane (two HFP
+            // claimants tear each other's SCO link down; field
+            // logs 2026-10-30 18:25). If the earbuds have an A2DP
+            // presence, pin her media to them; otherwise park.
+            verdict = findEarbudsA2dpDevice() != null
+                    ? LANE_CASE_B_PIN : LANE_PARK;
         } else if (findEarbudsCommDevice() != null) {
             verdict = LANE_CASE_B_HEADSET;
         } else {
@@ -5529,19 +5717,22 @@ public class VoiceService extends Service
             // route sits elsewhere: she must not land on the truck.
             verdict = LANE_PARK;
         }
-        logLaneDecision(why, verdict, present, routed, aa);
+        logLaneDecision(why, verdict, present, routed, aa, foreign);
         return verdict;
     }
 
     private void logLaneDecision(String why, int verdict,
-            boolean present, AudioDeviceInfo routed, String aa) {
+            boolean present, AudioDeviceInfo routed, String aa,
+            AudioDeviceInfo foreign) {
         String saved = getEarbudsDeviceName();
         String routeDesc = routed != null
                 ? "'" + routed.getProductName() + "'("
                         + btTypeName(routed.getType()) + ")"
                 : "unknown";
         String sig = saved + "|" + present + "|" + routeDesc + "|"
-                + aa + "|" + verdict + "|" + describeBtOutputs();
+                + aa + "|" + verdict + "|" + describeBtOutputs()
+                + "|" + (foreign != null
+                        ? foreign.getProductName() : "");
         long now = android.os.SystemClock.uptimeMillis();
         if (sig.equals(laneLastDecisionSig)
                 && now - laneLastDecisionLogMs < 30_000) {
@@ -5554,6 +5745,10 @@ public class VoiceService extends Service
                 + " route=" + routeDesc
                 + " aa=" + (aa != null ? aa : "none")
                 + " verdict=" + laneVerdictName(verdict)
+                + (foreign != null
+                        ? " foreignComm='"
+                                + foreign.getProductName() + "'"
+                        : "")
                 + " outputs=" + describeBtOutputs()
                 + " comm=" + describeCommDevices());
     }
@@ -5565,7 +5760,8 @@ public class VoiceService extends Service
      */
     private boolean laneHeadsetActive() {
         int d = evaluateLane("duck-gate");
-        return d == LANE_CASE_B_HEADSET || d == LANE_CASE_B_AA;
+        return d == LANE_CASE_B_HEADSET || d == LANE_CASE_B_AA
+                || d == LANE_CASE_B_PIN;
     }
 
     /**
@@ -5586,7 +5782,8 @@ public class VoiceService extends Service
      */
     private boolean laneTtsBlocked() {
         int d = evaluateLane("tts-gate");
-        return d == LANE_PARK || d == LANE_CASE_B_AA;
+        return d == LANE_PARK || d == LANE_CASE_B_AA
+                || d == LANE_CASE_B_PIN;
     }
 
     /** Human-readable lane state for logs. */
@@ -5597,6 +5794,7 @@ public class VoiceService extends Service
             case LANE_CASE_A: return "media-duck (earbuds)";
             case LANE_CASE_B_HEADSET: return "headset (split)";
             case LANE_CASE_B_AA: return "aa-present pin (split)";
+            case LANE_CASE_B_PIN: return "media pin (split)";
             default: return "armed-held (no earbuds)";
         }
     }
@@ -5610,11 +5808,133 @@ public class VoiceService extends Service
                 + getEarbudsDeviceName() + "); nothing plays out loud");
     }
 
-    // laneBegin() outcomes (v1.75).
+    // laneBegin() outcomes (v1.75; PIN added v1.76).
     private static final int LANE_BEGIN_LEGACY = 0;
     private static final int LANE_BEGIN_HEADSET = 1;
     private static final int LANE_BEGIN_AA = 2;
     private static final int LANE_BEGIN_PARK = 3;
+    private static final int LANE_BEGIN_PIN = 4;
+
+    private static String laneBeginName(int b) {
+        switch (b) {
+            case LANE_BEGIN_HEADSET: return "headset";
+            case LANE_BEGIN_AA: return "aa-pin";
+            case LANE_BEGIN_PIN: return "media-pin";
+            default: return "legacy";
+        }
+    }
+
+    /** v1.76: a lane session is currently acquired (route held). */
+    private boolean laneSessionHeld() {
+        return laneSessionKind == LANE_BEGIN_HEADSET
+                || laneSessionKind == LANE_BEGIN_AA
+                || laneSessionKind == LANE_BEGIN_PIN;
+    }
+
+    private void cancelLaneSessionRelease() {
+        if (laneSessionReleaseTask != null) {
+            handler.removeCallbacks(laneSessionReleaseTask);
+            laneSessionReleaseTask = null;
+        }
+        laneSessionGen++;
+    }
+
+    /**
+     * v1.76: is there still playback work the session should serve?
+     * Anything playing, paused, mid segment-gap, or queued counts —
+     * the session releases only when ALL of it has been idle.
+     */
+    private boolean laneWorkPending() {
+        if (playing || ttsSpeaking || playbackPaused || ttsPaused
+                || pendingSegmentAdvance != null || priorityMode) {
+            return true;
+        }
+        if (!waitingPriority.isEmpty()
+                || !interruptStack.isEmpty()) {
+            return true;
+        }
+        synchronized (audioQueue) {
+            if (!audioQueue.isEmpty()) return true;
+        }
+        synchronized (ttsQueue) {
+            if (!ttsQueue.isEmpty()) return true;
+        }
+        return false;
+    }
+
+    /**
+     * v1.76: an item finished under a held session — keep the lane
+     * for LANE_SESSION_HOLD_MS (covers the 3 s segment gap and
+     * back-to-back items), then release only if the queues have
+     * gone idle; reschedule while work remains.
+     */
+    private void scheduleLaneSessionRelease() {
+        if (!laneSessionHeld()) return;
+        cancelLaneSessionRelease();
+        final int gen = laneSessionGen;
+        laneSessionReleaseTask = () -> {
+            if (laneSessionGen != gen) return;
+            laneSessionReleaseTask = null;
+            if (laneWorkPending()) {
+                scheduleLaneSessionRelease();
+                return;
+            }
+            laneEnd();
+        };
+        handler.postDelayed(laneSessionReleaseTask,
+                LANE_SESSION_HOLD_MS);
+        if (!laneSessionHoldLogged) {
+            laneSessionHoldLogged = true;
+            log("lane: session hold — keeping the "
+                    + laneBeginName(laneSessionKind)
+                    + " lane for "
+                    + (LANE_SESSION_HOLD_MS / 1000)
+                    + "s for the next segment/item");
+        }
+    }
+
+    /**
+     * v1.76: a held headset session is reused only while the
+     * earbuds still hold the communication device. If the system
+     * cleared the selection between items, re-assert it ONCE for
+     * the session; if another BT call device took the lane, do
+     * not fight it — report false and the caller parks.
+     */
+    private boolean laneSessionCommIntact() {
+        if (android.os.Build.VERSION.SDK_INT < 31
+                || audioManager == null || laneDevice == null) {
+            return laneHeadsetLive;
+        }
+        try {
+            AudioDeviceInfo current =
+                    audioManager.getCommunicationDevice();
+            if (current != null
+                    && nameMatchesEarbuds(current.getProductName())) {
+                return true;
+            }
+            if (current != null) {
+                int ct = current.getType();
+                if (ct == AudioDeviceInfo.TYPE_BLUETOOTH_SCO
+                        || ct == AudioDeviceInfo.TYPE_BLE_HEADSET) {
+                    log("lane: session comm lane taken by "
+                            + current.getProductName()
+                            + " — not fighting it; parking");
+                    return false;
+                }
+            }
+            if (audioManager.setCommunicationDevice(laneDevice)) {
+                log("lane: session comm device re-asserted for "
+                        + laneDevice.getProductName());
+                return true;
+            }
+            log("lane: session comm re-assert refused for "
+                    + laneDevice.getProductName() + "; parking");
+            return false;
+        } catch (Exception e) {
+            log("lane: session comm check failed: " + e);
+            return false;
+        }
+    }
 
     /**
      * Begin an engaged play. LEGACY = the caller takes the normal
@@ -5630,36 +5950,114 @@ public class VoiceService extends Service
      */
     private int laneBegin() {
         int d = evaluateLane("begin");
-        if (d == LANE_OFF) return LANE_BEGIN_LEGACY;
-        if (d == LANE_CASE_A) {
-            // Nick 2026-10-30 14:44: when the earbuds themselves
-            // hold the media route, the duck is wanted — decline
-            // the lane; the caller takes the media + MAY_DUCK path.
-            log("lane: case A same-device duck — earbuds hold the "
-                    + "media route, normal playback with duck");
+        if (d == LANE_OFF || d == LANE_CASE_A) {
+            // A session left over from an earlier split verdict
+            // must never leak its route into a legacy play.
+            if (laneSessionHeld()) laneEnd();
+            if (d == LANE_CASE_A) {
+                // Nick 2026-10-30 14:44: when the earbuds
+                // themselves hold the media route, the duck is
+                // wanted — decline the lane; the caller takes the
+                // media + MAY_DUCK path.
+                log("lane: case A same-device duck — earbuds hold "
+                        + "the media route, normal playback with "
+                        + "duck");
+            }
             return LANE_BEGIN_LEGACY;
         }
-        if (d == LANE_PARK) return LANE_BEGIN_PARK;
+        if (d == LANE_PARK) {
+            if (laneSessionHeld()) laneEnd();
+            return LANE_BEGIN_PARK;
+        }
+        final int want = d == LANE_CASE_B_AA ? LANE_BEGIN_AA
+                : d == LANE_CASE_B_PIN ? LANE_BEGIN_PIN
+                : LANE_BEGIN_HEADSET;
+        // v1.76 SESSION REUSE: a held session of the wanted kind
+        // serves this item as-is — NO route set/clear per item or
+        // per segment. (The v1.75 per-segment comm set/clear is
+        // what made Android Auto announce "call ended" at every
+        // segment seam in the 2026-10-30 18:25 field test.)
+        if (laneSessionHeld() && laneSessionKind == want) {
+            AudioDeviceInfo dev = want == LANE_BEGIN_HEADSET
+                    ? laneDevice
+                    : want == LANE_BEGIN_AA
+                            ? findEarbudsMediaDevice()
+                            : findEarbudsA2dpDevice();
+            if (dev != null && laneSessionDeviceName != null
+                    && laneSessionDeviceName.equals(
+                            String.valueOf(dev.getProductName()))) {
+                if (want == LANE_BEGIN_HEADSET
+                        && !laneSessionCommIntact()) {
+                    laneEnd();
+                    return LANE_BEGIN_PARK;
+                }
+                cancelLaneSessionRelease();
+                laneDevice = dev;
+                laneSessionItems++;
+                log("lane: session continuing — item "
+                        + laneSessionItems + " ("
+                        + laneBeginName(want) + " to "
+                        + laneSessionDeviceName + ")");
+                return want;
+            }
+            laneEnd(); // earbuds device changed — reacquire below
+        } else if (laneSessionHeld()) {
+            laneEnd(); // verdict changed — reacquire below
+        }
         laneTransitionUntilMs =
                 android.os.SystemClock.uptimeMillis() + 1500;
-        if (d == LANE_CASE_B_AA) {
-            AudioDeviceInfo dev = findEarbudsMediaDevice();
+        if (want == LANE_BEGIN_AA || want == LANE_BEGIN_PIN) {
+            AudioDeviceInfo dev = want == LANE_BEGIN_AA
+                    ? findEarbudsMediaDevice()
+                    : findEarbudsA2dpDevice();
             if (dev == null) {
-                log("lane: AA preferred-device FAILED — no earbuds "
-                        + "media device among outputs; parking");
+                log("lane: "
+                        + (want == LANE_BEGIN_AA
+                                ? "AA preferred-device FAILED — no "
+                                        + "earbuds media device "
+                                        + "among outputs; parking"
+                                : "media pin FAILED — no earbuds "
+                                        + "A2DP device among "
+                                        + "outputs; parking"));
                 return LANE_BEGIN_PARK;
             }
             laneDevice = dev;
-            laneAaActive = true;
+            lanePinActive = true;
             lanePlaybackActive = true;
-            log("lane: AA-present earbuds media pin — playing to "
-                    + dev.getProductName()
-                    + " as media (AA signal: " + laneAaSignal
-                    + "), no focus, no mode change, other audio "
-                    + "untouched");
-            return LANE_BEGIN_AA;
+            laneSessionKind = want;
+            laneSessionDeviceName =
+                    String.valueOf(dev.getProductName());
+            laneSessionAcquiredMs =
+                    android.os.SystemClock.uptimeMillis();
+            laneSessionItems = 1;
+            laneSessionHoldLogged = false;
+            if (want == LANE_BEGIN_AA) {
+                log("lane: AA-present earbuds media pin — playing "
+                        + "to " + dev.getProductName()
+                        + " as media (AA signal: " + laneAaSignal
+                        + "), no focus, no mode change, other audio "
+                        + "untouched");
+            } else {
+                log("lane: media pin — a foreign device holds the "
+                        + "communication lane; playing to "
+                        + dev.getProductName()
+                        + " as media (A2DP pin), no focus, no mode "
+                        + "change, other audio untouched");
+            }
+            log("lane: session acquired — " + laneBeginName(want)
+                    + " to " + laneSessionDeviceName);
+            return want;
         }
-        // CASE_B_HEADSET (plain Bluetooth split, no Android Auto).
+        // CASE_B_HEADSET (plain Bluetooth split, no Android Auto,
+        // no foreign comm incumbent). Defense in depth: the comm
+        // channel must NEVER open under Android Auto, even if the
+        // state flipped between the decision and here.
+        if (androidAutoSignal(probeMediaRoutedDevice()) != null) {
+            log("lane: Android Auto present at begin — the "
+                    + "communication channel is never opened "
+                    + "under AA; parking");
+            return LANE_BEGIN_PARK;
+        }
         AudioDeviceInfo dev = findEarbudsCommDevice();
         if (dev == null) return LANE_BEGIN_PARK;
         try {
@@ -5675,9 +6073,18 @@ public class VoiceService extends Service
             laneDevice = dev;
             laneHeadsetLive = true;
             lanePlaybackActive = true;
+            laneSessionKind = LANE_BEGIN_HEADSET;
+            laneSessionDeviceName =
+                    String.valueOf(dev.getProductName());
+            laneSessionAcquiredMs =
+                    android.os.SystemClock.uptimeMillis();
+            laneSessionItems = 1;
+            laneSessionHoldLogged = false;
             log("lane: case B split no-focus — playing to "
                     + dev.getProductName()
                     + " via headset channel, other audio untouched");
+            log("lane: session acquired — headset to "
+                    + laneSessionDeviceName);
             return LANE_BEGIN_HEADSET;
         } catch (Exception e) {
             log("lane: begin failed: " + e);
@@ -5689,13 +6096,18 @@ public class VoiceService extends Service
     }
 
     /** Release the lane: headset teardown only if the comm channel
-     *  was actually taken (the AA-present pin never touches
-     *  mode/comm). */
+     *  was actually taken (the media pins never touch mode/comm).
+     *  v1.76: this is the SESSION release — it runs when the
+     *  session's idle hold expires, when the verdict/device
+     *  changes, on a user stop, or on service destroy — never at
+     *  a segment boundary. */
     private void laneEnd() {
-        if (!lanePlaybackActive) {
-            laneAaActive = false;
+        cancelLaneSessionRelease();
+        if (!lanePlaybackActive && !laneSessionHeld()) {
+            lanePinActive = false;
             return;
         }
+        boolean wasHeadset = laneHeadsetLive;
         if (laneHeadsetLive) {
             try {
                 audioManager.clearCommunicationDevice();
@@ -5705,8 +6117,24 @@ public class VoiceService extends Service
             } catch (Exception ignored) {}
             laneHeadsetLive = false;
         }
+        if (laneSessionHeld()) {
+            long heldMs = laneSessionAcquiredMs > 0
+                    ? android.os.SystemClock.uptimeMillis()
+                            - laneSessionAcquiredMs
+                    : 0;
+            log("lane: session released — "
+                    + laneBeginName(laneSessionKind) + " to "
+                    + laneSessionDeviceName + ", "
+                    + laneSessionItems + " item(s), held "
+                    + heldMs + "ms");
+        }
         lanePlaybackActive = false;
-        laneAaActive = false;
+        lanePinActive = false;
+        laneSessionKind = LANE_BEGIN_LEGACY;
+        laneSessionDeviceName = null;
+        laneSessionAcquiredMs = 0;
+        laneSessionItems = 0;
+        laneSessionHoldLogged = false;
         laneTransitionUntilMs =
                 android.os.SystemClock.uptimeMillis() + 1500;
         laneDevice = null;
@@ -5726,7 +6154,7 @@ public class VoiceService extends Service
                 }
             } catch (Exception ignored) {}
         }
-        log("lane: headset channel released");
+        if (wasHeadset) log("lane: headset channel released");
     }
 
     /**
@@ -5736,7 +6164,15 @@ public class VoiceService extends Service
      * from the start when the earbuds reconnect.
      */
     private void laneAbortPlayback() {
-        if (!lanePlaybackActive) return;
+        if (!lanePlaybackActive && !laneSessionHeld()) return;
+        if (!playing && !ttsSpeaking) {
+            // The session was in its idle hold-over between items —
+            // nothing is playing to return; just end the session.
+            log("lane: session ended — earbuds lost during "
+                    + "hold-over");
+            laneEnd();
+            return;
+        }
         log("lane: earbuds lost mid-play — message returned to "
                 + "queue unplayed");
         if (playing && currentAudioFile != null) {
