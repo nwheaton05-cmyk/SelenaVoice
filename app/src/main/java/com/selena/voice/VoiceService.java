@@ -744,6 +744,10 @@ public class VoiceService extends Service
         // v1.58: segment group (null = standalone), for the 3s gap
         // when this item succeeds a same-group segment.
         final String segmentGroup;
+        // v1.81: true when this entry is a priority play that was
+        // superseded mid-play by a newer start and parked for replay
+        // (see the orphan guard in playFileNow).
+        boolean wasOrphaned;
         WaitingPriority(File audioFile, String text, String serverId) {
             this(audioFile, text, serverId, null);
         }
@@ -757,6 +761,20 @@ public class VoiceService extends Service
     }
     private final java.util.ArrayDeque<WaitingPriority> waitingPriority =
             new java.util.ArrayDeque<>();
+    // v1.81: number of priority plays started in the current priority
+    // chain (playPriorityMp3 increments it on a successful start; the
+    // completion unwinds that end a priority flow reset it to 0 — the
+    // same points that clear priorityMode). playFileNow reads it to
+    // tell a live PRIORITY play from a live queue play when a new
+    // start is about to supersede the current player: a superseded
+    // priority play never completes (its completion listener dies
+    // with the released player), so without this witness its row is
+    // silently lost — the 2026-11-02 field swallow (see playFileNow).
+    private int priorityInterruptDepth = 0;
+    // v1.81: text of the priority play currently in flight, captured
+    // by playPriorityMp3 alongside currentPlayServerId so the orphan
+    // guard in playFileNow can park the row complete (text included).
+    private String currentPriorityPlayText = null;
     // Set while halting TTS for an interrupt so the async onTtsStopped
     // doesn't fire onTtsDone (which would pump the queues mid-interrupt).
     private boolean suppressNextTtsDone = false;
@@ -1419,6 +1437,23 @@ public class VoiceService extends Service
             for (int i = 0; i < count; i++) {
                 maxTs = handleQueueMessage(arr.getJSONObject(i), maxTs);
             }
+            // v1.81: poll-cycle backstop drain — if anything sits in
+            // the waiting-priority FIFO while the service is idle
+            // (e.g. a row parked by the orphan guard in playFileNow
+            // whose chain never produced a completion advance), the
+            // next poll cycle starts it. Guarantees every accepted
+            // row a playback attempt even if a completion trigger
+            // was lost. No-op while busy or when nothing waits;
+            // playNextWaitingPriority re-checks polite/lane gates.
+            handler.post(() -> {
+                if (!playing && !ttsSpeaking
+                        && !waitingPriority.isEmpty()) {
+                    log("priority: poll backstop draining "
+                            + waitingPriority.size()
+                            + " waiting item(s)");
+                    playNextWaitingPriority();
+                }
+            });
             // Nick 2026-10-18 v1.7: ALWAYS advance last_ts PAST the newest
             // message processed (+1). The API returned a message whose
             // timestamp exactly equaled `since`, so a strict greater-than
@@ -1503,6 +1538,32 @@ public class VoiceService extends Service
             // Low-priority (segments of one long message) falls through
             // to the normal polite queueing below.
             String priority = m.optString("priority", "high");
+            // v1.81 (Nick, 2026-11-02): intake disposition — EVERY
+            // accepted row logs its id and intended disposition here,
+            // before any dispatch, so a row that later vanishes can
+            // be traced from the field logs alone (the 2026-11-02
+            // swallow was undiagnosable at intake level: nothing
+            // named the row between the poll and its disappearance).
+            final String disposition;
+            if (!"low".equals(priority)) {
+                disposition = isPhoneVoiceMode() ? "priority-tts"
+                        : (!audioUrl.isEmpty()
+                                && audioUrl.startsWith("http"))
+                                ? "priority-mp3-download"
+                                : "priority-mp3-synth";
+            } else if (isNoAutoReadout()) {
+                disposition = "held-no-auto-readout";
+            } else if (isPhoneVoiceMode()) {
+                disposition = "queue-tts";
+            } else if (!audioUrl.isEmpty()) {
+                disposition = "queue-mp3";
+            } else {
+                disposition = "queue-mp3-synth";
+            }
+            log("intake: row id=" + (sid != null ? sid : "(none)")
+                    + " priority=" + priority
+                    + " group=" + (sgroup != null ? sgroup : "(none)")
+                    + " disposition=" + disposition);
             if (!"low".equals(priority)) {
                 markSpokenLocked(text);
                 if (isPhoneVoiceMode()) {
@@ -1927,6 +1988,43 @@ public class VoiceService extends Service
             } else if (lanePin) {
                 log("audio: stream=MUSIC pinned to earbuds "
                         + "(media pin — no focus, no routing change)");
+            }
+            // v1.81 ORPHAN GUARD (field, 2026-11-02): this start is
+            // about to release the current player below. If that
+            // player is a live PRIORITY play (priorityInterruptDepth
+            // > 0), releasing it kills the play's completion listener
+            // with it: the row never reports played, no completion
+            // pump ever runs for it, and priorityMode stays up with
+            // nothing playing — the row is silently swallowed. (That
+            // is exactly how row msg-1793641641223-uo9po8 died on
+            // v1.79: a segment start superseded it 3 s in — there
+            // the start was wrongful because the `playing` flag was
+            // down on the priority path, fixed in v1.80 — but a
+            // replay tap or any other direct start can still
+            // supersede a live priority play, so the guard stands on
+            // its own.) Park the superseded row at the HEAD of the
+            // waiting-priority FIFO before the state moves: the
+            // superseding play's completion advance drains it like
+            // any queued priority item and it plays out in full.
+            // A queue play being superseded is NOT parked here —
+            // priorityInterruptDepth is 0 outside priority chains,
+            // and interrupted queue output belongs to the interrupt
+            // stack, not this guard.
+            if (player != null && priorityInterruptDepth > 0
+                    && currentPlayServerId != null
+                    && !"priority".equals(currentPlayServerId)
+                    && currentAudioFile != null
+                    && !f.getAbsolutePath().equals(
+                            currentAudioFile.getAbsolutePath())) {
+                WaitingPriority orphan = new WaitingPriority(
+                        currentAudioFile, currentPriorityPlayText,
+                        currentPlayServerId, currentPlaySegmentGroup);
+                orphan.wasOrphaned = true;
+                waitingPriority.addFirst(orphan);
+                log("priority: in-flight priority play superseded "
+                        + "by a new start — row parked for replay id="
+                        + currentPlayServerId + " ("
+                        + waitingPriority.size() + " waiting)");
             }
             releasePlayer();
             player = new MediaPlayer();
@@ -2425,7 +2523,16 @@ public class VoiceService extends Service
                 // finished yields to waiting priority items first. Priority items
                 // queue behind each other and never interrupt each other;
                 // interrupted output only resumes once no priority items remain.
-                if (priorityMode && !waitingPriority.isEmpty()) {
+                // v1.81: the drain is NOT gated on priorityMode anymore.
+                // A row parked by the orphan guard (see playFileNow) can
+                // be waiting while the flag is already down — the
+                // superseding play may be an ordinary queue item whose
+                // completion clears priorityMode in the unwind below —
+                // and a flag-gated drain would leave the parked row
+                // stranded with no future trigger. playNextWaitingPriority
+                // re-checks the polite/lane gates itself, so draining
+                // whenever anything waits is safe.
+                if (!waitingPriority.isEmpty()) {
                     playNextWaitingPriority();
                     return;
                 }
@@ -2437,11 +2544,13 @@ public class VoiceService extends Service
                     log("priority: MP3 completion, unwinding interrupt stack ("
                             + interruptStack.size() + " left)");
                     priorityMode = false;
+                    priorityInterruptDepth = 0;
                     resumeNextInterrupted();
                     return;
                 }
                 if (priorityMode) {
                     priorityMode = false;
+                    priorityInterruptDepth = 0;
                     log("priority: flow done, resuming normal queues");
                 }
                 pumpAudioQueue();
@@ -2512,7 +2621,11 @@ public class VoiceService extends Service
      *  queued" and "next item is a standalone message" — either way no
      *  gap applies, which is all the caller needs. */
     private String nextGroupAudioFirst() {
-        if (priorityMode && !waitingPriority.isEmpty()) {
+        if (!waitingPriority.isEmpty()) {
+            // v1.81: not gated on priorityMode — the advance drains
+            // the waiting FIFO unconditionally now (see
+            // onPlaybackDoneNow), so the gap decision peeks it the
+            // same way.
             return waitingPriority.peek().segmentGroup;
         }
         if (!interruptStack.isEmpty()) {
@@ -2532,7 +2645,11 @@ public class VoiceService extends Service
 
     /** Same peek in onTtsDone's branch order (TTS before audio). */
     private String nextGroupTtsFirst() {
-        if (priorityMode && !waitingPriority.isEmpty()) {
+        if (!waitingPriority.isEmpty()) {
+            // v1.81: not gated on priorityMode — the advance drains
+            // the waiting FIFO unconditionally now (see
+            // onPlaybackDoneNow), so the gap decision peeks it the
+            // same way.
             return waitingPriority.peek().segmentGroup;
         }
         if (!interruptStack.isEmpty()) {
@@ -2986,7 +3103,10 @@ public class VoiceService extends Service
                 // Nick 2026-10-23 v1.42: priority FIFO — a priority item that just
                 // finished yields to waiting priority items first (same rule as
                 // onPlaybackDoneNow).
-                if (priorityMode && !waitingPriority.isEmpty()) {
+                // v1.81: drain not gated on priorityMode (see
+                // onPlaybackDoneNow) — an orphan-parked row must drain
+                // here too.
+                if (!waitingPriority.isEmpty()) {
                     playNextWaitingPriority();
                     return;
                 }
@@ -2996,11 +3116,13 @@ public class VoiceService extends Service
                     log("priority: TTS completion, unwinding interrupt stack ("
                             + interruptStack.size() + " left)");
                     priorityMode = false;
+                    priorityInterruptDepth = 0;
                     resumeNextInterrupted();
                     return;
                 }
                 if (priorityMode) {
                     priorityMode = false;
+                    priorityInterruptDepth = 0;
                     log("priority: flow done, resuming normal queues");
                 }
                 pumpTtsQueue();
@@ -3180,6 +3302,8 @@ public class VoiceService extends Service
         cancelPendingResume();
         // Nick 2026-10-23 v1.40: stop cancels any priority flow too.
         priorityMode = false;
+        priorityInterruptDepth = 0;
+        currentPriorityPlayText = null;
         // Nick 2026-10-23 v1.42: stop also drops queued priority items.
         waitingPriority.clear();
         suppressNextTtsDone = false;
@@ -3310,6 +3434,10 @@ public class VoiceService extends Service
         // almost-done — their next segment rode the completion
         // backstop instead (field, 2026-11-02).
         playing = true;
+        // v1.81: the row's text rides along so the orphan guard in
+        // playFileNow can park this play complete if a newer start
+        // supersedes it mid-play.
+        currentPriorityPlayText = text;
         if (!playFileNow(f)) {
             // v1.75: parked at the lane gate — back to the head of
             // the waiting queue; the priority chain releases it when
@@ -3317,12 +3445,18 @@ public class VoiceService extends Service
             playing = false;
             currentPlayServerId = null;
             currentPlaySegmentGroup = null;
+            currentPriorityPlayText = null;
             priorityMode = false;
             waitingPriority.addFirst(new WaitingPriority(f, text,
                     serverId, segmentGroup));
             log("lane: priority play parked — returned to the "
                     + "waiting queue (" + waitingPriority.size()
                     + " waiting)");
+        } else {
+            // v1.81: this play is now live — count it so playFileNow
+            // can recognize a live priority play if a newer start
+            // supersedes it (see the orphan guard there).
+            priorityInterruptDepth++;
         }
     }
 
@@ -3462,6 +3596,13 @@ public class VoiceService extends Service
         log("priority: playing queued priority item ("
                 + waitingPriority.size() + " still waiting)"
                 + (wp.serverId != null ? " id=" + wp.serverId : ""));
+        if (wp.wasOrphaned) {
+            // v1.81: this row was superseded mid-play once already
+            // (see the orphan guard in playFileNow) — name it, so
+            // the field log proves the replay happened.
+            log("priority: replaying superseded priority row id="
+                    + wp.serverId);
+        }
         if (wp.audioFile != null) {
             playPriorityMp3(wp.audioFile, wp.text, wp.serverId,
                     wp.segmentGroup);
