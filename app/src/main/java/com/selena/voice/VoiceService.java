@@ -622,13 +622,15 @@ public class VoiceService extends Service
     // ONE message share segment_group (null = standalone message).
     // currentPlaySegmentGroup rides alongside currentPlayServerId
     // through every tracking path below, so the completion handlers
-    // can hold the ruled 3s gap before a same-group successor starts
-    // (see advanceAfterSegmentGap).
+    // can hold the ruled segment gap before a same-group successor
+    // starts (see advanceAfterSegmentGap).
     private String currentPlaySegmentGroup = null;
-    // Nick 2026-10-29: 3-second spacing between segments of one
-    // message — long enough to hear the seam, short enough to keep
-    // the thought. NOT the dictation SENTENCE_GAP_MS further down.
-    private static final long SEGMENT_GAP_MS = 3000;
+    // Nick 2026-11-02 v1.80: the gap between segments of one
+    // message must land between 1.5 s and 3 s end-to-start, as
+    // close to real-time as possible — a 2000 ms hold plus normal
+    // start latency sits mid-band. (Was 3000, Nick 2026-10-29.)
+    // NOT the dictation SENTENCE_GAP_MS further down.
+    private static final long SEGMENT_GAP_MS = 2000;
     // A same-group advance waiting out its gap. Preemptible: pause /
     // stop / skip / priority cancel it (cancelPendingSegmentAdvance),
     // and a stale generation or already-started playback drops it.
@@ -2279,6 +2281,19 @@ public class VoiceService extends Service
         almostDoneWatchTask = () -> almostDoneWatchTick();
         handler.postDelayed(almostDoneWatchTask,
                 ALMOST_DONE_TICK_MS / 2);
+        // v1.80: prove the arming in the field log, with the row
+        // and the path that started it (the priority path silently
+        // never fired in v1.79 — see playPriorityMp3). Id-less
+        // plays and the "priority" marker are not server rows and
+        // are never reported, so they get no line.
+        String armRowId = currentPlayServerId;
+        if (armRowId != null && !armRowId.isEmpty()
+                && !"priority".equals(armRowId)) {
+            log("progress: almost-done watch armed for row "
+                    + armRowId
+                    + (priorityMode ? " (priority path)"
+                            : " (queue path)"));
+        }
     }
 
     private void cancelAlmostDoneWatch() {
@@ -3103,6 +3118,11 @@ public class VoiceService extends Service
                 player.start();
                 playbackPaused = false;
                 didResume = true;
+                // v1.80: a plain pause never cleared the playing
+                // flag, but a priority interrupt of the paused item
+                // did (interruptCurrentPlayback) — restore it so
+                // the re-armed watch below can actually tick.
+                playing = true;
                 // v1.79: re-arm the almost-done watch on resume
                 // (insurance — the tick normally idles through pause).
                 armAlmostDoneWatch();
@@ -3282,10 +3302,19 @@ public class VoiceService extends Service
         currentPlayServerId = serverId;
         // v1.58: same for the segment group.
         currentPlaySegmentGroup = segmentGroup;
+        // v1.80: raise the playing flag exactly as the queue pump
+        // (playNext) does before playFileNow. interruptCurrentPlayback
+        // cleared it and playFileNow never sets it, so on this path
+        // the v1.79 almost-done watch died at its first tick
+        // (!playing) and high-priority rows never reported
+        // almost-done — their next segment rode the completion
+        // backstop instead (field, 2026-11-02).
+        playing = true;
         if (!playFileNow(f)) {
             // v1.75: parked at the lane gate — back to the head of
             // the waiting queue; the priority chain releases it when
             // the lane can actually play.
+            playing = false;
             currentPlayServerId = null;
             currentPlaySegmentGroup = null;
             priorityMode = false;
@@ -3511,10 +3540,17 @@ public class VoiceService extends Service
         }
         log("priority: resuming MP3 at " + st.audioPositionMs + "ms");
         // Same setup as playFileNow, then seek before start.
+        // v1.80: same playing-flag fix as playPriorityMp3 — the
+        // completion of the priority item cleared the flag
+        // (onPlaybackDoneNow), so a watch armed here would die at
+        // its first tick and the resumed row would never report
+        // almost-done.
+        playing = true;
         if (!playFileNow(f)) {
             // v1.75: parked at the lane gate — the item goes back
             // on the interrupt stack, unresumed, until the lane can
             // play again.
+            playing = false;
             interruptStack.push(st);
             log("lane: resumed play parked — item returned to the "
                     + "interrupt stack");
