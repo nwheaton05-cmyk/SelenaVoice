@@ -3,12 +3,7 @@
     package="com.selena.voice">
 
     <uses-permission android:name="android.permission.INTERNET" />
-    <uses-permission android:name="android.permission.RECORD_AUDIO" />
-    <!-- v1.72: call-state watch for the phone-call mic mute — state
-         only (ringing/offhook/idle), never numbers or call content. -->
-    <uses-permission android:name="android.permission.READ_PHONE_STATE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <!-- Nick 2026-10-19 v1.16: background operation — the service holds a
@@ -38,13 +33,15 @@
             </intent-filter>
         </activity>
 
-        <!-- Nick 2026-10-19 v1.16: mediaPlayback type added — the service
-             plays Selena's replies with the screen locked (Android 14
-             requires the declared type to match the work). -->
+        <!-- The service plays Selena's replies with the screen locked
+             (Android 14 requires the declared type to match the work).
+             v1.82: mediaPlayback ONLY — the microphone type is gone
+             with the microphone itself; the app holds no RECORD_AUDIO
+             permission and cannot capture audio. -->
         <service
             android:name=".VoiceService"
             android:exported="false"
-            android:foregroundServiceType="microphone|mediaPlayback" />
+            android:foregroundServiceType="mediaPlayback" />
 
         <!-- Nick 2026-10-28 v1.51: earbud/headset media-button taps.
              Before v1.51 the app registered NOTHING for media buttons,

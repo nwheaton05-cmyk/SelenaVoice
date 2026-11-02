@@ -23,7 +23,7 @@
         android:id="@+id/statusText"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:text="🎙️ Listening for Selena…"
+        android:text="🔊 Selena Voice"
         android:textSize="20sp"
         android:textStyle="bold"
         android:textColor="@color/selena_dark"
@@ -65,46 +65,6 @@
         android:textSize="14sp"
         android:visibility="gone"
         android:backgroundTint="#2E7D32" />
-
-    <!-- Always-listening toggle + pulse dot -->
-    <LinearLayout
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:orientation="horizontal"
-        android:gravity="center"
-        android:paddingBottom="8dp">
-
-        <View
-            android:id="@+id/pulseDot"
-            android:layout_width="16dp"
-            android:layout_height="16dp"
-            android:layout_marginEnd="8dp"
-            android:background="@drawable/pulse_dot" />
-
-        <TextView
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:text="Always listening"
-            android:textSize="16sp"
-            android:textColor="@color/selena_dark"
-            android:paddingEnd="8dp" />
-
-        <Switch
-            android:id="@+id/alwaysOnSwitch"
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:checked="true" />
-    </LinearLayout>
-
-    <!-- Mic button (manual fallback) -->
-    <Button
-        android:id="@+id/micButton"
-        android:layout_width="120dp"
-        android:layout_height="120dp"
-        android:layout_gravity="center"
-        android:text="🎤"
-        android:textSize="40sp"
-        android:backgroundTint="@color/selena_purple" />
 
     <!-- Playback controls, TWO ROWS (Nick 2026-10-23 v1.36: his pick).
          Four buttons in one row overflowed his screen and squeezed
@@ -183,35 +143,7 @@
             android:text="🔑 Delete key"
             android:textSize="16sp"
             android:visibility="visible" />
-
-        <Button
-            android:id="@+id/voiceprintButton"
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:layout_marginStart="12dp"
-            android:text="🎙️ Voiceprint"
-            android:textSize="16sp"
-            android:visibility="visible" />
-
-        <Button
-            android:id="@+id/machinesButton"
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:layout_marginStart="12dp"
-            android:text="🚜 Machines"
-            android:textSize="16sp"
-            android:visibility="visible" />
     </LinearLayout>
-
-    <TextView
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:text="Tap mic for a one-shot listen (fallback)"
-        android:textSize="14sp"
-        android:textColor="#888888"
-        android:gravity="center"
-        android:paddingTop="8dp"
-        android:paddingBottom="8dp" />
 
     <!-- Voice mode: Phone (fast, on-device TTS) vs Aria (quality, server MP3) -->
     <LinearLayout
@@ -358,43 +290,6 @@
             android:layout_height="wrap_content"
             android:checked="true" />
     </LinearLayout>
-
-    <!-- Text box (Nick 2026-10-29 v1.65, offline workflow): the
-         stacking/holding field. Dictations that can't be delivered
-         (offline) stack here in spoken order; typed text lives here
-         too; the Send button is the ONLY way held text leaves —
-         manual send, never auto-delivered. -->
-    <TextView
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:text="Text box"
-        android:textSize="16sp"
-        android:textStyle="bold"
-        android:textColor="@color/selena_dark"
-        android:paddingTop="8dp"
-        android:paddingBottom="4dp" />
-
-    <EditText
-        android:id="@+id/heldTextBox"
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:minLines="2"
-        android:gravity="top|start"
-        android:hint="Type here — or dictations stack here while you're offline"
-        android:textSize="15sp"
-        android:background="#FFFFFF"
-        android:padding="10dp"
-        android:inputType="textMultiLine|textCapSentences" />
-
-    <Button
-        android:id="@+id/heldSendButton"
-        android:layout_width="wrap_content"
-        android:layout_height="wrap_content"
-        android:layout_gravity="end"
-        android:text="Send"
-        android:textSize="15sp"
-        android:layout_marginTop="4dp"
-        android:layout_marginBottom="10dp" />
 
     <!-- Message log -->
     <TextView

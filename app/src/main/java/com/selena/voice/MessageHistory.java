@@ -116,6 +116,31 @@ public class MessageHistory {
         }
     }
 
+    /** Nick 2026-11-02 v1.82: delete-after-full-play. Remove the entry
+     * for a message whose playback completed in full — matched by
+     * server row ID, or by audio path (history replays complete with
+     * no live row ID, so the played file's path is their identity) —
+     * and delete its cached audio file with it. LOCKED entries are
+     * exempt: a lock is Nick's explicit keep and outranks the default
+     * delete. Returns the removed entry's server ID (or its local ID
+     * when it has no server row), or null when nothing was removed. */
+    public static synchronized String deleteIfFullyPlayed(String serverId,
+            String audioPath) {
+        for (int i = 0; i < entries.size(); i++) {
+            Entry e = entries.get(i);
+            boolean match = (serverId != null && !serverId.isEmpty()
+                    && serverId.equals(e.serverId))
+                    || (audioPath != null && audioPath.equals(e.audioPath));
+            if (!match) continue;
+            if (e.locked) return null;
+            deleteAudioFile(e);
+            entries.remove(i);
+            save();
+            return e.serverId != null ? e.serverId : e.id;
+        }
+        return null;
+    }
+
     /** Nick 2026-10-22 v1.34: server IDs of locked entries, for the
      * delete-unlocked keep_ids list. Entries without a serverId (local-only
      * or from before v1.34) are skipped — they have no server row to keep. */

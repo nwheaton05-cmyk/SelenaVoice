@@ -1,6 +1,5 @@
 package com.selena.voice;
 
-import android.Manifest;
 import android.app.Notification;
 import android.app.NotificationChannel;
 import android.app.NotificationManager;
@@ -13,16 +12,12 @@ import android.bluetooth.BluetoothProfile;
 import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
-import android.content.pm.PackageManager;
 import android.content.pm.ServiceInfo;
 import android.media.AudioAttributes;
 import android.media.AudioDeviceInfo;
-import android.media.AudioFormat;
-import android.media.AudioRecord;
 import android.media.AudioFocusRequest;
 import android.media.AudioManager;
 import android.media.MediaPlayer;
-import android.media.MediaRecorder;
 import android.media.audiofx.LoudnessEnhancer;
 import android.media.session.MediaSession;
 import android.media.session.PlaybackState;
@@ -32,8 +27,6 @@ import android.os.Handler;
 import android.os.IBinder;
 import android.os.Looper;
 import android.os.PowerManager;
-import android.speech.RecognizerIntent;
-import android.speech.SpeechRecognizer;
 import android.speech.tts.TextToSpeech;
 import android.util.Base64;
 import android.util.Log;
@@ -74,10 +67,12 @@ import java.util.Queue;
  *     Aria mode: synthesize text in-app via Google Cloud TTS (Achernar,
  *     v1.43+) and play the result. Server MP3s still play when a row
  *     arrives carrying one whose text was never spoken (transition).
- *  2. INBOUND (Nick -> Selena): continuous SpeechRecognizer ("always
- *     listening"). On speech, transcribes and POSTs to
- *     /api/selena-voice/input. Auto-restarts on NO_MATCH / SPEECH_TIMEOUT
- *     with a 5s backoff. Beep suppressed via stream mute; visual only.
+ *  2. v1.82 (Nick, 2026-11-02): PLAYBACK-ONLY. The microphone is
+ *     GONE — no RECORD_AUDIO permission, no recognizer, no dictation,
+ *     no wake word, no voiceprint/guest capture, no polite hold.
+ *     Nick replies in the Muse app; this app only speaks. Nothing
+ *     in here may ever consult a listening state again: playback
+ *     pumps run purely on queue/lane state.
  *
  * NOTE: All helpers are top-level classes (no inner/anonymous classes
  * extending Android listener types) because d8 8.2.2 crashes on inner-class
@@ -91,9 +86,6 @@ public class VoiceService extends Service
     private static final int NOTIF_ID = 1;
 
     public static final String ACTION_MESSAGE = "com.selena.voice.MESSAGE";
-    public static final String ACTION_SPEECH_DETECTED = "com.selena.voice.SPEECH_DETECTED";
-    public static final String ACTION_INPUT_SENT = "com.selena.voice.INPUT_SENT";
-    public static final String ACTION_LISTENING_STATE = "com.selena.voice.LISTENING_STATE";
     public static final String ACTION_POLL_STATUS = "com.selena.voice.POLL_STATUS";
     // Nick 2026-10-21: playback pause/resume state for the pause button.
     public static final String ACTION_PLAYBACK_STATE = "com.selena.voice.PLAYBACK_STATE";
@@ -106,29 +98,12 @@ public class VoiceService extends Service
     // Nick 2026-10-22 v1.35: hard-stop all playback from the UI.
     public static final String ACTION_STOP_ALL = "com.selena.voice.STOP_ALL";
     public static final String ACTION_REQUEST_STATUS = "com.selena.voice.REQUEST_STATUS";
-    // Nick 2026-10-23 v1.41: service -> activity request to surface the
-    // RECORD_AUDIO permission prompt (system dialog or Settings).
-    public static final String ACTION_REQUEST_MIC_PERMISSION = "com.selena.voice.REQUEST_MIC_PERMISSION";
     public static final String EXTRA_FILE_PATH = "file_path";
     public static final String EXTRA_POLL_STATUS = "poll_status";
     public static final String EXTRA_TEXT = "text";
-    public static final String EXTRA_STATE = "listening";
-    // Nick 2026-10-28 v1.52: noise-gate state riding the listening-state
-    // broadcast ("ambient" / "killed" / "noise_hold") so the UI can show
-    // the subtle "Paused — loud noise" state (spec §4.5).
-    public static final String EXTRA_GATE_STATE = "gate_state";
-    // Nick 2026-10-23 v1.46: live dictation — the recognizer's partial
-    // (in-progress) transcription, broadcast for the dictation popup.
-    public static final String ACTION_PARTIAL_INPUT = "com.selena.voice.PARTIAL_INPUT";
 
     static final String PREFS = "selena_voice";
-    /** v1.65: the text box's persisted content (offline workflow) —
-     *  shared between the service (stacking) and MainActivity (the
-     *  field itself). One string; dictations stack newline-joined,
-     *  in spoken order. */
-    static final String PREF_HELD_TEXT = "held_text_box";
     private static final String KEY_LAST_TS = "last_ts";
-    private static final String KEY_ALWAYS_ON = "always_listening";
     // Nick 2026-10-18 v1.11: voice mode lives in SharedPreferences so the
     // activity toggle and the service read the same value.
     public static final String KEY_VOICE_MODE = "voice_mode";
@@ -175,31 +150,6 @@ public class VoiceService extends Service
     private static final String SUPABASE_ANON_KEY = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJzdXBhYmFzZSIsImlhdCI6MTc5Mjg1Njk0MCwiZXhwIjo0OTQ4NTMwNTQwLCJyb2xlIjoiYW5vbiJ9.tHuj64aAawXs_4dl-TVdgfxOUcmyKloh204BfEc60mk";
     private static final long POLL_MS = 3000;
     private static final long HEARTBEAT_MS = 30000;
-    // Nick 2026-10-18 v1.3: was 500ms — the Samsung A17 plays a system
-    // beep on every recognizer start, so 500ms restarts = constant beeping.
-    // 5s backoff = far fewer beeps. NO_MATCH/TIMEOUT use quiet restart.
-    private static final long RESTART_DELAY_MS = 5000;
-
-    // Nick 2026-10-18 v1.2: ADJUST_MUTE did NOT stop the beep on the
-    // Samsung A17 — the recognizer beep apparently plays on a stream that
-    // ignores the mute flag. New approach: save each stream's volume and
-    // set it to 0 (not mute), then restore. STREAM_VOICE_CALL added too.
-    // Nick 2026-10-29 v1.63: STREAM_MUSIC is OUT of this set, permanently.
-    // His standing rule (14:32 EDT field report): playback must NEVER
-    // change the system media volume, in either direction — the media
-    // stream is simply never written by this app again. The remaining
-    // streams carry no media and none of her voice; they are zeroed
-    // only around recognizer restarts to kill the Samsung beep (his
-    // v1.2–v1.48 demand) and restored immediately after.
-    private static final int[] BEEP_STREAMS = {
-            AudioManager.STREAM_SYSTEM,
-            AudioManager.STREAM_NOTIFICATION,
-            AudioManager.STREAM_ALARM,
-            AudioManager.STREAM_VOICE_CALL,
-    };
-    private final int[] savedVolumes = new int[BEEP_STREAMS.length];
-    private boolean beepMuted = false;
-
     // Nick 2026-10-29 v1.63: the v1.17 STREAM_MUSIC boost state
     // (savedMusicVolume) is GONE — the boost was disabled in v1.48 and
     // its restore machinery is now removed entirely. Nothing in this
@@ -207,29 +157,18 @@ public class VoiceService extends Service
     // own output at the level Nick set, and music ducking is the
     // MAY_DUCK audio-focus layer only (the music app lowers ITSELF).
 
-    // Nick 2026-10-18 v1.2: echo prevention. True while Selena's audio
-    // response is playing — recognition results arriving during playback
-    // are the speaker, not Nick, and get discarded.
+    // True while Selena's audio is playing (playback state shared
+    // with the TTS listener; v1.82: no recognizer remains for this
+    // to guard — it is plain playback state now).
     private static volatile boolean isPlayingAudio = false;
 
     public boolean isPlayingAudio() {
         return isPlayingAudio;
     }
 
-    /** Called while Selena's voice messages play (echo guard). */
+    /** Called while Selena's voice messages play. */
     public static void setPlayingAudio(boolean playing) {
         isPlayingAudio = playing;
-    }
-
-    // Nick 2026-10-18 v1.8: manual mic toggle state. The mic button starts a
-    // one-shot listening session when always-listening is off; a second press
-    // stops it. Tracked here (not just in the activity) so it survives
-    // activity recreation.
-    private static volatile boolean manualListening = false;
-
-    /** True while a manual (mic-button) listening session is active. */
-    public static boolean isManualListening() {
-        return manualListening;
     }
 
     // Nick 2026-10-18 v1.6: remote-visible log buffer. The service is
@@ -254,27 +193,7 @@ public class VoiceService extends Service
     }
 
     private final Handler handler = new Handler(Looper.getMainLooper());
-    private SpeechRecognizer recognizer;
-    private boolean recognizerActive = false;
     private boolean destroyed = false;
-    // Nick 2026-10-23 v1.47: mic mute during Selena playback — true
-    // between muteMicForPlayback() (playback starting) and
-    // unmuteMicAfterPlayback() (playback fully done). While true the
-    // recognizer is stopped entirely so her voice can't be transcribed
-    // as Nick's input. Inverse of the v1.46 polite-interruption hold
-    // (which holds PLAYBACK while Nick speaks).
-    private boolean micMutedForPlayback = false;
-    // Nick 2026-10-29 v1.72: PHONE-CALL MIC MUTE — true while a
-    // call is ringing or in progress. Capture is parked at the
-    // capture layer (the same parks the playback mute uses:
-    // recognizer guards, the spotter's and drone session's park
-    // predicates, gate-probe deferral), so nothing said on the
-    // call is dictated, captured, held, or learned (voiceprint
-    // included). Restored exactly on CALL_STATE_IDLE.
-    private boolean phoneCallMuted = false;
-    private PhoneCallCallback phoneCallCallback = null;
-    private boolean phoneCallWatchRegistered = false;
-    private boolean phoneCallWatchWarned = false;
     private MediaPlayer player;
     // Nick 2026-10-28 v1.51: media session for earbud/headset buttons.
     // Before v1.51 the app had NO MediaSession and NO media-button
@@ -335,23 +254,6 @@ public class VoiceService extends Service
     private boolean playing = false;
     private AudioManager audioManager;
     private AudioFocusRequest focusRequest;
-    // Nick 2026-10-29 v1.59 (ducking rule): a SECOND, independent focus
-    // request held only while a dictation is actively being captured,
-    // so other audio (Spotify/Pandora) fades DOWN while Nick talks and
-    // fades back when he stops — it never hard-pauses. Independent of
-    // the playback request above: either can be held without the
-    // other, and the music only un-ducks once BOTH are gone. Release
-    // is driven by the dictation lifecycle (sentence flush,
-    // recognizer-done, held-sentence send) plus a staleness watchdog —
-    // a stuck hold that leaves music ducked forever is the failure
-    // this design refuses.
-    private AudioFocusRequest dictationFocusRequest;
-    private volatile boolean dictationDuckHeld = false;
-    private volatile long lastDictationActivityMs = 0;
-    private Runnable dictationDuckWatchdog = null;
-    private static final long DICTATION_DUCK_GRACE_MS = 3000;
-    private static final long DICTATION_DUCK_STALE_MS = 20000;
-    private static final long DICTATION_DUCK_WATCHDOG_MS = 5000;
     // Nick 2026-10-29 v1.63: the v1.61 DEEP DUCK fields lived here
     // (DEEP_DUCK_FRACTION, holder flags, saved/target volume, ramp
     // generation, watchdog). ALL REMOVED under Nick's standing rule
@@ -361,246 +263,14 @@ public class VoiceService extends Service
     // symptom. Ducking is the MAY_DUCK focus layer above, and only
     // that: the music app lowers its own playback; the knob never
     // moves, and her voice always plays at the level he set.
-    // Nick 2026-10-29 v1.60 (true wake word spike): sherpa-onnx
-    // keyword spotter (WakeWordSpotter) + the app-side conversation
-    // window it opens. While the spotter is healthy and no
-    // conversation is open, the spotter is the SOLE mic consumer and
-    // the SpeechRecognizer rests; a spot (or the transcript fallback)
-    // opens the window for WAKE_CONVO_WINDOW_MS — the same 2 minutes
-    // as the web rule — during which dictations post exactly as they
-    // did pre-v1.60. Outside the window, dictations without the wake
-    // word are held (never posted). If the spotter fails to init,
-    // wakeSpotterFailed fails the whole mode OPEN: recognizer always
-    // on, everything posts, exactly v1.59 behavior.
-    private WakeWordSpotter wakeSpotter = null;
-    private volatile boolean wakeSpotterReady = false;
-    private volatile boolean wakeSpotterFailed = false;
-    // v1.68 zero-gap wake handoff (Nick 2026-10-29 15:19): the
-    // own-ASR session that takes the first dictation at a spot,
-    // fed by the spotter's ring seed + forwarded live chunks.
-    private WakeStreamSession wakeStream = null;
-    private volatile long wakeStreamTryAtMs = 0;
-    private volatile boolean wakeConvoOpen = false;
-    private volatile long wakeConvoUntilMs = 0;
-    private Runnable wakeExpiryTask = null;
-    private static final long WAKE_CONVO_WINDOW_MS = 120000;
-    // Drone mirror for spot suppression, on the spotter's PCM scale
-    // (dBFS — NOT the recognizer's RMS scale the gate constants use):
-    // a mower at earbud distance is very loud and very flat.
-    private static final float WAKE_DRONE_MEAN_DBFS = -25.0f;
-    private static final float WAKE_DRONE_STD_DB = 2.0f;
     private NotificationManager notificationManager;
-    private ServiceRecognitionListener recognitionListener;
     private PowerManager.WakeLock wakeLock;
 
-    // Nick 2026-10-23 v1.46: polite interruption — true between the
-    // recognizer's onBeginningOfSpeech and onEndOfSpeech. Entirely
-    // on-device: the app holds Selena's playback while this is true and
-    // releases it on his pause. Never stuck: reset in onSpeechEnd and
-    // onRecognizerDone (every utterance ends in one of those, onResults,
-    // or onError).
-    private volatile boolean nickSpeaking = false;
 
-    // ------------------------------------------------------------ v1.52 noise gate
-    // Nick 2026-10-28 (spec §3/§4): a cheap sampler IN FRONT OF the
-    // recognizer. The old app let SpeechRecognizer's own VAD decide
-    // "someone is talking" — a mower is loud, so it opened dictation
-    // sessions on engine noise and held them open. The gate watches
-    // level + variation and kills the recognizer under a loud, steady
-    // drone. Sampling NEVER opens a second mic consumer while the
-    // recognizer is live (Android gives the mic to one client
-    // reliably; two consumers starve/degrade each other, worst on
-    // Samsung's engine):
-    //   - recognizer live  -> samples come from its onRmsChanged
-    //     stream (ServiceRecognitionListener.samplerStats).
-    //   - recognizer held off (KILLED) -> short AudioRecord probes
-    //     (GateProbeTask) are the only mic consumer and watch for the
-    //     two re-arms: drone stops, or speech bursts over the drone.
-    // Failure behavior (§4): any sampler error disables the gate and
-    // the app falls back to plain recognizer behavior — fail open for
-    // the user, closed for noise. A manual mic tap (or an earbud
-    // dictation request) forces a session open, gate bypassed for
-    // that session (§4.1).
-    private static final int GATE_AMBIENT = 0;
-    private static final int GATE_KILLED = 1;
-    // Nick 2026-10-29 v1.61: DRONE — the extraction session
-    // (DroneSession) owns the mic and dictation stays alive over a
-    // running machine. Entered instead of KILLED whenever the
-    // extraction pipeline is ready (Nick's order: extraction active
-    // + session alive over kill); any failure inside it falls back
-    // to KILLED, i.e. exact v1.60 behavior.
-    private static final int GATE_DRONE = 2;
-    private volatile int gateState = GATE_AMBIENT;
-    private boolean gateDisabled = false;
-    private boolean gateBypassSession = false;
-    private long gateDroneSinceMs = 0;
-    private long gateGraceUntilMs = 0;
-    private long gateDroneAbsentSinceMs = 0;
-    // Probe-side (dBFS) drone baseline, learned from the first probes
-    // after a kill, then drift-tracked only by near-baseline samples
-    // so a level drop can't drag the baseline down and hide itself.
-    private float gateDroneBaselineDbfs = Float.NaN;
-    private int gateProbeCount = 0;
-    private int gateProbeDropCount = 0;
-    private boolean gateProbeInFlight = false;
-    private Runnable gateTickTask = null;
-    private Runnable gateProbeScheduleTask = null;
-    // Pause-and-remember (§3): a held dictation lives in sentenceBuffer
-    // with these flags; the 60s noise clock (NOT the 4s sentence gap)
-    // sends it flagged possiblyCutOff if no further dictation comes.
-    private boolean noiseHoldActive = false;
-    private boolean bufferCutOffFlag = false;
-    private Runnable noiseHoldSendTask = null;
-    private static final long GATE_TICK_MS = 250;
-    // TUNABLE (spec §13.4 — kill timing left open by Nick; ~1s was the
-    // proposal): how long loud-and-steady must persist before KILLED.
-    private static final long GATE_KILL_SUSTAIN_MS = 1000;
-    private static final float GATE_LOUD_DB = -9.0f;       // recognizer-scale mean level
-    private static final float GATE_STEADY_STD_DB = 1.4f;  // recognizer-scale variation ceiling
-    private static final long GATE_PROBE_INTERVAL_MS = 1200;
-    private static final float GATE_PROBE_DROP_DB = 8.0f;      // drone-gone test (below baseline)
-    private static final float GATE_PROBE_BURST_STD_DB = 2.5f; // speech-shaped variation (dBFS frames)
-    private static final float GATE_PROBE_BURST_PEAK_DB = 5.0f; // burst peak above drone baseline
-    private static final long NOISE_HOLD_SEND_MS = 60000;      // spec §3: 60s noise clock
 
-    // Nick 2026-10-29 v1.70 — ADAPTIVE AMBIENT GATE (his 13:11
-    // calibration ruling, ordered built 16:00: "the ambient noise
-    // threshold [should be] dialed up or down depending on the
-    // variations of ambient noise throughout the day"). The fixed
-    // GATE_LOUD_DB line is retired as the primary test. Instead
-    // the gate continuously learns the environment's AMBIENT
-    // BASELINE (recognizer scale, like the sampler stats it feeds
-    // on) from steady-or-quiet windows during non-speech periods,
-    // and the kill line floats as a MARGIN over that baseline:
-    //     kill line = clamp(baseline + GATE_KILL_MARGIN_DB,
-    //                       GATE_KILL_LINE_MIN_DB, GATE_KILL_LINE_MAX_DB)
-    // Quiet morning → the line sits low and the gate is keen. Road
-    // noise / a loud shop → the baseline (and the line) rise with
-    // the day, so ordinary loud surroundings stop reading as a
-    // kill-worthy drone — while speech, which is unsteady by
-    // nature, still bursts through the steadiness test untouched.
-    // The hard floor/ceiling keep two failure shapes impossible:
-    // a silent room can't make a whisper "too loud" (line floor),
-    // and a loud workplace can't teach the gate that a shout is
-    // ambient (line ceiling + baseline ceiling). The baseline
-    // persists across restarts (decaying toward the default when
-    // stale), so a cold start begins at EXACTLY the pre-v1.70 line
-    // (default −27 + margin 18 = −9 = old GATE_LOUD_DB) and
-    // converges on the real room within ~30 s of steady sound.
-    // Principle preserved: fail open for the user, closed for
-    // noise; the manual override still forces a session.
-    private static final float GATE_KILL_MARGIN_DB = 18.0f;
-    private static final float GATE_BASELINE_DEFAULT_DB = -27.0f;
-    private static final float GATE_BASELINE_MIN_DB = -42.0f;
-    private static final float GATE_BASELINE_MAX_DB = -15.0f;
-    private static final float GATE_KILL_LINE_MIN_DB = -21.0f;
-    private static final float GATE_KILL_LINE_MAX_DB = -3.0f;
-    // A window may teach the baseline when it is steady (at or
-    // under this variation) or plainly quieter than the baseline;
-    // speech fails both tests, so his voice never teaches it.
-    private static final float GATE_AMBIENT_LEARN_STD_DB = 2.2f;
-    private static final float GATE_AMBIENT_ALPHA = 0.02f;     // per eligible 250 ms tick (~12 s TC)
-    private static final float GATE_AMBIENT_MAX_STEP_DB = 0.1f; // per-tick clamp — the day drifts, it never jumps
-    private static final long GATE_AMBIENT_SPEECH_TAIL_MS = 1500;
-    private static final long GATE_BASELINE_STALE_MS = 6 * 3600_000L;
-    private static final String PREF_GATE_BASELINE = "gate_ambient_baseline_db";
-    private static final String PREF_GATE_BASELINE_MS = "gate_ambient_baseline_ms";
-    private float gateAmbientBaselineDb = GATE_BASELINE_DEFAULT_DB;
-    private long gateAmbientLastSpeechMs = 0;
-    private int gateAmbientSaveTicks = 0;
-    private float gateAmbientLastSaved = Float.NaN;
-    private long gateBaselineLogMs = 0;
 
-    // Nick 2026-10-28 v1.53: learned voiceprint (Phase 4, spec §5).
-    // The store/profiles live in Voiceprint; the service owns the one
-    // live instance and feeds it from the acceptance path only. The
-    // voiceprint's verdict is a booster at gate decision points —
-    // it can open the gate wider, never narrower (§4.3).
-    private Voiceprint voiceprint;
-    private long vpDroneSeenMs = 0;              // last sampler drone sighting
-    private long vpLastNoiseFeedMs = 0;          // noise-teaching throttle
-    private float[] vpPendingBurstFeats = null;  // probe burst awaiting confirmation
-    private long vpBurstConfirmUntilMs = 0;
 
-    // Nick 2026-10-29 v1.61: Drone Dictation (extraction over a
-    // running machine) + the per-machine profile library + the
-    // naming prompts (13:21/13:25/13:27/13:28/13:31 rulings).
-    // droneSession is built on a worker thread once the ASR model
-    // download verifies; droneReady is the arm condition. The
-    // naming capture: after a run of an UNNAMED machine ends, the
-    // app asks "Hey, {user}, what was that noise?" and the next
-    // short dictation inside the capture window becomes the name.
-    // During the run it first says the playful line, verbatim with
-    // its emphasis styling: "What IS that HORRIBLE noise?!"
-    // Both prompts fire only while the profile is unnamed; a named
-    // machine is never prompted again, ever.
-    private MachineProfiles machineProfiles;
-    private DroneSession droneSession;
-    private volatile boolean droneReady = false;
-    private volatile long droneSelfTalkUntilMs = 0;
-    private int pendingNameProfileId = -1;
-    private long namingCaptureUntilMs = 0;
-    private static final long NAMING_CAPTURE_MS = 90000;
-    public static final String DURING_DRONE_LINE = "What IS that HORRIBLE noise?!";
 
-    // Nick 2026-10-29 v1.62: NEW-VOICE FLOW (standalone group mode,
-    // 13:52/13:55 rulings). An accepted dictation whose recognizer
-    // envelope matches NEITHER Nick's voiceprint NOR any enrolled
-    // guest is a new-voice candidate: detection happens in
-    // vpLearnAccepted (before anything learns — a guest must never
-    // train Nick's print), the sentence flush HOLDS the post, she
-    // asks "Who's talking?" / "Who's asking?" / "Who wants to
-    // know?" (form by statement-vs-question, question forms
-    // alternate), the reply enrolls the guest, and only then does
-    // the held dictation post — tagged with the guest's name so the
-    // answer addresses them by name. Unanswered (90 s) → the held
-    // dictation posts untagged; no phantom guest is created.
-    private GuestProfiles guestProfiles;
-    private String bufferGuestName = null;
-    private boolean bufferNewVoiceCandidate = false;
-    private float[] pendingGuestFeats = null;
-    private String pendingGuestSentence = null;
-    // Rider G2 (v1.71): the name of a guest enrolled moments ago
-    // whose held dictation is about to be released — consumed
-    // one-shot by releaseHeldGuestSentence to mark that post (and
-    // its guest_speaking directive) justEnrolled.
-    private String justEnrolledGuestName = null;
-    private long guestNameCaptureUntilMs = 0;
-    private long guestAskCooldownUntilMs = 0;
-    private Runnable guestHoldReleaseTask = null;
-    private static final long GUEST_NAME_CAPTURE_MS = 90000;
-    private static final long GUEST_ASK_COOLDOWN_MS = 600000;
-    /** Clearly-far line for "not Nick": MATCH_DIST is 2.4; a cold
-     *  shifts an envelope, but not this far. Nudge-grade by design. */
-    private static final double NEW_VOICE_MIN_DIST = 3.2;
-
-    // Nick 2026-10-29 v1.64: EARBUD (private-output) mode of the
-    // second-voice system — the Item 2 half of the parity batch; the
-    // design was completed and ruled 14:02–14:13 EDT. When the active
-    // output is Nick's earbuds (isEarbudsConnected — product-name
-    // identity, never Bluetooth-yes/no), a second voice is handled
-    // COMPLETELY differently from group mode: nothing is said in the
-    // moment, the words are never answered and never executed, and
-    // the content reaches Nick only as a private relay + consent
-    // query in his earbuds. Unknown voice: hold the sentence, grab a
-    // ~3 s room sample (TRANSIENT, memory only — played back once
-    // for identification, then discarded; the durable artifact is
-    // the voiceprint enrolled from the dictation's own envelope
-    // measurements), and at the next silent period ask NICK who that
-    // was and play the sample; the name enrolls the guest and only
-    // THEN is the content relayed. Known guest: relay directly.
-    // Never identified: the content is reported as guest_unidentified
-    // and never posted as a dictation.
-    private boolean pendingGuestEarbud = false;
-    private short[] heldGuestSamplePcm = null;
-    private long earbudHoldSinceMs = 0;
-    private Runnable earbudIdentifyTask = null;
-    private Runnable earbudCaptureTask = null;
-    private static final int EARBUD_SAMPLE_SECONDS = 3;
-    private static final int EARBUD_SAMPLE_RATE = 16000;
-    private static final long EARBUD_IDENTIFY_POLL_MS = 5000;
-    private static final long EARBUD_IDENTIFY_QUIET_MS = 6000;
-    private static final long EARBUD_IDENTIFY_CAP_MS = 300000;
 
     // Nick 2026-10-19 v1.16: outbound (moved from MainActivity).
     private RealtimeClient realtimeClient;
@@ -791,7 +461,6 @@ public class VoiceService extends Service
     @Override
     public void onCreate() {
         super.onCreate();
-        registerOfflineWatcher(); // v1.65: reconnect announcements
         // FOREGROUND FIRST (Nick 2026-10-23): Android 12+ kills the service
         // with ForegroundServiceDidNotStartInTimeException if startForeground()
         // doesn't land within seconds of startForegroundService(). Everything
@@ -801,29 +470,20 @@ public class VoiceService extends Service
         // suspenders — this ordering is the platform's stated requirement.)
         notificationManager = getSystemService(NotificationManager.class);
         createChannel();
-        // Nick 2026-10-23 v1.41: start as MEDIA_PLAYBACK only (explicit type).
-        // mediaPlayback needs no runtime permission, so the service can
-        // always start — even with RECORD_AUDIO denied or never granted.
-        // The microphone type is claimed ONLY while a listening session is
-        // live (see upgradeToMicrophone/downgradeToMediaPlayback).
+        // Nick 2026-10-23 v1.41: start as MEDIA_PLAYBACK only (explicit
+        // type). v1.82: this is now the ONLY type, permanently — the
+        // app holds no microphone permission and never claims one.
         startForegroundAs("Selena Voice ready",
                 ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK);
         // Nick 2026-10-23 v1.36: global crash reporter (service process).
         CrashReporter.install(this);
         audioManager = (AudioManager) getSystemService(Context.AUDIO_SERVICE);
-        recognitionListener = new ServiceRecognitionListener(this);
-        // Nick 2026-10-28 v1.53: learned voiceprint store (Phase 4,
-        // spec §5) + an opportunistic archive sync attempt (upload of
-        // week-old measurements / re-seed from the server archive).
-        voiceprint = new Voiceprint(this);
-        new Thread(new VoiceprintSyncTask(
-                this, VoiceprintSyncTask.MODE_SYNC, voiceprint)).start();
         // Nick 2026-10-28 v1.51: register the media session so Bluetooth
         // earbud/headset button presses are delivered to this app.
         initMediaSession();
         // Nick 2026-10-19 v1.16: hold a partial wake lock for the service's
-        // lifetime so the poll loop, Realtime socket, recognizer, and TTS
-        // keep running with the screen locked. (MediaPlayer additionally
+        // lifetime so the poll loop, Realtime socket, and TTS keep
+        // running with the screen locked. (MediaPlayer additionally
         // uses setWakeMode per-playback.)
         acquireWakeLock();
         initOnDeviceTts();
@@ -834,66 +494,18 @@ public class VoiceService extends Service
         startPolling();
         startHeartbeat();
         startRealtime();
-        if (isAlwaysListening()) {
-            startContinuousListening();
-        }
-        // Nick 2026-10-28 v1.52: noise-gate watchdog (250ms tick,
-        // near-free when nothing is being listened to).
-        // v1.70: restore the learned ambient baseline first, so the
-        // adaptive kill line starts from the room's history.
-        loadGateBaseline();
-        startGateWatchdog();
-        registerPhoneCallWatch(); // v1.72: phone-call mic mute
         registerLaneDeviceWatch(); // v1.73: earbuds-only lane watch
         log("lane: earbuds-only state at create: " + laneModeName()
                 + (getEarbudsDeviceName() != null
                         ? " (earbuds '" + getEarbudsDeviceName() + "')"
                         : ""));
-        // Nick 2026-10-29 v1.60: wake word spotter loads async; when
-        // it's ready it takes over the idle mic (see onWakeSpotterReady
-        // for the handover). Until then the recognizer path above is
-        // untouched — and stays untouched if init fails (fail open).
-        initWakeSpotterAsync();
-        // Nick 2026-10-29 v1.61: Drone Dictation prep — machine
-        // profile store up front; the ASR model downloads/verifies
-        // in the background and the extraction session builds when
-        // it's ready. Until droneReady, the gate is exactly v1.60.
-        machineProfiles = new MachineProfiles();
-        guestProfiles = new GuestProfiles();
-        initDroneAsync();
-        log("service created (v1.16 background mode)");
+        log("service created (v1.82 playback-only)");
     }
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
         if (intent != null) {
-            if ("TOGGLE_LISTENING".equals(intent.getAction())) {
-                boolean on = intent.getBooleanExtra("on", true);
-                setAlwaysListening(on);
-                if (on) {
-                    manualListening = false; // switch owns the mic now
-                    // Nick 2026-10-29 v1.60: with a healthy spotter,
-                    // switch-on now means spotter mode (the recognizer
-                    // rests until a wake opens a conversation); without
-                    // one, exactly the pre-v1.60 behavior.
-                    refreshWakeMode();
-                    if (wakeSpotter == null || !wakeSpotter.isRunning()) {
-                        startContinuousListening();
-                    }
-                } else {
-                    manualListening = false;
-                    // v1.60: switching off also closes any wake-opened
-                    // conversation and stands the spotter down.
-                    wakeConvoOpen = false;
-                    if (wakeExpiryTask != null) {
-                        handler.removeCallbacks(wakeExpiryTask);
-                        wakeExpiryTask = null;
-                    }
-                    if (wakeSpotter != null) wakeSpotter.stopCapture();
-                    stopContinuousListening();
-                }
-                broadcastListeningState();
-            } else if ("EARBUD_TAP".equals(intent.getAction())) {
+            if ("EARBUD_TAP".equals(intent.getAction())) {
                 // Nick 2026-10-28 v1.51: forwarded by EarbudButtonReceiver
                 // (manifest MEDIA_BUTTON path). The MediaSession callback
                 // lands in onEarbudAction directly; both paths debounce
@@ -907,46 +519,6 @@ public class VoiceService extends Service
                     onEarbudAction(earbudAction,
                             earbudSource != null ? earbudSource : "broadcast");
                 }
-            } else if ("RESET_VOICEPRINT".equals(intent.getAction())) {
-                // Nick 2026-10-28 v1.53 (§5): per-profile reset. The
-                // service owns the live voiceprint, so the reset lands
-                // here (local profile + records); the sync task drops
-                // the server archive under the user's profile.
-                if (voiceprint != null) voiceprint.resetCurrentUser();
-                new Thread(new VoiceprintSyncTask(
-                        this, VoiceprintSyncTask.MODE_RESET)).start();
-                log("voiceprint: reset by user (local + server archive)");
-            } else if ("MANUAL_LISTEN".equals(intent.getAction())) {
-                // Nick 2026-10-28 v1.52 (§4.1): the mic tap is the
-                // manual override — while the noise gate has the
-                // recognizer killed, a tap forces a session open,
-                // gate bypassed for that session. (recognizerActive
-                // stays true while killed, so check the gate first.)
-                if (gateState == GATE_DRONE) {
-                    // Same override over drone mode: exitDroneMode
-                    // sets the bypass session itself for this reason
-                    // (forceGateOverride only acts from KILLED).
-                    exitDroneMode("manual override");
-                } else if (gateState == GATE_KILLED) {
-                    forceGateOverride();
-                }
-                if (!recognizerActive) {
-                    manualListening = true;
-                    startContinuousListening();
-                }
-            } else if ("RESTORE_VOLUMES".equals(intent.getAction())) {
-                // Kept for compatibility; playback now calls unmuteBeep()
-                // directly since it lives in the service.
-                unmuteBeep();
-            } else if ("MANUAL_STOP".equals(intent.getAction())) {
-                // Safety: a manual stop must never kill the always-on loop.
-                if (isAlwaysListening()) {
-                    log("MANUAL_STOP ignored — always-listening is on");
-                    return START_STICKY;
-                }
-                manualListening = false;
-                if (recognizerActive) stopContinuousListening();
-                else broadcastListeningState();
             } else if ("PAUSE_PLAYBACK".equals(intent.getAction())) {
                 // Nick 2026-10-21: pause button — halts the current audio,
                 // keeps the position so resume picks up where it left off.
@@ -1025,15 +597,6 @@ public class VoiceService extends Service
     @Override
     public void onDestroy() {
         destroyed = true;
-        if (offlineNetCallback != null) {
-            try {
-                android.net.ConnectivityManager cm =
-                        (android.net.ConnectivityManager)
-                                getSystemService(CONNECTIVITY_SERVICE);
-                if (cm != null) cm.unregisterNetworkCallback(offlineNetCallback);
-            } catch (Exception ignored) {}
-            offlineNetCallback = null;
-        }
         stopRealtime();
         stopPolling();
         heartbeating = false;
@@ -1041,30 +604,8 @@ public class VoiceService extends Service
         // v1.63: no volume safety nets remain to run — nothing in
         // this app writes the system media volume anymore (v1.17
         // boost restore and the v1.61 deep-duck release are gone).
-        releaseDictationDuck("service destroyed"); // v1.59 safety net
-        // Nick 2026-10-29 v1.60: stop + release the wake word spotter.
-        if (wakeExpiryTask != null) {
-            handler.removeCallbacks(wakeExpiryTask);
-            wakeExpiryTask = null;
-        }
-        if (wakeSpotter != null) {
-            wakeSpotter.release();
-            wakeSpotter = null;
-        }
-        if (droneSession != null) {
-            droneSession.release();
-            droneSession = null;
-        }
-        if (wakeStream != null) {
-            wakeStream.release();
-            wakeStream = null;
-        }
-        unmuteBeep();
-        unregisterPhoneCallWatch(); // v1.72
         unregisterLaneDeviceWatch(); // v1.73
         laneEnd(); // v1.73: never leave the headset channel pinned
-        recognizerActive = false;
-        destroyRecognizer();
         releasePlayer();
         // Nick 2026-10-28 v1.51: release the media session.
         try {
@@ -1139,16 +680,11 @@ public class VoiceService extends Service
         } catch (Exception ignored) {}
     }
 
-    // ------------------------------------------------------------ foreground service type mgmt
-    // Nick 2026-10-23 v1.41 (mic-permission crash fix): the manifest declares
-    // microphone|mediaPlayback, but the 2-arg startForeground() implies ALL
-    // declared types — on Android 14 (targetSdk 34) a foreground service
-    // started with the microphone type dies without RECORD_AUDIO granted.
-    // So: start (and live) as MEDIA_PLAYBACK, which needs no permission.
-    // The microphone type is claimed only while actually listening, right
-    // before SpeechRecognizer.startListening(), and dropped the moment the
-    // last listening session stops. A missing/denied mic can never again
-    // kill the service at startup.
+    // ------------------------------------------------------------ foreground service type
+    // The service lives as MEDIA_PLAYBACK only (v1.41 shape, made
+    // permanent in v1.82): mediaPlayback needs no runtime permission,
+    // and the app no longer holds — or ever claims — a microphone
+    // foreground-service type.
 
     private void startForegroundAs(String text, int type) {
         Notification n = buildNotification(text);
@@ -1156,80 +692,6 @@ public class VoiceService extends Service
             startForeground(NOTIF_ID, n, type);
         } else {
             startForeground(NOTIF_ID, n);
-        }
-    }
-
-    private void upgradeToMicrophone() {
-        startForegroundAs("🎤 Listening…",
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
-                        | ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK);
-    }
-
-    private void downgradeToMediaPlayback() {
-        startForegroundAs("Selena Voice ready",
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK);
-    }
-
-    private boolean hasMicPermission() {
-        return checkSelfPermission(Manifest.permission.RECORD_AUDIO)
-                == PackageManager.PERMISSION_GRANTED;
-    }
-
-    // Listening was refused for lack of RECORD_AUDIO: tell the user and
-    // ask the activity to surface the permission prompt (system dialog or
-    // Settings). Never start the recognizer, never touch the mic type.
-    private void micDeniedFeedback() {
-        Log.w(TAG, "listening refused: RECORD_AUDIO not granted");
-        try {
-            handler.post(() -> Toast.makeText(getApplicationContext(),
-                    "Mic permission needed — grant it in Settings > Apps > Selena Voice",
-                    Toast.LENGTH_LONG).show());
-        } catch (Exception ignored) {}
-        sendAppBroadcast(new Intent(ACTION_REQUEST_MIC_PERMISSION));
-    }
-
-    // ------------------------------------------------------------ beep suppression
-
-    private void muteBeep() {
-        if (beepMuted) return;
-        try {
-            for (int i = 0; i < BEEP_STREAMS.length; i++) {
-                // v1.63: STREAM_MUSIC is not in BEEP_STREAMS anymore,
-                // so this loop can never touch her playback stream —
-                // the v1.18 mid-playback skip that used to live here
-                // is unnecessary by construction.
-                savedVolumes[i] = audioManager.getStreamVolume(BEEP_STREAMS[i]);
-                audioManager.setStreamVolume(BEEP_STREAMS[i], 0, 0);
-                // Nick 2026-10-23 v1.48: also hard-mute — Samsung's beep
-                // ignores volume-zero on some streams. setStreamMute is
-                // stronger. Nick wants the beep GONE.
-                try { audioManager.setStreamMute(BEEP_STREAMS[i], true); } catch (Exception ignored) {}
-            }
-            beepMuted = true;
-            Log.d(TAG, "beep streams zeroed+muted");
-        } catch (Exception e) {
-            Log.w(TAG, "muteBeep failed", e);
-        }
-    }
-
-    private void unmuteBeep() {
-        if (!beepMuted) return;
-        try {
-            for (int i = 0; i < BEEP_STREAMS.length; i++) {
-                // Nick 2026-10-23 v1.48: undo the hard-mute from muteBeep().
-                try { audioManager.setStreamMute(BEEP_STREAMS[i], false); } catch (Exception ignored) {}
-                // Nick 2026-10-18 v1.10: only restore a stream we actually
-                // zeroed. If Nick changed the volume himself while the
-                // streams were zeroed, his new setting stays — we never
-                // clobber it with a stale saved value.
-                if (audioManager.getStreamVolume(BEEP_STREAMS[i]) == 0) {
-                    audioManager.setStreamVolume(BEEP_STREAMS[i], savedVolumes[i], 0);
-                }
-            }
-            beepMuted = false;
-            Log.d(TAG, "beep streams restored");
-        } catch (Exception e) {
-            Log.w(TAG, "unmuteBeep failed", e);
         }
     }
 
@@ -1657,9 +1119,7 @@ public class VoiceService extends Service
                 } else {
                     // Playback is strictly queue-only: only Selena's
                     // replies (with server-generated audioUrl MP3s) are
-                    // ever enqueued and played. Nick's own voice inputs
-                    // go to /api/selena-voice/input as text and are
-                    // never read aloud.
+                    // ever enqueued and played.
                     markSpokenLocked(text);
                     broadcastMessage(text);
                     try {
@@ -1741,13 +1201,6 @@ public class VoiceService extends Service
     /** Runs on main thread: start the next queued file if idle. */
     private void pumpAudioQueue() {
         if (playing) return;
-        // Nick 2026-10-23 v1.46: polite interruption — hold while Nick
-        // speaks in always-listening mode. Stays queued; released on his
-        // pause via releasePoliteHold().
-        if (politeHoldActive()) {
-            log("polite: holding MP3 playback for Nick's pause");
-            return;
-        }
         // Nick 2026-10-30 v1.73: earbuds-only lane armed but no
         // earbuds — the file stays queued, unplayed and unreported;
         // the device watch pumps again when the earbuds connect.
@@ -1896,18 +1349,6 @@ public class VoiceService extends Service
     // routing — the wrong semantic for media playback.
     @SuppressWarnings("deprecation")
     private boolean playFileNow(File f) {
-        // Nick 2026-10-29 v1.70: playback starting is the holding
-        // note's master cancel — her answer (or any of her clips)
-        // beginning retires a pending note, and a note file that
-        // somehow queued behind this file is dropped, never played
-        // late. The note's OWN file starting just disarms quietly:
-        // it fired, that's the end of its lifecycle.
-        if (HOLDING_NOTE_CACHE.equals(f.getName())) {
-            cancelHoldingNoteTask();
-        } else {
-            purgeQueuedHoldingNote();
-            cancelHoldingNote("playback started");
-        }
         // Nick 2026-10-30 v1.73: backstop — the pumps and priority
         // gates already hold items while the earbuds-only lane is
         // armed without earbuds; a direct caller (e.g. a replay tap)
@@ -1931,14 +1372,10 @@ public class VoiceService extends Service
             // touch setStreamVolume at all. If he's got it muted, it
             // plays muted. His choice.
             //
-            // Undo the mic-beep zeroing first so playback uses
-            // his REAL volume. (The beep set no longer contains
-            // STREAM_MUSIC at all — v1.63.)
             // Nick 2026-10-19 v1.17's boost-to-max once lived here;
             // Nick 2026-10-29 v1.63 removed it entirely: her voice
             // plays at exactly the level he set, and other audio is
             // ducked only by the MAY_DUCK focus request below.
-            unmuteBeep();
             log("audio: using device volume (no override)");
             // Nick 2026-10-30 v1.73: earbuds-only lane — when engaged,
             // she plays ONLY into the named earbuds' headset channel
@@ -2202,9 +1639,6 @@ public class VoiceService extends Service
                         + proven.getProductName()
                         + " proven before start");
             }
-            // Nick 2026-10-23 v1.47: stop the mic BEFORE her voice
-            // comes out, so it can't be transcribed as Nick's input.
-            muteMicForPlayback();
             player.start();
             isPlayingAudio = true;
             playbackPaused = false;
@@ -2308,6 +1742,28 @@ public class VoiceService extends Service
         if (rowId == null || rowId.isEmpty()) return;
         log("progress: reporting row played: " + rowId);
         new Thread(new PlaybackProgressTask(rowId)).start();
+    }
+
+    /**
+     * v1.82 (Nick, 2026-11-02): delete-after-full-play. Called from
+     * the two completion handlers at the exact points where the
+     * played report fires — a message that played through in full
+     * loses its local footprint: the MessageHistory entry and its
+     * cached audio file(s), including the replay cache. Matched by
+     * queue row id; history replays complete with no live row id, so
+     * they match by the played file's path instead. Partial plays,
+     * pauses, and stops never call this. Locked entries are exempt
+     * (MessageHistory enforces it — a lock is Nick's explicit keep).
+     */
+    private void cleanupFullyPlayedMessage(String rowId, String audioPath) {
+        if ((rowId == null || rowId.isEmpty() || "priority".equals(rowId))
+                && audioPath == null) {
+            return;
+        }
+        String removed = MessageHistory.deleteIfFullyPlayed(rowId, audioPath);
+        if (removed != null) {
+            log("cleanup: deleted fully-played message row id=" + removed);
+        }
     }
 
     /**
@@ -2484,12 +1940,22 @@ public class VoiceService extends Service
         // v1.58: capture the finished item's segment group BEFORE the
         // progress report clears the tracker.
         final String finishedGroup = currentPlaySegmentGroup;
+        // v1.82: same for the finished row id + file — the delete-
+        // after-full-play cleanup below keys on them.
+        final String finishedRowId = currentPlayServerId;
+        final File finishedFile = currentAudioFile;
         reportPlaybackProgress(); // v1.55: before any unwinding below
         abandonAudioFocus();
         // v1.63: nothing to restore — no volume was written on the
         // way in (the v1.17 boost restore and the v1.61 deep-duck
         // release that lived here are both deleted).
         releasePlayer();
+        // v1.82 (Nick, 2026-11-02): delete-after-full-play — this row
+        // played through in full, so its local footprint goes now
+        // (history entry + cached/replay audio). Partial plays,
+        // pauses and stops never reach this point.
+        cleanupFullyPlayedMessage(finishedRowId,
+                finishedFile != null ? finishedFile.getAbsolutePath() : null);
         playing = false;
         isPlayingAudio = false;
         // Nick 2026-10-18 v1.7: put the speakerphone back the way we found
@@ -2498,11 +1964,12 @@ public class VoiceService extends Service
         restoreAudioRouting();
         log("playback done (echo guard off)");
         if (currentAudioFile != null) {
-            // Nick 2026-10-22 v1.28: DON'T delete MP3s a message card still
-            // references for replay — deleting after every play is what
-            // broke replay after the first listen (v1.24 cache). Unreferenced
-            // one-shot files are still cleaned up; expired entries' MP3s go
-            // via purgeExpired.
+            // v1.82: the cleanup above already removed the finished
+            // message's history entry (and its cached file with it) —
+            // a file still referenced here belongs to a LOCKED entry
+            // (the lock exempts it from delete-after-full-play) and is
+            // kept for replay. Unreferenced one-shot files are cleaned
+            // up; expired entries' MP3s go via purgeExpired.
             String path = currentAudioFile.getAbsolutePath();
             if (MessageHistory.isAudioReferenced(path)) {
                 log("playback: keeping replay-cached file");
@@ -2556,9 +2023,6 @@ public class VoiceService extends Service
                 pumpAudioQueue();
                 pumpTtsQueue();
             }
-            // Nick 2026-10-23 v1.47: if the pumps didn't start new
-            // playback, she's fully done — restart the mic if we muted it.
-            if (!isPlayingAudio) unmuteMicAfterPlayback();
         });
     }
 
@@ -2573,7 +2037,7 @@ public class VoiceService extends Service
      * Preemption: the delayed advance is a handler runnable guarded by
      * a generation counter. Pause / stop / skip-to-newest / a priority
      * arrival cancel it outright (cancelPendingSegmentAdvance), the
-     * polite gate parks it like any other start, and if anything has
+     * and if anything has
      * already started playing by the time it fires the advance drops
      * itself — the pumps re-check playing/ttsSpeaking, so a late fire
      * can never double-start. While the gap runs, playback state reads
@@ -2593,13 +2057,6 @@ public class VoiceService extends Service
         Runnable delayed = () -> {
             if (segmentAdvanceGen != gen) return; // cancelled/superseded
             pendingSegmentAdvance = null;
-            if (politeHoldActive()) {
-                // Nick is talking — park exactly like an arrival
-                // during speech; the polite-hold release pumps the
-                // queues, so nothing is lost by not advancing here.
-                log("segments: gap elapsed under polite hold — parked");
-                return;
-            }
             advance.run();
         };
         pendingSegmentAdvance = delayed;
@@ -2903,13 +2360,6 @@ public class VoiceService extends Service
         // Nick 2026-10-22 v1.27: ttsPaused blocks the pump — a paused
         // message holds its place until resume.
         if (ttsSpeaking || playing || ttsPaused) return;
-        // Nick 2026-10-23 v1.46: polite interruption — hold while Nick
-        // speaks in always-listening mode. Stays queued; released on his
-        // pause via releasePoliteHold().
-        if (politeHoldActive()) {
-            log("polite: holding TTS playback for Nick's pause");
-            return;
-        }
         // Nick 2026-10-30 v1.73: earbuds-only lane armed but no
         // earbuds — the text stays queued, unspoken and unreported.
         // v1.75: TTS also holds under Android Auto (laneTtsBlocked)
@@ -2938,12 +2388,6 @@ public class VoiceService extends Service
      *  one utterance — never split it here; Selena segments. */
     @SuppressWarnings("deprecation") // setSpeakerphoneOn, see playFileNow
     private void speakOnDevice(String text, boolean isResume) {
-        // v1.70: device-TTS speech starting is answer/local speech —
-        // a pending holding note retires (see playFileNow).
-        if (!isResume) {
-            purgeQueuedHoldingNote();
-            cancelHoldingNote("local speech started");
-        }
         // Nick 2026-10-30 v1.73: backstop (see playFileNow) — never
         // speak out loud while the lane is armed without earbuds.
         // Unwind WITHOUT a progress report: nothing was heard.
@@ -2997,12 +2441,11 @@ public class VoiceService extends Service
         }
         String preview = text.length() > 30 ? text.substring(0, 30) + "…" : text;
         log("tts: on-device speak '" + preview + "'");
-        // Same routing as MP3 playback: loudspeaker, and undo the
-        // mic-beep zeroing first so we use Nick's real device
-        // volume (v1.10: no override, respect his setting — made
-        // absolute in v1.63: nothing here writes the media volume;
-        // the v1.17 boost call that lived in this spot is deleted).
-        unmuteBeep();
+        // Same routing as MP3 playback: loudspeaker at Nick's real
+        // device volume (v1.10: no override, respect his setting —
+        // made absolute in v1.63: nothing here writes the media
+        // volume; the v1.17 boost call that lived in this spot is
+        // deleted).
         // Nick 2026-10-30 v1.73: earbuds-only lane — when engaged,
         // the TTS speaks over the earbuds' headset channel with
         // voice-communication attributes and NO media focus request.
@@ -3046,9 +2489,6 @@ public class VoiceService extends Service
             log("tts: stream=MUSIC");
             requestAudioFocus();
         }
-        // Nick 2026-10-23 v1.47: stop the mic BEFORE she speaks, so
-        // her voice can't be transcribed as Nick's input.
-        muteMicForPlayback();
         isPlayingAudio = true;
         log("tts: echo guard on");
         broadcastPlaybackState();
@@ -3082,7 +2522,13 @@ public class VoiceService extends Service
         // v1.58: capture the finished item's segment group BEFORE the
         // progress report clears the tracker.
         final String finishedGroup = currentPlaySegmentGroup;
+        // v1.82: same for the finished row id (delete-after-full-play).
+        final String finishedRowId = currentPlayServerId;
         reportPlaybackProgress(); // v1.55: before any unwinding below
+        // v1.82 (Nick, 2026-11-02): delete-after-full-play — see
+        // onPlaybackDoneNow. TTS plays carry no file; the entry is
+        // matched by row id.
+        cleanupFullyPlayedMessage(finishedRowId, null);
         abandonAudioFocus();
         // v1.63: no boost to undo — nothing wrote the media volume.
         ttsSpeaking = false;
@@ -3128,9 +2574,6 @@ public class VoiceService extends Service
                 pumpTtsQueue();
                 pumpAudioQueue();
             }
-            // Nick 2026-10-23 v1.47: if the pumps didn't start new
-            // playback, she's fully done — restart the mic if we muted it.
-            if (!isPlayingAudio) unmuteMicAfterPlayback();
         });
     }
 
@@ -3158,8 +2601,8 @@ public class VoiceService extends Service
 
     private void pausePlayback() {
         // v1.58: pausing during a segment gap cancels the pending
-        // start — the successor stays queued and the pumps (or the
-        // polite-hold release) start it later with no gap owed.
+        // start — the successor stays queued and the pumps start it
+        // later with no gap owed.
         cancelPendingSegmentAdvance();
         // Nick 2026-10-22 v1.28: UNCONDITIONAL pause — works in phone
         // (on-device TTS) mode, Aria (MP3) mode, whatever is playing.
@@ -3212,9 +2655,6 @@ public class VoiceService extends Service
         }
         if (didPause) {
             toast("Paused");
-            // Nick 2026-10-23 v1.47: paused = she's not speaking —
-            // the mic should be live so Nick can talk.
-            unmuteMicAfterPlayback();
         } else {
             log("pause: nothing was playing");
             toast("Nothing playing to pause");
@@ -3272,11 +2712,6 @@ public class VoiceService extends Service
         }
         if (didResume) {
             toast("Resumed");
-            // Nick 2026-10-23 v1.47: resuming = she's speaking again —
-            // stop the mic so her voice isn't transcribed. (TTS resume
-            // goes through speakOnDevice which mutes; this covers the
-            // MP3 player.start() path.)
-            muteMicForPlayback();
         } else {
             log("resume: nothing was paused");
             toast("Nothing paused");
@@ -3331,9 +2766,6 @@ public class VoiceService extends Service
         // v1.76: a user stop ends the lane session immediately —
         // the idle hold-over is for queue flow, not for a stop.
         laneEnd();
-        // Nick 2026-10-23 v1.47: stopped = she's not speaking —
-        // restart the mic if we muted it.
-        unmuteMicAfterPlayback();
         broadcastPlaybackState();
     }
 
@@ -3501,17 +2933,6 @@ public class VoiceService extends Service
             toast("Priority message queued");
             return;
         }
-        // Nick 2026-10-23 v1.46: polite interruption — park behind the
-        // gate instead of breaking in over Nick's voice. Released on his
-        // pause via releasePoliteHold().
-        if (politeHoldActive()) {
-            waitingPriority.offer(new WaitingPriority(f, text, serverId,
-                    segmentGroup));
-            log("priority: held for Nick's pause ("
-                    + waitingPriority.size() + " waiting)");
-            toast("Priority message queued");
-            return;
-        }
         // Nick 2026-10-30 v1.73: earbuds-only lane armed but no
         // earbuds — even a priority item parks; it must not burst
         // out of the speaker or the truck radio.
@@ -3545,17 +2966,6 @@ public class VoiceService extends Service
             toast("Priority message queued");
             return;
         }
-        // Nick 2026-10-23 v1.46: polite interruption — park behind the
-        // gate instead of breaking in over Nick's voice. Released on his
-        // pause via releasePoliteHold().
-        if (politeHoldActive()) {
-            waitingPriority.offer(new WaitingPriority(null, text, serverId,
-                    segmentGroup));
-            log("priority: held for Nick's pause ("
-                    + waitingPriority.size() + " waiting)");
-            toast("Priority message queued");
-            return;
-        }
         // Nick 2026-10-30 v1.73: earbuds-only lane armed but no
         // earbuds — park instead of speaking out loud (see MP3 twin).
         // v1.75: also parks under Android Auto (TTS cannot be pinned).
@@ -3578,13 +2988,6 @@ public class VoiceService extends Service
      * to interrupt — the flow simply continues with priorityMode held.
      */
     private void playNextWaitingPriority() {
-        // Nick 2026-10-23 v1.46: polite interruption — never start a
-        // queued priority item over Nick's voice. It stays queued; the
-        // hold releases on his pause.
-        if (politeHoldActive()) {
-            log("priority: holding queued item for Nick's pause");
-            return;
-        }
         // Nick 2026-10-30 v1.73: earbuds-only lane armed but no
         // earbuds — the queued priority item waits for the earbuds.
         if (laneBlocked()) {
@@ -3779,7 +3182,6 @@ public class VoiceService extends Service
      * place, per the v1.34 rule). Runs on the main thread.
      */
     private void stopAllPlayback() {
-        cancelHoldingNote("stopped");
         // v1.56: report the stop to the brain FIRST — stopCurrentPlayback
         // clears the interrupt stack the report reads (delete-once-heard).
         reportPlaybackStopped();
@@ -4106,15 +3508,11 @@ public class VoiceService extends Service
      * active for the service's whole lifetime, which also meant an
      * idle Selena kept claiming earbud presses that belonged to
      * Spotify/Pandora. Now the session is active only while Selena
-     * has content (playing or paused) or is listening — the states
-     * where a press is plausibly FOR her. Fully idle → inactive, and
-     * the music apps get their presses back. Tradeoff, deliberately
-     * kept working: with always-listening on (Nick's normal mode) the
-     * session stays active, so earbud pause/dictation behave exactly
-     * as v1.51; the deactivation only bites when listening is off AND
-     * nothing is playing — and even then the manifest
-     * EarbudButtonReceiver can still deliver a press to start
-     * dictation on devices that fall back to the broadcast path.
+     * has content (playing or paused) — the states where a press is
+     * plausibly FOR her. Fully idle → inactive, and the music apps
+     * get their presses back; the manifest EarbudButtonReceiver can
+     * still deliver a press on devices that fall back to the
+     * broadcast path.
      */
     private void initMediaSession() {
         try {
@@ -4138,21 +3536,19 @@ public class VoiceService extends Service
     /**
      * Nick 2026-10-28 v1.52: keep the media session's active flag in
      * step with whether Selena has anything a press could mean —
-     * playing, paused-holding, speaking, or listening (including
-     * gate-killed: recognizerActive stays true while killed). Only
-     * touches the session on transitions.
+     * playing, paused-holding, or speaking. Only touches the session
+     * on transitions. (v1.82: the listening term is gone with the mic.)
      */
     private void refreshMediaSessionActive() {
         if (mediaSession == null) return;
         boolean want = safeIsPlaying() || ttsSpeaking
-                || playbackPaused || ttsPaused
-                || recognizerActive;
+                || playbackPaused || ttsPaused;
         if (want == mediaSessionActiveWanted) return;
         mediaSessionActiveWanted = want;
         try {
             mediaSession.setActive(want);
             log("earbud: media session " + (want
-                    ? "activated (Selena has content or is listening)"
+                    ? "activated (Selena has content)"
                     : "deactivated (idle — music apps keep their presses)"));
         } catch (Exception e) {
             log("earbud: session active toggle failed: " + e);
@@ -4194,9 +3590,9 @@ public class VoiceService extends Service
     /**
      * Nick 2026-10-28 v1.51: one earbud/headset button action, from the
      * MediaSession callback or the manifest broadcast receiver.
-     * Semantics (Nick's ask: "pause the readout / start dictation"):
-     *   toggle — playing -> pause; paused -> resume; idle -> dictation.
-     *   play   — paused -> resume; idle -> dictation.
+     * Semantics:
+     *   toggle — playing -> pause; paused -> resume; idle -> play queued.
+     *   play   — paused -> resume; idle -> play queued.
      *   pause  — playing -> pause.
      *   next   — skip to newest queued message.
      *   stop   — stop all playback.
@@ -4232,18 +3628,17 @@ public class VoiceService extends Service
         log("earbud: action=" + action + " via " + source
                 + " mp3Playing=" + safeIsPlaying()
                 + " ttsSpeaking=" + ttsSpeaking
-                + " paused=" + (playbackPaused || ttsPaused)
-                + " recognizerActive=" + recognizerActive);
+                + " paused=" + (playbackPaused || ttsPaused));
         switch (action) {
             case "toggle":
                 if (playbackPaused || ttsPaused) resumePlayback();
                 else if (safeIsPlaying() || ttsSpeaking) pausePlayback();
-                else startDictationFromEarbud();
+                else playQueuedFromEarbud();
                 break;
             case "play":
                 if (playbackPaused || ttsPaused) resumePlayback();
                 else if (!safeIsPlaying() && !ttsSpeaking) {
-                    startDictationFromEarbud();
+                    playQueuedFromEarbud();
                 }
                 break;
             case "pause":
@@ -4356,34 +3751,16 @@ public class VoiceService extends Service
     }
 
     /**
-     * Nick 2026-10-28 v1.51: earbud tap while idle = start dictating.
-     * If always-listening already has the recognizer running there is
-     * nothing to start — say so instead of silently doing nothing.
-     *
-     * Nick 2026-10-28 v1.52: while the noise gate has the recognizer
-     * killed, recognizerActive is still true but no session is live —
-     * an earbud dictation request is a manual override (§4.1), same
-     * as the on-screen mic tap.
+     * v1.82: earbud tap while idle. Dictation is gone with the
+     * microphone (Nick, 2026-11-02 — the app is playback-only), so
+     * an idle press means "play what's waiting": pump both queues.
+     * The pumps' own lane gates still hold playback while the
+     * earbuds-only lane is armed without earbuds.
      */
-    private void startDictationFromEarbud() {
-        if (gateState == GATE_DRONE) {
-            exitDroneMode("manual override");
-            toast("Listening");
-            return;
-        }
-        if (gateState == GATE_KILLED) {
-            forceGateOverride();
-            toast("Listening");
-            return;
-        }
-        if (recognizerActive) {
-            log("earbud: dictation requested, already listening");
-            toast("Already listening");
-            return;
-        }
-        manualListening = true;
-        startContinuousListening();
-        toast("Listening");
+    private void playQueuedFromEarbud() {
+        log("earbud: idle press — pumping queues (playback-only)");
+        pumpAudioQueue();
+        pumpTtsQueue();
     }
 
     private void requestAudioFocus() {
@@ -4432,498 +3809,6 @@ public class VoiceService extends Service
         try {
             if (focusRequest != null) audioManager.abandonAudioFocusRequest(focusRequest);
         } catch (Exception ignored) {}
-    }
-
-    // ------------------------------------------------------------ v1.59 dictation duck
-
-    /**
-     * Nick 2026-10-29 v1.59 (ducking rule): Nick started dictating —
-     * fade other audio down for the capture. Called from the
-     * recognizer's real speech onset (onSpeechDetected), NOT for the
-     * whole always-listening idle wait (music would sit ducked
-     * forever). Re-entry while held only refreshes activity and the
-     * watchdog. The batching window stays ducked because chunks and
-     * partials keep refreshing activity and the release requires an
-     * empty sentence buffer — mid-thought pauses between sentences
-     * of one dictation never pop the music back up.
-     */
-    private void acquireDictationDuck() {
-        // Nick 2026-10-30 v1.73: while the earbuds-only lane is in
-        // HEADSET mode (split case), the dictation takes NO media
-        // focus either — Spotify on the truck radio must not dip
-        // while he talks into his earbuds. (Media-duck mode keeps
-        // the normal duck — Nick's 14:44 refinement.)
-        if (laneHeadsetActive()) {
-            log("lane: case B split no-focus — dictation duck "
-                    + "skipped, other audio untouched");
-            return;
-        }
-        lastDictationActivityMs = android.os.SystemClock.uptimeMillis();
-        armDictationDuckWatchdog();
-        if (dictationDuckHeld) return;
-        try {
-            AudioAttributes attrs = new AudioAttributes.Builder()
-                    .setUsage(AudioAttributes.USAGE_MEDIA)
-                    .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
-                    .build();
-            dictationFocusRequest = new AudioFocusRequest.Builder(
-                    AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK)
-                    .setAudioAttributes(attrs)
-                    .build();
-            int rc = audioManager.requestAudioFocus(dictationFocusRequest);
-            dictationDuckHeld = rc == AudioManager.AUDIOFOCUS_REQUEST_GRANTED;
-            log("duck: dictation focus " + (dictationDuckHeld
-                    ? "held — other audio fades down" : "NOT granted rc=" + rc));
-        } catch (Exception e) {
-            log("duck: dictation focus request failed: " + e);
-        }
-        // v1.63: the MAY_DUCK focus request above is the WHOLE duck
-        // now — the v1.61 manual ramp that rode this lifecycle is
-        // deleted (standing rule: never write the media volume).
-    }
-
-    /** Partials/chunks/speech-end while the duck is held = still capturing. */
-    private void noteDictationActivity() {
-        if (dictationDuckHeld) {
-            lastDictationActivityMs = android.os.SystemClock.uptimeMillis();
-        }
-    }
-
-    /**
-     * Release the dictation duck when the dictation is truly over:
-     * he's not speaking, nothing is buffered awaiting its flush, and
-     * the tail grace has passed (covers the ~1s between speech-end
-     * and the final chunk landing). Called from the sentence flush,
-     * the held-sentence send, recognizer-done, and the watchdog; the
-     * watchdog additionally force-releases on staleness, so no path
-     * can leave Spotify ducked forever.
-     */
-    private void maybeReleaseDictationDuck() {
-        if (!dictationDuckHeld) return;
-        if (nickSpeaking) return;
-        if (sentenceBuffer.length() > 0) return;
-        long idle = android.os.SystemClock.uptimeMillis()
-                - lastDictationActivityMs;
-        if (idle < DICTATION_DUCK_GRACE_MS) return;
-        releaseDictationDuck("dictation ended");
-    }
-
-    private void releaseDictationDuck(String why) {
-        if (!dictationDuckHeld && dictationFocusRequest == null) return;
-        try {
-            if (dictationFocusRequest != null) {
-                audioManager.abandonAudioFocusRequest(dictationFocusRequest);
-            }
-        } catch (Exception ignored) {}
-        dictationFocusRequest = null;
-        dictationDuckHeld = false;
-        if (dictationDuckWatchdog != null) {
-            handler.removeCallbacks(dictationDuckWatchdog);
-            dictationDuckWatchdog = null;
-        }
-        log("duck: released (" + why + ") — music fades back");
-    }
-
-    private void armDictationDuckWatchdog() {
-        if (dictationDuckWatchdog != null) return;
-        // A lambda, not an anonymous Runnable class, on purpose: this
-        // codebase keeps service callbacks in lambdas / named task
-        // classes — the one anonymous inner class tried here made the
-        // build-tools 34 d8 fail with an internal NPE (nestmate
-        // desugaring), 2026-10-29.
-        dictationDuckWatchdog = () -> {
-            dictationDuckWatchdog = null;
-            if (!dictationDuckHeld) return;
-            long idle = android.os.SystemClock.uptimeMillis()
-                    - lastDictationActivityMs;
-            if (idle > DICTATION_DUCK_STALE_MS) {
-                // No speech/chunk/partial activity for 20s: whatever
-                // the bookkeeping says, the capture is not live.
-                releaseDictationDuck("watchdog: stale " + idle + "ms");
-                return;
-            }
-            if (!nickSpeaking && sentenceBuffer.length() == 0
-                    && idle >= DICTATION_DUCK_GRACE_MS) {
-                releaseDictationDuck("watchdog: dictation over");
-                return;
-            }
-            armDictationDuckWatchdog();
-        };
-        handler.postDelayed(dictationDuckWatchdog, DICTATION_DUCK_WATCHDOG_MS);
-    }
-
-    // ------------------------------------------------------------ deep duck: REMOVED (v1.63)
-    // The v1.61 manual deep duck (acquireDeepDuck / releaseDeepDuck /
-    // rampMusicVolume / its watchdog) lived here. DELETED under
-    // Nick's standing rule (2026-10-29 14:32 EDT): this app never
-    // writes the system media volume — no ramp down, no restore, no
-    // compensation. The field symptom it caused: with NO music
-    // playing, the ramp + capped LoudnessEnhancer offset netted out
-    // negative on Selena's own MP3 voice. Ducking is now exactly the
-    // v1.59 layer: MAY_DUCK audio-focus requests (playback +
-    // dictation), under which the music app lowers its own playback
-    // and the system knob never moves.
-
-    // ------------------------------------------------------------ v1.60 wake word (sherpa-onnx KWS)
-
-    /**
-     * Load the spotter off the main thread. Until it is ready, the
-     * recognizer path runs exactly as before; if it never becomes
-     * ready, it stays that way (fail open).
-     */
-    private void initWakeSpotterAsync() {
-        new Thread(() -> {
-            WakeWordSpotter candidate = new WakeWordSpotter(this);
-            if (candidate.init(this)) {
-                wakeSpotter = candidate;
-                wakeSpotterReady = true;
-                handler.post(this::onWakeSpotterReady);
-            } else {
-                wakeSpotterFailed = true;
-                log("wakeword: spotter unavailable (init failed) — "
-                        + "transcript wake word remains the only path");
-            }
-        }, "SelenaWakeInit").start();
-    }
-
-    /**
-     * Main thread, spotter ready: if the assistant is in the plain
-     * idle state (always-listening on, no conversation, nobody
-     * mid-dictation, nothing playing), hand the mic over — recognizer
-     * rests, spotter listens. Any busier state is left alone; the
-     * spotter joins at the next natural transition (window expiry,
-     * toggle) via refreshWakeMode().
-     */
-    private void onWakeSpotterReady() {
-        log("wakeword: spotter ready — 'Insight' / 'Hey Insight' (sherpa-onnx KWS, on-device)");
-        if (destroyed || !isAlwaysListening() || wakeConvoOpen
-                || manualListening) {
-            return;
-        }
-        if (recognizerActive && !nickSpeaking && sentenceBuffer.length() == 0
-                && !isPlayingAudio() && gateState != GATE_KILLED) {
-            stopContinuousListening();
-        }
-        refreshWakeMode();
-    }
-
-    /**
-     * The mode arbiter: start the spotter capture iff it should be
-     * the idle listener right now; stop it when a conversation is
-     * open, a manual session owns the mic, always-listening is off,
-     * or the service is going away. The recognizer-active and gate
-     * conditions are ALSO re-checked per-chunk inside the capture
-     * loop (wakeSpotterParked), so a transition this method misses
-     * can never produce two live mic consumers.
-     */
-    private void refreshWakeMode() {
-        if (wakeSpotter == null) return;
-        // v1.68: a zero-gap handoff owns the spotter's capture —
-        // the arbiter leaves it alone until the session ends.
-        if (wakeSpotter.isHandoff()) return;
-        boolean want = wakeSpotterReady && !wakeSpotterFailed
-                && isAlwaysListening() && !wakeConvoOpen && !manualListening
-                && !destroyed && gateState != GATE_KILLED
-                && gateState != GATE_DRONE && !recognizerActive
-                && !phoneCallMuted;
-        if (want) {
-            boolean wasRunning = wakeSpotter.isRunning();
-            wakeSpotter.startCapture();
-            if (!wasRunning && wakeSpotter.isRunning()) {
-                updateNotification("👂 Waiting for 'Insight'…");
-                log("wakeword: spotter listening — recognizer resting");
-            }
-        } else if (wakeConvoOpen || manualListening || !isAlwaysListening()
-                || destroyed || phoneCallMuted) {
-            wakeSpotter.stopCapture();
-        }
-    }
-
-    /**
-     * Called from the spotter's capture thread per chunk: park (mic
-     * released, nothing fed, nothing captured) whenever anything else
-     * owns the moment — the recognizer, Selena's own playback (echo),
-     * the playback mic-mute, or a gate-killed drone session.
-     */
-    public boolean wakeSpotterParked() {
-        return destroyed || !isAlwaysListening() || wakeConvoOpen
-                || manualListening || recognizerActive || isPlayingAudio()
-                || micMutedForPlayback || phoneCallMuted
-                || gateState == GATE_KILLED
-                || gateState == GATE_DRONE;
-    }
-
-    /** Spotter thread → main thread shim. */
-    public void onWakeWordSpotted(String keyword, float meanDbfs, float stdDbfs) {
-        handler.post(() -> handleWakeSpot(keyword, meanDbfs, stdDbfs));
-    }
-
-    private void handleWakeSpot(String keyword, float meanDbfs, float stdDbfs) {
-        if (destroyed || wakeConvoOpen) return;
-        String levels = "mean " + String.format(Locale.US, "%.1f", meanDbfs)
-                + " dBFS, std " + String.format(Locale.US, "%.1f", stdDbfs);
-        if (gateState == GATE_KILLED || gateState == GATE_DRONE) {
-            log("wakeword: spot '" + keyword + "' suppressed — gate killed (drone)");
-            return;
-        }
-        // The gate's principle, mirrored on the spotter's own levels:
-        // loud AND steady = machine, not a wake word. (The capture
-        // loop parks while the gate is KILLED; this guards the window
-        // where the drone is present but the gate — which samples the
-        // recognizer, now resting — has not killed.)
-        if (meanDbfs >= WAKE_DRONE_MEAN_DBFS && stdDbfs <= WAKE_DRONE_STD_DB) {
-            log("wakeword: spot '" + keyword + "' suppressed — loud steady drone ("
-                    + levels + ")");
-            return;
-        }
-        if (tryZeroGapHandoff(keyword, levels)) {
-            new Thread(new WakeDirectiveTask(this, keyword)).start();
-            return;
-        }
-        log("wakeword: spotted '" + keyword + "' (" + levels
-                + ") — opening conversation, recognizer taking over");
-        openWakeConversation("spotter");
-        new Thread(new WakeDirectiveTask(this, keyword)).start();
-    }
-
-    /** Lazily build the zero-gap recognizer (it shares the drone
-     *  path's downloaded ASR model; retried at most every 30 s
-     *  until the model is present and the build succeeds). */
-    private void ensureWakeStreamAsync() {
-        if (wakeStream != null && wakeStream.isReady()) return;
-        long now = System.currentTimeMillis();
-        if (now - wakeStreamTryAtMs < 30_000) return;
-        wakeStreamTryAtMs = now;
-        new Thread(() -> {
-            WakeStreamSession candidate = new WakeStreamSession(this);
-            if (candidate.init(this)) {
-                wakeStream = candidate;
-            }
-        }, "SelenaWakeStreamInit").start();
-    }
-
-    /**
-     * Zero-gap handoff (v1.68, Nick 2026-10-29 15:19): conversation
-     * bookkeeping as usual, but the spotter's capture keeps running
-     * in handoff mode and the wake-stream session takes the first
-     * dictation — ring seed first, forwarded live chunks after — so
-     * recognition is already running from the wake word's end.
-     * Returns false when the session isn't available; the caller
-     * then runs the pre-v1.68 cold-start path (fail open).
-     */
-    private boolean tryZeroGapHandoff(String keyword, String levels) {
-        // v1.72: no handoff during a phone call — the spotter is
-        // parked then anyway; this is the belt to its suspenders.
-        if (phoneCallMuted) return false;
-        if (wakeSpotter == null) return false;
-        ensureWakeStreamAsync();
-        if (wakeStream == null || !wakeStream.isReady()
-                || wakeStream.isActive()) {
-            return false;
-        }
-        wakeConvoOpen = true;
-        wakeConvoUntilMs = gateNow() + WAKE_CONVO_WINDOW_MS;
-        armWakeExpiry();
-        float[] seed = wakeSpotter.beginHandoff(wakeStream);
-        if (seed == null || !wakeStream.begin(seed)) {
-            wakeSpotter.endHandoff();
-            wakeConvoOpen = false;
-            return false;
-        }
-        log("wakeword: spotted '" + keyword + "' (" + levels
-                + ") — zero-gap handoff: own ASR live on the "
-                + "spotter's stream (seed " + seed.length
-                + " samples, no recognizer cold start)");
-        return true;
-    }
-
-    /** Wake-stream final: the conversation's first dictation,
-     *  delivered through the same door as every dictation
-     *  (onVoiceInput). Called from the session thread. */
-    public void onWakeStreamDictation(String text) {
-        handler.post(() -> {
-            if (text == null || text.trim().isEmpty()) return;
-            String cleaned = stripWakePrefix(text.trim());
-            if (cleaned.isEmpty()) return;
-            acquireDictationDuck();
-            log("wakestream: dictation '" + cleaned + "'");
-            onVoiceInput(cleaned);
-        });
-    }
-
-    /** Wake-stream session over (final delivered, timeout, or
-     *  failure): end the handoff and give the conversation to the
-     *  platform recognizer — the pre-v1.68 post-spot state. Called
-     *  from the session thread. */
-    public void onWakeStreamEnded() {
-        handler.post(() -> {
-            if (wakeSpotter != null) {
-                wakeSpotter.endHandoff();
-                wakeSpotter.stopCapture();
-            }
-            if (!destroyed && wakeConvoOpen && !recognizerActive
-                    && !manualListening) {
-                startContinuousListening();
-            }
-            refreshWakeMode();
-        });
-    }
-
-    /** Remove a leading wake word the seed slice may have caught
-     *  ("insight, what time…" → "what time…"). */
-    private String stripWakePrefix(String text) {
-        if (!sentenceStartsWithWakeWord(text)) return text;
-        String low = text.toLowerCase(Locale.US);
-        int cut = low.startsWith("hey insight")
-                ? "hey insight".length() : "insight".length();
-        return text.substring(cut)
-                .replaceAll("^[\\s,.:;!-]+", "").trim();
-    }
-
-    /**
-     * Open (or re-open) the app-side conversation window and make
-     * sure the recognizer is the live mic consumer. The window lasts
-     * WAKE_CONVO_WINDOW_MS from the last posted dictation — the same
-     * 2 minutes as the web rule.
-     */
-    private void openWakeConversation(String source) {
-        wakeConvoOpen = true;
-        wakeConvoUntilMs = gateNow() + WAKE_CONVO_WINDOW_MS;
-        armWakeExpiry();
-        if (wakeSpotter != null) wakeSpotter.stopCapture();
-        // No-op when the recognizer is already running (transcript /
-        // noise-hold sources); the entry point for the spotter source.
-        startContinuousListening();
-        log("wakeword: conversation open (" + source + ") — 2m window");
-    }
-
-    /** A posted dictation inside the window extends it. */
-    private void noteWakeConversationActivity() {
-        if (!wakeConvoOpen) return;
-        wakeConvoUntilMs = gateNow() + WAKE_CONVO_WINDOW_MS;
-        armWakeExpiry();
-    }
-
-    private void armWakeExpiry() {
-        if (wakeExpiryTask != null) handler.removeCallbacks(wakeExpiryTask);
-        wakeExpiryTask = () -> onWakeConvoExpiry();
-        long delay = Math.max(1000L, wakeConvoUntilMs - gateNow());
-        handler.postDelayed(wakeExpiryTask, delay);
-    }
-
-    private void onWakeConvoExpiry() {
-        wakeExpiryTask = null;
-        if (!wakeConvoOpen) return;
-        // Mid-flow never closes: he's dictating, composing, in a
-        // manual session, or she's mid-answer. Re-check shortly.
-        if (nickSpeaking || sentenceBuffer.length() > 0 || manualListening
-                || isPlayingAudio()) {
-            wakeExpiryTask = () -> onWakeConvoExpiry();
-            handler.postDelayed(wakeExpiryTask, 30000);
-            return;
-        }
-        wakeConvoOpen = false;
-        cancelHoldingNote("conversation closed");
-        log("wakeword: conversation window closed (2m idle) — spotter resuming");
-        if (isAlwaysListening() && !destroyed && gateState != GATE_KILLED
-                && recognizerActive) {
-            // stopContinuousListening first sends any noise-held
-            // dictation — and that send RE-OPENS this window (the
-            // exchange is still live). Honor the re-open: bring the
-            // recognizer back instead of handing over to the spotter.
-            stopContinuousListening();
-            if (wakeConvoOpen) {
-                startContinuousListening();
-                return;
-            }
-        }
-        refreshWakeMode();
-    }
-
-    /**
-     * True when the v1.60 wake gate should hold a flushed dictation:
-     * spotter engaged, no conversation open, not a manual/deliberate
-     * session. Spotter-failed mode never blocks (fail open).
-     */
-    private boolean wakeGateBlocksPost() {
-        if (wakeSpotter == null || !wakeSpotterReady || wakeSpotterFailed) {
-            return false;
-        }
-        if (wakeConvoOpen) return false;
-        if (manualListening || gateBypassSession) return false;
-        return true;
-    }
-
-    /**
-     * The transcript fallback, mirroring the web layer's detectWakeWord
-     * placement rule: the wake word counts as the first word(s) of the
-     * sentence — "insight" or "hey insight", case-insensitive, light
-     * punctuation tolerated.
-     */
-    private boolean sentenceStartsWithWakeWord(String sentence) {
-        if (sentence == null) return false;
-        String t = sentence.trim().toLowerCase(Locale.US);
-        t = t.replaceAll("^[^a-z]+", "");
-        return t.equals("insight") || t.startsWith("insight ")
-                || t.startsWith("insight,") || t.startsWith("insight.")
-                || t.equals("hey insight") || t.startsWith("hey insight ")
-                || t.startsWith("hey insight,") || t.startsWith("hey insight.");
-    }
-
-    /**
-     * Spotter failure (init or runtime): fail OPEN — the mode
-     * disables itself and the recognizer path resumes, exactly the
-     * pre-v1.60 behavior. Called from any thread.
-     */
-    public void onWakeSpotterFailed(String reason) {
-        if (wakeSpotterFailed) return;
-        wakeSpotterFailed = true;
-        log("wakeword: spotter failed (" + reason + ") — falling back to "
-                + "always-recognizer; transcript wake word only");
-        handler.post(() -> {
-            if (wakeSpotter != null) wakeSpotter.stopCapture();
-            if (!destroyed && isAlwaysListening() && !recognizerActive
-                    && !manualListening) {
-                startContinuousListening();
-            }
-        });
-    }
-
-    /**
-     * POST the wake directive: {action:'wake_word_spotted', keyword}.
-     * The input route records any string action into
-     * selena_voice_directives (user_id null for app posts, same as the
-     * app's dictation posts today) — the durable server-side record of
-     * the spot; the brain treats the unknown kind gracefully.
-     */
-    public void doPostWakeDirective(String keyword) {
-        HttpURLConnection conn = null;
-        try {
-            URL url = new URL(BASE_URL + "/api/selena-voice/input");
-            conn = (HttpURLConnection) url.openConnection();
-            conn.setRequestMethod("POST");
-            conn.setRequestProperty("Content-Type", "application/json");
-            conn.setConnectTimeout(8000);
-            conn.setReadTimeout(8000);
-            conn.setDoOutput(true);
-            JSONObject body = new JSONObject();
-            body.put("action", "wake_word_spotted");
-            body.put("keyword", keyword);
-            body.put("timestamp", System.currentTimeMillis());
-            OutputStream os = null;
-            try {
-                os = conn.getOutputStream();
-                os.write(body.toString().getBytes("UTF-8"));
-            } finally {
-                if (os != null) try { os.close(); } catch (Exception ignored) {}
-            }
-            int code = conn.getResponseCode();
-            log("wakeword: directive posted (" + code + "): '" + keyword + "'");
-        } catch (Exception e) {
-            Log.w(TAG, "wakeword: directive post failed", e);
-        } finally {
-            if (conn != null) conn.disconnect();
-        }
     }
 
     private boolean isPhoneVoiceMode() {
@@ -5021,305 +3906,11 @@ public class VoiceService extends Service
         handler.postDelayed(new ServiceHeartbeatTask(this), HEARTBEAT_MS);
     }
 
-    // ------------------------------------------------------------ inbound: always listening
-
-    private void startContinuousListening() {
-        if (recognizerActive || destroyed) return;
-        // Nick 2026-10-29 v1.60: the recognizer taking the mic always
-        // stands the wake spotter down first — never two live mic
-        // consumers (the spotter's own capture loop also parks itself
-        // whenever the recognizer is active, as a backstop).
-        if (wakeSpotter != null) wakeSpotter.stopCapture();
-        // Nick 2026-10-23 v1.41: never claim the mic (recognizer or FGS
-        // type) without RECORD_AUDIO. Refuse loudly instead of crashing.
-        if (!hasMicPermission()) {
-            micDeniedFeedback();
-            broadcastListeningState();
-            return;
-        }
-        if (!SpeechRecognizer.isRecognitionAvailable(this)) {
-            log("speech recognition not available");
-            return;
-        }
-        try {
-            // v1.41: claim the microphone FGS type BEFORE startListening().
-            upgradeToMicrophone();
-            recognizer = SpeechRecognizer.createSpeechRecognizer(this);
-            recognizer.setRecognitionListener(recognitionListener);
-            recognizerActive = true;
-            launchRecognizer();
-            broadcastListeningState();
-            log("continuous listening started");
-        } catch (Exception e) {
-            Log.w(TAG, "startContinuousListening failed", e);
-            recognizerActive = false;
-        }
-    }
-
-    private void stopContinuousListening() {
-        // Nick 2026-10-28 v1.52: ending listening ends any noise hold —
-        // send the held dictation (flagged) rather than losing the
-        // user's words, and reset the gate for the next session.
-        if (noiseHoldActive) sendHeldSentence();
-        if (gateState == GATE_KILLED) {
-            gateState = GATE_AMBIENT;
-            if (gateProbeScheduleTask != null) {
-                handler.removeCallbacks(gateProbeScheduleTask);
-                gateProbeScheduleTask = null;
-            }
-        }
-        if (gateState == GATE_DRONE) {
-            // Listening is ending mid-drone: the extraction session
-            // stands down with everything else.
-            gateState = GATE_AMBIENT;
-            if (droneSession != null) droneSession.endCapture();
-        }
-        gateBypassSession = false;
-        recognizerActive = false;
-        // Nick 2026-10-23 v1.41: last listening session ended — drop the
-        // microphone FGS type immediately; live on mediaPlayback only.
-        downgradeToMediaPlayback();
-        unmuteBeep();
-        destroyRecognizer();
-        updateNotification("⏸️ Paused");
-        broadcastListeningState();
-    }
-
-    private void launchRecognizer() {
-        // Nick 2026-10-23 v1.41: belt and suspenders — no permission, no
-        // recognizer, ever. Refuse rather than risk a SecurityException from
-        // any path that reaches startListening() unguarded.
-        if (!hasMicPermission()) {
-            Log.w(TAG, "launchRecognizer refused: RECORD_AUDIO not granted");
-            recognizerActive = false;
-            destroyRecognizer();
-            downgradeToMediaPlayback();
-            broadcastListeningState();
-            return;
-        }
-        if (!recognizerActive || recognizer == null || destroyed) return;
-        // Nick 2026-10-23 v1.47: never start listening while muted for
-        // Selena playback — unmuteMicAfterPlayback() restarts when done.
-        // v1.72: or while a phone call owns the mic (call-end restores).
-        if (micMutedForPlayback || phoneCallMuted) return;
-        // Nick 2026-10-28 v1.52: noise gate — while KILLED the
-        // recognizer stays OFF (nothing is recorded or sent); the
-        // probe loop owns re-arming. Every recognizer start funnels
-        // through here, so this one check suppresses them all. The
-        // manual override clears the killed state before starting.
-        if ((gateState == GATE_KILLED || gateState == GATE_DRONE)
-                && !gateBypassSession) return;
-        try {
-            muteBeep();
-            Intent intent = new Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH);
-            intent.putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL,
-                    RecognizerIntent.LANGUAGE_MODEL_FREE_FORM);
-            intent.putExtra(RecognizerIntent.EXTRA_LANGUAGE, Locale.getDefault());
-            intent.putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true);
-            recognizer.startListening(intent);
-            updateNotification("🎤 Listening…");
-        } catch (Exception e) {
-            Log.w(TAG, "launchRecognizer failed", e);
-            unmuteBeep();
-            scheduleRecognizerRestart();
-        }
-    }
-
-    private void destroyRecognizer() {
-        if (recognizer != null) {
-            try { recognizer.destroy(); } catch (Exception ignored) {}
-            recognizer = null;
-        }
-    }
-
-    private void scheduleRecognizerRestart() {
-        // Nick 2026-10-23 v1.47: never restart while muted for Selena
-        // playback — the unmute path restarts when she's done.
-        // v1.72: same for the phone-call mute (call-end restores).
-        if (destroyed || !recognizerActive || micMutedForPlayback
-                || phoneCallMuted) return;
-        handler.postDelayed(new RecognizerRestartTask(this), RESTART_DELAY_MS);
-    }
-
-    /**
-     * Nick 2026-10-18 v1.3: for NO_MATCH/SPEECH_TIMEOUT (routine silence,
-     * not a real error). Skips the unmuteBeep() — volumes stay zeroed from
-     * the last mute, so there's no window where the beep can slip through.
-     * launchRecognizer() will re-mute (no-op) before startListening().
-     */
-    public void scheduleQuietRestart() {
-        // Nick 2026-10-23 v1.47: never restart while muted for Selena
-        // playback — the unmute path restarts when she's done.
-        // v1.72: same for the phone-call mute (call-end restores).
-        if (destroyed || !recognizerActive || micMutedForPlayback
-                || phoneCallMuted) return;
-        Log.d(TAG, "quiet restart scheduled (" + RESTART_DELAY_MS + "ms)");
-        handler.postDelayed(new RecognizerRestartTask(this), RESTART_DELAY_MS);
-    }
-
-    /** Called by RecognizerRestartTask on main thread. */
-    public void restartRecognizerNow() {
-        if (destroyed || !recognizerActive || micMutedForPlayback) return;
-        // v1.72: never restart INTO a phone call. (The call-end path
-        // calls this itself once the flag has cleared.)
-        if (phoneCallMuted) return;
-        destroyRecognizer();
-        try {
-            recognizer = SpeechRecognizer.createSpeechRecognizer(this);
-            recognizer.setRecognitionListener(recognitionListener);
-            launchRecognizer();
-        } catch (Exception e) {
-            Log.w(TAG, "restart failed", e);
-            scheduleRecognizerRestart();
-        }
-    }
-
-    /**
-     * Nick 2026-10-23 v1.47: true while the mic is muted for Selena
-     * playback. Used by ServiceRecognitionListener to swallow the
-     * cancel() error without scheduling a restart.
-     */
-    public boolean isMicMutedForPlayback() {
-        return micMutedForPlayback;
-    }
-
-    // ------------------------------------------------------------
-    // v1.72: PHONE-CALL MIC MUTE (Nick, 2026-10-29 ~16:33)
-    // ------------------------------------------------------------
-    // While a phone call is ringing or in progress, the mic is
-    // MUTED at the capture layer — the spotter, the recognizer,
-    // the drone session, and the gate probes all park — so nothing
-    // said on the call is dictated, captured, held, or learned.
-    // When the call goes idle, the exact prior listening state
-    // resumes (conversation still open if it was open; the spotter
-    // if it was the idle owner; drone capture if an episode is on).
-
-    public boolean isPhoneCallMuted() {
-        return phoneCallMuted;
-    }
-
-    private void registerPhoneCallWatch() {
-        if (phoneCallWatchRegistered || destroyed) return;
-        if (android.os.Build.VERSION.SDK_INT < 31) {
-            if (!phoneCallWatchWarned) {
-                phoneCallWatchWarned = true;
-                log("phonecall: call-state watch needs Android 12+ — "
-                        + "the call mute is inactive on this device");
-            }
-            return;
-        }
-        if (checkSelfPermission(
-                android.Manifest.permission.READ_PHONE_STATE)
-                != android.content.pm.PackageManager.PERMISSION_GRANTED) {
-            if (!phoneCallWatchWarned) {
-                phoneCallWatchWarned = true;
-                log("phonecall: READ_PHONE_STATE not granted — the "
-                        + "call mute stays inactive until it is");
-            }
-            return;
-        }
-        try {
-            android.telephony.TelephonyManager tm =
-                    (android.telephony.TelephonyManager)
-                            getSystemService(Context.TELEPHONY_SERVICE);
-            if (tm == null) return;
-            phoneCallCallback = new PhoneCallCallback(this);
-            tm.registerTelephonyCallback(getMainExecutor(),
-                    phoneCallCallback);
-            phoneCallWatchRegistered = true;
-            log("phonecall: call-state watch registered (mic mutes "
-                    + "for the duration of any call)");
-        } catch (Exception e) {
-            Log.w(TAG, "phonecall: registerTelephonyCallback failed", e);
-        }
-    }
-
-    private void unregisterPhoneCallWatch() {
-        if (!phoneCallWatchRegistered) return;
-        try {
-            android.telephony.TelephonyManager tm =
-                    (android.telephony.TelephonyManager)
-                            getSystemService(Context.TELEPHONY_SERVICE);
-            if (tm != null && phoneCallCallback != null) {
-                tm.unregisterTelephonyCallback(phoneCallCallback);
-            }
-        } catch (Exception ignored) {}
-        phoneCallWatchRegistered = false;
-        phoneCallCallback = null;
-    }
-
-    /** PhoneCallCallback lands here (main executor). */
-    public void onPhoneCallStateChanged(int state) {
-        handler.post(() -> {
-            boolean inCall = state
-                            == android.telephony.TelephonyManager.CALL_STATE_RINGING
-                    || state
-                            == android.telephony.TelephonyManager.CALL_STATE_OFFHOOK;
-            if (inCall == phoneCallMuted) {
-                // RINGING → OFFHOOK is ONE mute, not two.
-                return;
-            }
-            if (inCall) {
-                phoneCallMuted = true;
-                log("phonecall: mic muted — call "
-                        + (state
-                                == android.telephony.TelephonyManager.CALL_STATE_RINGING
-                                ? "ringing" : "in progress")
-                        + "; capture parked, nothing is recorded, "
-                        + "held, or learned");
-                // Park every capture owner NOW; the park
-                // predicates + start guards keep them parked for
-                // the whole call.
-                if (recognizer != null) {
-                    try { recognizer.cancel(); } catch (Exception ignored) {}
-                    destroyRecognizer();
-                }
-                if (wakeSpotter != null) wakeSpotter.stopCapture();
-                if (droneSession != null && droneSession.isCapturing()) {
-                    // endCapture abandons any partial utterance —
-                    // it is discarded, never delivered (v1.61 code).
-                    droneSession.endCapture();
-                }
-                refreshWakeMode();
-                broadcastListeningState();
-            } else {
-                phoneCallMuted = false;
-                log("phonecall: mic restored — call ended, resuming "
-                        + "the listening state from before the call");
-                // Resume the exact prior state: the spotter if it
-                // was the idle owner (the arbiter re-decides), the
-                // recognizer if a conversation/manual session was
-                // live, drone capture if an episode is still on.
-                refreshWakeMode();
-                if (gateState == GATE_DRONE && droneSession != null
-                        && !droneSession.isCapturing()) {
-                    droneSession.beginCapture(machineUserKey());
-                }
-                if (recognizerActive && !destroyed) {
-                    restartRecognizerNow();
-                }
-                broadcastListeningState();
-            }
-        });
-    }
-
-    // Nick 2026-10-23 v1.48: Bluetooth-aware interrupt mode. Nick marks
-    // which BT device is his earbuds (one-time, in SharedPreferences).
-    // During Selena's playback:
-    // - Earbuds connected → VOICE INTERRUPT: recognizer stays ON,
-    //   onBeginningOfSpeech pauses her, results discarded (VAD ignores
-    //   mower/engine noise, only human speech triggers).
-    // - Anything else (truck radio, phone speaker, no BT) → TAP INTERRUPT:
-    //   recognizer OFF (v1.47 mic-mute), tap screen to pause.
+    // Nick's earbuds identity (v1.48, kept for the v1.73 earbuds-only
+    // playback lane): he marks which BT device is his earbuds, one
+    // time, in SharedPreferences.
     private static final String PREFS_NAME = "selena_voice_prefs";
     private static final String PREF_EARBUDS_NAME = "earbuds_device_name";
-
-    /** Nick 2026-10-23 v1.48: true while in voice-interrupt mode. */
-    private volatile boolean voiceInterruptMode = false;
-
-    public boolean isVoiceInterruptMode() {
-        return voiceInterruptMode;
-    }
 
     /** Nick 2026-10-23 v1.48: save Nick's earbuds BT device name. */
     public void setEarbudsDeviceName(String name) {
@@ -6828,7 +5419,6 @@ public class VoiceService extends Service
             currentPlaySegmentGroup = null;
         }
         laneEnd();
-        unmuteMicAfterPlayback();
         broadcastPlaybackState();
     }
 
@@ -6946,2618 +5536,6 @@ public class VoiceService extends Service
         }
     }
 
-    /**
-     * Nick 2026-10-23 v1.47: stop the recognizer entirely when Selena
-     * starts speaking, so her voice can't be transcribed as Nick's
-     * input. Uses cancel() (not stopListening()) so no partial result
-     * fires. The onError(ERROR_CLIENT) this triggers is swallowed by
-     * the micMutedForPlayback guards — no restart is scheduled.
-     * Idempotent: safe to call when already muted or not listening.
-     *
-     * Nick 2026-10-23 v1.48: Bluetooth-aware. If Nick's earbuds are
-     * connected → VOICE INTERRUPT mode: recognizer stays ON, but
-     * onBeginningOfSpeech pauses her playback (results discarded —
-     * the VAD ignores mower/engine noise). Otherwise → TAP INTERRUPT:
-     * full mute as in v1.47, tap the screen to pause her.
-     */
-    private void muteMicForPlayback() {
-        if (micMutedForPlayback || voiceInterruptMode) return;
-        if (!recognizerActive || recognizer == null) return;
-        // Nick 2026-10-23 v1.48: check BT before muting.
-        if (isEarbudsConnected()) {
-            voiceInterruptMode = true;
-            log("mic: voice-interrupt mode (earbuds) — recognizer stays on, "
-                    + "speech pauses playback, results discarded");
-            broadcastListeningState();
-            return;
-        }
-        micMutedForPlayback = true;
-        log("mic: muted for Selena playback (tap-interrupt mode)");
-        try {
-            recognizer.cancel();
-        } catch (Exception e) {
-            Log.w(TAG, "mic mute cancel failed", e);
-        }
-        broadcastListeningState();
-    }
-
-    /**
-     * Nick 2026-10-23 v1.47: restart the recognizer after Selena
-     * finishes speaking, if we muted it. Uses the existing clean
-     * restart path (destroy + recreate) since cancel() can leave
-     * the recognizer in an uncertain state. No-op if not muted or
-     * the listening mode was turned off while she spoke.
-     */
-    private void unmuteMicAfterPlayback() {
-        // Nick 2026-10-23 v1.48: clear voice-interrupt mode too.
-        if (voiceInterruptMode) {
-            voiceInterruptMode = false;
-            log("mic: voice-interrupt mode cleared");
-            broadcastListeningState();
-        }
-        if (!micMutedForPlayback) return;
-        micMutedForPlayback = false;
-        if (destroyed || !recognizerActive) {
-            log("mic: unmute skipped (not listening anymore)");
-            broadcastListeningState();
-            return;
-        }
-        log("mic: unmuted after Selena playback, restarting recognizer");
-        restartRecognizerNow();
-    }
-
-    // Callbacks from ServiceRecognitionListener (main thread):
-
-    public void onSpeechDetected() {
-        // Nick 2026-10-23 v1.48: voice-interrupt mode — Nick started
-        // talking while Selena was speaking. Pause her immediately.
-        // Results are discarded (ServiceRecognitionListener checks
-        // isPlayingAudio), so this never becomes an input.
-        if (voiceInterruptMode && isPlayingAudio()) {
-            log("interrupt: Nick speaking during playback — pausing her");
-            pausePlayback();
-            return;
-        }
-        // Nick 2026-10-23 v1.46: polite interruption — Nick started
-        // talking; Selena holds any pending playback until his pause.
-        nickSpeaking = true;
-        // v1.70: he's dictating again — a pending holding note must
-        // never talk over him.
-        cancelHoldingNote("user dictating");
-        // Nick 2026-10-29 v1.59 (ducking rule): real capture started —
-        // fade other audio down for the dictation.
-        acquireDictationDuck();
-        sendBroadcast(new Intent(ACTION_SPEECH_DETECTED));
-    }
-
-    public void onSpeechEnd() {
-        nickSpeaking = false;
-        // v1.59: speech-end anchors the duck's release grace — the
-        // dictation is in its tail (final chunk + flush), not over.
-        noteDictationActivity();
-        unmuteBeep();
-        // Nick 2026-10-23 v1.46: polite interruption — Nick just paused.
-        // onResults (with his chunk) usually lands within ~1s; delay the
-        // release so the chunk is POSTed first — otherwise the echo guard
-        // would discard it as "during playback". Also the fallback for
-        // chunks the filters discard. The gate is re-checked at play
-        // time, so a re-started utterance re-holds.
-        // Nick 2026-10-23 v1.48: 3s to match SENTENCE_GAP_MS.
-        handler.postDelayed(() -> releasePoliteHold(), 4000);
-    }
-
-    public void onRecognizerDone() {
-        // Nick 2026-10-23 v1.46: the recognizer session ended (results or
-        // error) — the utterance is over, so the speech flag must not
-        // stick. Safety-net release for error paths where onEndOfSpeech
-        // never fired; harmless otherwise (pumps are idempotent).
-        nickSpeaking = false;
-        // Nick 2026-10-29 v1.59: session over — if nothing is buffered
-        // (e.g. the gate rejected the utterance, so no chunk ever
-        // landed and no flush will ever run), the duck releases here.
-        maybeReleaseDictationDuck();
-        unmuteBeep();
-        // Nick 2026-10-23 v1.48: FAST restart (500ms) after normal utterance
-        // end — the 5s delay is for error cases only. Nick was waiting
-        // ~10s (3s gap + 5s restart + init) for dictation to resume.
-        handler.postDelayed(new RecognizerRestartTask(this), 500);
-        // Nick 2026-10-23 v1.48: 3s to match SENTENCE_GAP_MS.
-        handler.postDelayed(() -> releasePoliteHold(), 4000);
-    }
-
-    /**
-     * Nick 2026-10-23 v1.46: live dictation popup. Called by
-     * ServiceRecognitionListener.onPartialResults on the main thread.
-     * The popup shows the in-progress sentence = buffered chunks plus
-     * the live partial. Unfiltered by design — the final accept/reject
-     * still happens in onResults.
-     */
-    public void onPartialVoiceInput(String text) {
-        noteDictationActivity(); // v1.59: partials = capture still live
-        String display = sentenceBuffer.length() > 0
-                ? sentenceBuffer.toString() + " " + text
-                : text;
-        Intent i = new Intent(ACTION_PARTIAL_INPUT);
-        i.putExtra(EXTRA_TEXT, display);
-        sendAppBroadcast(i);
-    }
-
-    /**
-     * Nick 2026-10-23 v1.46: polite interruption, decided ENTIRELY
-     * ON-DEVICE (no cloud round-trip — by the time the cloud answered,
-     * Nick would be talking again). In always-listening mode Selena never
-     * STARTS speaking while Nick is talking: neither on the utterance
-     * flag from the recognizer's real-time speech detector, nor on a hot
-     * live mic RMS (covers the detector's lag). Callers keep the message
-     * queued; the hold releases on his pause.
-     */
-    private boolean politeHoldActive() {
-        if (!isAlwaysListening()) return false;
-        if (nickSpeaking) return true;
-        return recognitionListener != null && recognitionListener.isMicHot();
-    }
-
-    /**
-     * Nick 2026-10-23 v1.46: polite interruption — Nick paused, so play
-     * anything held. Priority items first (they were parked in the
-     * waiting FIFO), then the normal queues. Every start point re-checks
-     * the gate, so a re-started utterance re-holds. Never starts over
-     * active playback — completion handlers drive the next item there.
-     */
-    private void releasePoliteHold() {
-        if (playing || ttsSpeaking) return;
-        playNextWaitingPriority(); // no-op when empty; gate re-checked inside
-        pumpAudioQueue();
-        pumpTtsQueue();
-    }
-
-    // Nick 2026-10-23 v1.46: sentence buffering — a 0.5s "collecting my
-    // thought" pause is NOT a sentence end. Chunks arriving within
-    // SENTENCE_GAP_MS of the previous chunk are mid-thought pauses:
-    // appended to the in-progress sentence, not sent. A longer gap (or
-    // the flush timer below) means the sentence ended — POST it as one
-    // clean batch. 1.0s is a starting point; tune if it feels wrong.
-    private final StringBuilder sentenceBuffer = new StringBuilder();
-    private long lastChunkMs = 0;
-    // Nick 2026-10-23 v1.48: 3-second gap — Nick speaks, 3s of quiet =
-    // batch end. (Was 1.0s in v1.46; Nick found 1s cut him off mid-thought.)
-    private static final long SENTENCE_GAP_MS = 4000; // Nick 2026-10-23: 4s silence before batch (was 3s)
-    private Runnable sentenceFlushTask = null;
-
-    /**
-     * Nick 2026-10-23 v1.46: called per ACCEPTED chunk (post-filter).
-     * Buffers mid-thought pauses into the in-progress sentence; the
-     * sentence is sent by flushSentence() once a real pause lands.
-     * Runs on the main thread (recognizer callback).
-     */
-    public void onVoiceInput(String text) {
-        // Nick 2026-10-29 v1.61 naming capture: if the naming
-        // question is armed (asked right after an unnamed machine's
-        // run ended), a SHORT reply is the machine's name — consume
-        // it here, never buffer or POST it. A longer reply means the
-        // user just went on dictating; the question was asked once
-        // for this run, so disarm and fall through normally.
-        if (text != null && pendingNameProfileId >= 0
-                && System.currentTimeMillis() <= namingCaptureUntilMs) {
-            String t = text.trim();
-            if (!t.isEmpty() && t.split("\\s+").length <= 6) {
-                applyMachineName(t);
-                return;
-            }
-            disarmNamingCapture();
-        }
-        // Nick 2026-10-29 v1.62 guest-name capture: she just asked
-        // who's talking/asking — a SHORT reply is the new person's
-        // name (enroll + release the held dictation tagged with it).
-        // A longer reply means the ask went unanswered: release the
-        // held dictation untagged and let this chunk flow normally.
-        if (text != null && pendingGuestSentence != null
-                && System.currentTimeMillis() <= guestNameCaptureUntilMs) {
-            String t = text.trim();
-            if (!t.isEmpty() && t.split("\\s+").length <= 6) {
-                handleGuestNameReply(t);
-                return;
-            }
-            // v1.64: in earbud mode a non-name reply NEVER releases
-            // the overheard words as a dictation — the hold resolves
-            // as unidentified instead.
-            if (pendingGuestEarbud) {
-                earbudHoldTimeout();
-            } else {
-                releaseHeldGuestSentence(null);
-            }
-        }
-        // Nick 2026-10-18 v1.9: Nick's words reach the UI instantly, even
-        // if the POST later fails (offline, timeout). His inputs are never
-        // spoken aloud — playback only plays Selena's reply MP3s.
-        // Nick 2026-10-28 v1.53: capture the gate context BEFORE the
-        // bookkeeping below clears it — the voiceprint sample class
-        // depends on how this chunk was accepted.
-        final boolean vpWasNoiseHold = noiseHoldActive;
-        final boolean vpWasBypass = gateBypassSession;
-        long now = android.os.SystemClock.uptimeMillis();
-        noteDictationActivity(); // v1.59: an accepted chunk = capture live
-        // Nick 2026-10-28 v1.52: a real accepted chunk after a noise
-        // pause means dictation RESUMED on top of the held text — the
-        // message is continuing, so it is no longer a cut-off send:
-        // clear the noise-hold bookkeeping and the 60s noise clock.
-        if (noiseHoldActive) {
-            noiseHoldActive = false;
-            bufferCutOffFlag = false;
-            if (noiseHoldSendTask != null) {
-                handler.removeCallbacks(noiseHoldSendTask);
-                noiseHoldSendTask = null;
-            }
-            // The gap check below must not flush the held text as its
-            // own sentence — the resumed chunk continues THIS message.
-            lastChunkMs = now;
-            log("gate: dictation resumed on top of held text");
-        }
-        // Actively dictating (possibly over a still-running drone after
-        // a burst re-arm) — keep the gate from re-killing mid-flow.
-        // Each accepted chunk extends the grace; once he stops, the
-        // normal 4s flush lands well before grace + kill-sustain do.
-        gateGraceUntilMs = now + 6000;
-        long gap = now - lastChunkMs;
-        // A long gap means the buffered chunks were a complete sentence —
-        // flush them before starting the new one. (The flush timer
-        // normally beats us here; this covers the deferred-while-speaking
-        // case where the buffer went stale.)
-        if (sentenceBuffer.length() > 0 && gap >= SENTENCE_GAP_MS) {
-            flushSentence();
-        }
-        if (sentenceBuffer.length() > 0) sentenceBuffer.append(' ');
-        sentenceBuffer.append(text);
-        lastChunkMs = now;
-        // Popup shows the in-progress sentence.
-        broadcastInProgressSentence();
-        // (Re)arm the flush: a full SENTENCE_GAP_MS with no new chunk ends
-        // the sentence. Firing is deferred while he's still speaking.
-        if (sentenceFlushTask != null) handler.removeCallbacks(sentenceFlushTask);
-        sentenceFlushTask = () -> flushSentence();
-        handler.postDelayed(sentenceFlushTask, SENTENCE_GAP_MS);
-        // Nick 2026-10-28 v1.53: this chunk was ACCEPTED — it may
-        // teach the voiceprint (§5: only accepted dictations teach).
-        vpLearnAccepted(text, vpWasNoiseHold, vpWasBypass);
-    }
-
-    /**
-     * Nick 2026-10-28 v1.53 (Phase 4, spec §5): feed the learned
-     * voiceprint from one accepted dictation chunk. Sample class:
-     * manual-override sessions are the strongest evidence (§4.1);
-     * chunks accepted out of a noise hold (or with the drone recently
-     * in the sampler) are over-noise — light voice weight, and the
-     * surrounding drone teaches the noise profile too; quiet-room
-     * chunks are clean; everything else is normal. A chunk that says
-     * "ignore that / that wasn't me" instead redirects the PREVIOUS
-     * sample to the noise profile (§4.2) and teaches nothing itself.
-     */
-    private void vpLearnAccepted(String text, boolean wasNoiseHold,
-                                 boolean wasBypass) {
-        if (voiceprint == null || recognitionListener == null) return;
-        try {
-            float[] feats = recognitionListener.takeUtteranceFeatures();
-            float conf = recognitionListener.takeUtteranceConfidence();
-            if (feats == null) return;
-            String t = (text == null ? "" : text.trim().toLowerCase(Locale.US));
-            if (t.startsWith("ignore that") || t.startsWith("that wasn't me")
-                    || t.startsWith("that wasnt me") || t.startsWith("not me")
-                    || t.startsWith("disregard that")) {
-                voiceprint.moveLastVoiceSampleToNoise();
-                log("voiceprint: 'wasn't me' — last sample redirected to the noise profile");
-                return;
-            }
-            String cls;
-            if (wasBypass) {
-                cls = Voiceprint.CLS_OVERRIDE;
-            } else if (wasNoiseHold || gateNow() - vpDroneSeenMs < 15000) {
-                cls = Voiceprint.CLS_OVER_NOISE;
-            } else {
-                float[] s = recognitionListener.samplerStats();
-                cls = (s[3] >= 1f && s[0] < gateKillLineDb() - 4f)
-                        ? Voiceprint.CLS_CLEAN : Voiceprint.CLS_NORMAL;
-            }
-            // Nick 2026-10-29 v1.62 new-voice attribution — BEFORE
-            // Nick's profile learns anything from this chunk. A chunk
-            // matching an enrolled guest teaches the GUEST only; a
-            // chunk matching nobody (Nick established, distance
-            // clearly beyond the cold-and-off-day grace zone) marks
-            // the buffer as a new-voice candidate and teaches NO
-            // ONE — the flush holds that sentence for the ask, and
-            // the enrollment (if any) seeds from these measurements.
-            if (guestProfiles != null && voiceprint.voiceHasVote()
-                    && voiceprint.verdictRecog(feats) == Voiceprint.NO_MATCH) {
-                GuestProfiles.Guest g = guestProfiles.matchRecog(this, feats);
-                if (g != null) {
-                    guestProfiles.learnRecog(this, g.id, feats,
-                            Voiceprint.weightFor(cls));
-                    if (bufferGuestName == null) bufferGuestName = g.name;
-                    log("guests: chunk attributed to '" + g.name
-                            + "' — Nick's print untouched");
-                    return;
-                }
-                double distNick = voiceprint.distanceRecog(feats);
-                if (distNick >= NEW_VOICE_MIN_DIST
-                        && pendingGuestSentence == null
-                        && System.currentTimeMillis()
-                                >= guestAskCooldownUntilMs) {
-                    float[] lastUn = guestProfiles.lastUnmatchedFeats(this);
-                    if (lastUn == null
-                            || GuestProfiles.distanceBetween(feats, lastUn)
-                                    > 1.2) {
-                        pendingGuestFeats = feats;
-                        bufferNewVoiceCandidate = true;
-                        log("guests: NEW VOICE candidate (distance to Nick "
-                                + String.format(Locale.US, "%.2f", distNick)
-                                + ") — print not trained; the flush will "
-                                + "hold the sentence for the ask");
-                        return;
-                    }
-                    log("guests: unrecognized voice = the signature already "
-                            + "asked about in the last 24h — no re-ask, "
-                            + "print not trained");
-                    return;
-                }
-                // NO_MATCH but inside the grace distance: benefit of
-                // the doubt (Nick with a cold reads exactly like
-                // this) — fall through and learn as his, as before.
-            }
-            voiceprint.learnVoice(feats, cls, conf);
-            if (Voiceprint.CLS_OVER_NOISE.equals(cls)) {
-                float[] nf = recognitionListener.samplerTraceFeatures();
-                if (nf != null) voiceprint.learnNoiseRecog(nf, 0.7);
-            }
-            // A dictation landing right after a probe-burst re-arm
-            // CONFIRMS the burst was the user — teach the probe-domain
-            // voice profile so the next burst is recognized sooner.
-            if (vpPendingBurstFeats != null && gateNow() <= vpBurstConfirmUntilMs) {
-                voiceprint.learnVoiceProbe(vpPendingBurstFeats,
-                        Voiceprint.weightFor(cls) * 0.8);
-                vpPendingBurstFeats = null;
-                log("voiceprint: probe burst confirmed by dictation — probe voice profile taught");
-            }
-        } catch (Exception e) {
-            Log.w(TAG, "voiceprint: learn failed", e);
-        }
-    }
-
-    /**
-     * Nick 2026-10-28 v1.53 (§5/§4.3): the drone guard's one exception.
-     * Returns true only when the learned voiceprint is confident this
-     * envelope is the signed-in user (and clearly unlike the known
-     * noise) and the recognizer's own confidence isn't low. A false
-     * here changes nothing — the guard discards exactly as it did
-     * before the voiceprint existed. The voiceprint can open the
-     * gate; it can never be the reason anything is refused.
-     */
-    public boolean voiceprintRescueVerdict(float[] feats, float confidence) {
-        if (voiceprint == null || feats == null) return false;
-        try {
-            if (confidence >= 0 && confidence < 0.5f) return false;
-            boolean match = voiceprint.verdictRecog(feats) == Voiceprint.MATCH;
-            if (match) {
-                log("voiceprint: envelope MATCHES the signed-in user — rescuing result from the drone guard");
-            }
-            return match;
-        } catch (Exception e) {
-            Log.w(TAG, "voiceprint: rescue verdict failed", e);
-            return false;
-        }
-    }
-
-    /**
-     * Nick 2026-10-23 v1.46: send the buffered sentence to Selena as one
-     * clean batch — POST to /api/selena-voice/input plus a from-Nick
-     * history entry. Deferred while Nick is still speaking; never cut
-     * him off mid-thought. After sending, the polite hold releases so
-     * Selena may speak into the silence.
-     */
-    private void flushSentence() {
-        sentenceFlushTask = null;
-        if (sentenceBuffer.length() == 0) return;
-        // Nick 2026-10-28 v1.52: a noise-held dictation is owned by
-        // the 60s noise clock (or by resumed dictation) — the normal
-        // 4s sentence gap must never flush it early or unflagged.
-        if (noiseHoldActive) return;
-        if (nickSpeaking) {
-            // Still mid-utterance — wait for a real pause. The next chunk
-            // re-arms; re-arm here as a backstop.
-            sentenceFlushTask = () -> flushSentence();
-            handler.postDelayed(sentenceFlushTask, SENTENCE_GAP_MS);
-            return;
-        }
-        // Nick 2026-10-29 v1.62: a new-voice candidate sits in this
-        // buffer and the dictation has now STOPPED — hold the post
-        // and run the ask. (Pre-wake chatter is exempt: it was never
-        // going to post, so there is no question to preserve.)
-        if (bufferNewVoiceCandidate && pendingGuestSentence == null) {
-            bufferNewVoiceCandidate = false;
-            if (!(wakeGateBlocksPost()
-                    && !sentenceStartsWithWakeWord(
-                            sentenceBuffer.toString()))) {
-                String held = sentenceBuffer.toString();
-                sentenceBuffer.setLength(0);
-                startNewVoiceFlow(held);
-                maybeReleaseDictationDuck();
-                releasePoliteHold();
-                return;
-            }
-        }
-        String sentence = sentenceBuffer.toString();
-        sentenceBuffer.setLength(0);
-        // Nick 2026-10-23 v1.46: his dictations live in the message
-        // history as from-Nick entries, in the same list as her replies.
-        MessageHistory.addNick(sentence);
-        // Nick 2026-10-29 v1.60 (true wake word): while the spotter is
-        // engaged and no conversation is open, a dictation is SENT
-        // only when it carries the wake word itself (the transcript
-        // fallback — the spotter is the primary path). Anything else
-        // is pre-wake chatter: it stays in his local history above and
-        // is never posted. An open conversation, a manual session, and
-        // spotter-failed mode all post exactly as before.
-        boolean heldByWakeGate = false;
-        if (wakeGateBlocksPost()) {
-            if (sentenceStartsWithWakeWord(sentence)) {
-                log("wakeword: transcript wake word — conversation opened (fallback path)");
-                openWakeConversation("transcript");
-            } else {
-                heldByWakeGate = true;
-                String preview = sentence.length() > 30
-                        ? sentence.substring(0, 30) + "…" : sentence;
-                log("wakeword: dictation held — conversation closed, no wake word: '"
-                        + preview + "'");
-            }
-        }
-        if (!heldByWakeGate) {
-            Intent sent = new Intent(ACTION_INPUT_SENT);
-            sent.putExtra(EXTRA_TEXT, sentence);
-            sendAppBroadcast(sent);
-            final String toPost = sentence;
-            // v1.62: a guest spoke this sentence — bind the name
-            // explicitly (directive in order, then the tagged post).
-            final String spk = bufferGuestName;
-            bufferGuestName = null;
-            // v1.64 earbud mode: a KNOWN guest's words are never
-            // posted as a group dictation — they become a private
-            // relay to Nick (directive only; the brain composes the
-            // "I just heard [name] say… do you want me to…?" line and
-            // nothing is executed on the guest's words).
-            if (spk != null && isEarbudsConnected()) {
-                postGuestDirective("guest_relay", spk, null, toPost);
-                log("guests(earbuds): known guest '" + spk
-                        + "' — private relay only, no dictation post");
-                noteWakeConversationActivity();
-            } else if (spk == null && tryLocalFastLane(toPost)) {
-                // Nick 2026-10-29 v1.69: LOCAL FAST LANE — a
-                // phone-known question (time / date) answered
-                // on-device. NOT posted: no double handling. The
-                // exchange still counts as conversation activity.
-                noteWakeConversationActivity();
-            } else {
-                if (spk != null) {
-                    postGuestDirective("guest_speaking", spk, null, toPost);
-                }
-                new Thread(new InputPostTask(this, toPost, false, spk,
-                        snapshotInterruption(toPost), spk == null)).start();
-                noteWakeConversationActivity();
-            }
-        }
-        if (heldByWakeGate) bufferGuestName = null; // v1.62: never leak a tag
-        // Nick 2026-10-29 v1.59: the batch is sent and the buffer is
-        // empty — the dictation is over; release the duck BEFORE any
-        // held playback starts (playback takes its own MAY_DUCK focus,
-        // so the music never pops up in between).
-        maybeReleaseDictationDuck();
-        // Nick 2026-10-23 v1.46: polite interruption — the sentence is
-        // complete and he's silent; play anything Selena had held.
-        releasePoliteHold();
-    }
-
-    /**
-     * Nick 2026-10-29 v1.69: LOCAL FAST LANE — try to answer a
-     * just-flushed dictation on-device. Returns true when the
-     * sentence was a phone-known question (current time, current
-     * date / day of week — FastLane's exact-match table) AND the
-     * answer was spoken locally; the caller then skips the post
-     * entirely (no double handling).
-     *
-     * Fall-through guarantee: ANY doubt returns false and the
-     * caller posts exactly as before v1.69 — no clear match, or a
-     * match while the speech path is busy. Busy means she is
-     * mid-reply: we never talk over her, and rather than answering
-     * late-and-local the question takes the normal server path,
-     * untouched.
-     *
-     * The match runs on the wake-stripped text: the spotter path
-     * strips before onVoiceInput, but the transcript-fallback path
-     * can carry the wake word into the buffer. Guests never reach
-     * here (the caller routes them first), and noise-held
-     * possibly-cut-off sentences never reach here either —
-     * sendHeldSentence keeps posting those as always, because a
-     * truncated fragment must not be mistaken for a whole question.
-     *
-     * Speech uses speakOnDevice — the same local path as the
-     * drone/guest prompts — so the answer obeys the standing
-     * playback rules: MAY_DUCK focus, mic parked while she talks
-     * (echo guard), single-press pause / double-tap stop via the
-     * ttsSpeaking bookkeeping. The exchange is recorded in
-     * MessageHistory like any other (his side was added by the
-     * caller before the wake-gate check; hers is added here).
-     */
-    private boolean tryLocalFastLane(String sentence) {
-        String answer = FastLane.answerFor(stripWakePrefix(sentence),
-                System.currentTimeMillis());
-        if (answer == null) return false;
-        if (tts == null || !ttsReady || isPlayingAudio() || playing
-                || ttsSpeaking) {
-            log("fastlane: phone-known question matched but the "
-                    + "speech path is busy — posting as usual");
-            return false;
-        }
-        log("fastlane: answered locally — '" + answer + "'");
-        broadcastMessage(answer);
-        MessageHistory.add(answer, null);
-        // Nick 2026-10-30 v1.73: earbuds-only lane armed but no
-        // earbuds — the answer stays WRITTEN in the window and is
-        // not spoken later (a spoken time/date answer goes stale
-        // in minutes; bursting it out on reconnect would be wrong).
-        if (laneBlocked()) {
-            log("lane: fast-lane answer left written (earbuds-only, "
-                    + "no earbuds)");
-            return true;
-        }
-        // Park the drone capture for the utterance, same as the
-        // other local prompts, so she can't transcribe herself.
-        int words = Math.max(1, answer.split("\\s+").length);
-        droneSelfTalkUntilMs = System.currentTimeMillis()
-                + words * 650L + 1200L;
-        ttsSpeaking = true;
-        speakOnDevice(answer, false);
-        return true;
-    }
-
-    /** Nick 2026-10-23 v1.46: popup shows the in-progress sentence. */
-    private void broadcastInProgressSentence() {
-        Intent i = new Intent(ACTION_PARTIAL_INPUT);
-        i.putExtra(EXTRA_TEXT, sentenceBuffer.toString());
-        sendAppBroadcast(i);
-    }
-
-    // ------------------------------------------------------------ v1.64 interruption context (Item 4)
-
-    /**
-     * Nick 2026-10-29 v1.64 (interruption final shape, 14:16–14:20
-     * ruling): when a dictation lands while one of her messages is
-     * PLAYING or PAUSED, the post carries an "interrupts" object so
-     * the responder can run the ruled branch — SAME topic → revise
-     * the message (openly recognized as a revision); OFF topic →
-     * park the new topic in one line, FINISH the original, then take
-     * up the new topic. Heard fraction stays delivered context in
-     * both branches. The app supplies the facts (which row, playing
-     * vs paused, how much was heard, and — when the interrupted
-     * message's text is known on-device, i.e. the TTS path — a
-     * content-word overlap hint); the topic judgment itself is the
-     * responder's, made on the full texts it holds server-side.
-     * Returns null when nothing of hers is in flight.
-     */
-    private String snapshotInterruption(String dictationText) {
-        try {
-            boolean mp3Active = playing || playbackPaused;
-            boolean ttsActive = ttsSpeaking || ttsPaused;
-            if (!mp3Active && !ttsActive) return null;
-            String rowId = currentPlayServerId;
-            if (rowId != null && "priority".equals(rowId)) return null;
-            JSONObject o = new JSONObject();
-            o.put("state", (playbackPaused || ttsPaused) ? "paused" : "playing");
-            if (rowId != null && !rowId.isEmpty()) o.put("rowId", rowId);
-            double heard = -1;
-            if (mp3Active && player != null) {
-                try {
-                    int dur = player.getDuration();
-                    if (dur > 0) {
-                        heard = Math.min(1.0, Math.max(0.0,
-                                (double) player.getCurrentPosition() / dur));
-                    }
-                } catch (Exception ignored) {}
-            } else if (ttsActive && ttsCurrentText != null
-                    && ttsCurrentText.length() > 0) {
-                heard = Math.min(1.0, Math.max(0.0,
-                        (double) ttsResumeAtChar / ttsCurrentText.length()));
-                o.put("topicOverlapHint", String.format(Locale.US, "%.2f",
-                        contentWordOverlap(dictationText, ttsCurrentText)));
-            }
-            if (heard >= 0) {
-                o.put("heardFraction", String.format(Locale.US, "%.2f", heard));
-            }
-            log("interrupt: dictation interrupts her message ("
-                    + o.optString("state") + ", heard="
-                    + o.optString("heardFraction", "?") + ")");
-            return o.toString();
-        } catch (Exception e) {
-            Log.w(TAG, "interrupt snapshot failed", e);
-            return null;
-        }
-    }
-
-    /** Content-word Jaccard overlap (stopwords dropped, naive stem
-     *  by suffix strip). Advisory only — the responder's semantic
-     *  judgment is the branch switch. */
-    static double contentWordOverlap(String a, String b) {
-        java.util.Set<String> sa = contentWords(a);
-        java.util.Set<String> sb = contentWords(b);
-        if (sa.isEmpty() || sb.isEmpty()) return 0;
-        int inter = 0;
-        for (String w : sa) if (sb.contains(w)) inter++;
-        int union = sa.size() + sb.size() - inter;
-        return union == 0 ? 0 : (double) inter / union;
-    }
-
-    private static java.util.Set<String> contentWords(String text) {
-        java.util.Set<String> out = new java.util.HashSet<>();
-        if (text == null) return out;
-        String[] stop = {"the", "a", "an", "and", "or", "but", "to", "of",
-                "in", "on", "for", "with", "is", "are", "was", "were",
-                "it", "that", "this", "i", "you", "we", "they", "he",
-                "she", "do", "does", "did", "have", "has", "had", "be",
-                "been", "at", "by", "from", "as", "if", "then", "so",
-                "just", "about", "what", "when", "where", "who", "how",
-                "why", "can", "could", "would", "will", "should", "not",
-                "no", "yes", "me", "my", "your", "our", "their", "there",
-                "here", "one", "get", "got", "let", "lets"};
-        java.util.Set<String> stops = new java.util.HashSet<>(
-                java.util.Arrays.asList(stop));
-        for (String w : text.toLowerCase(Locale.US)
-                .replaceAll("[^a-z0-9' ]", " ").split("\\s+")) {
-            if (w.length() < 3 || stops.contains(w)) continue;
-            if (w.endsWith("ing") && w.length() > 5) w = w.substring(0, w.length() - 3);
-            else if (w.endsWith("ed") && w.length() > 4) w = w.substring(0, w.length() - 2);
-            else if (w.endsWith("s") && w.length() > 3) w = w.substring(0, w.length() - 1);
-            out.add(w);
-        }
-        return out;
-    }
-
-    /** Called by InputPostTask on background thread. */
-    public void doPostInput(String text) {
-        doPostInput(text, false);
-    }
-
-    /**
-     * Nick 2026-10-28 v1.52: possiblyCutOff carries the noise gate's
-     * verdict — true only when the dictation was held by loud noise
-     * and sent on the 60s no-further-dictation clock. The Siteview
-     * brain (which consumes this later) judges complete-vs-cut-off
-     * from it. Normal dictations post it as false.
-     */
-    public void doPostInput(String text, boolean possiblyCutOff) {
-        doPostInput(text, possiblyCutOff, null);
-    }
-
-    /**
-     * Nick 2026-10-29 v1.62: speakerName binds a dictation to an
-     * enrolled guest (standalone group mode) — the responder
-     * addresses them by name. Null = the signed-in user, as always.
-     * The binding is ALSO posted as a guest_speaking directive
-     * immediately before the dictation (ordering preserved), so it
-     * survives even if a consumer ignores these fields.
-     */
-    public void doPostInput(String text, boolean possiblyCutOff,
-                            String speakerName) {
-        doPostInput(text, possiblyCutOff, speakerName, null);
-    }
-
-    // Rider G1 (Nick, 2026-10-29 ~16:12): the roster as the post
-    // carries it. Transition diffs are logged at DEBUG level only
-    // (Log.d — local, never uploaded, never spoken: inaudible by
-    // design). Computed at post time, so the roster the responder
-    // sees is exactly as fresh as the last post.
-    private final java.util.Set<String> reportedActiveGuests =
-            new java.util.HashSet<>();
-
-    private JSONArray activeGuestsJson() {
-        if (guestProfiles == null) return null;
-        java.util.List<String> names =
-                guestProfiles.activeGuestNames(this);
-        synchronized (reportedActiveGuests) {
-            for (String n : names) {
-                if (!reportedActiveGuests.contains(n)) {
-                    Log.d(TAG, "guests: '" + n + "' active on the roster");
-                }
-            }
-            for (String n : reportedActiveGuests) {
-                if (!names.contains(n)) {
-                    Log.d(TAG, "guests: '" + n
-                            + "' left the active roster (unheard 10 min)");
-                }
-            }
-            reportedActiveGuests.clear();
-            reportedActiveGuests.addAll(names);
-        }
-        JSONArray arr = new JSONArray();
-        for (String n : names) arr.put(n);
-        return arr;
-    }
-
-    /** v1.64: interruptJson (see snapshotInterruption) rides along
-     *  as an "interrupts" object when this dictation interrupted a
-     *  playing/paused message. */
-    public void doPostInput(String text, boolean possiblyCutOff,
-                            String speakerName, String interruptJson) {
-        doPostInput(text, possiblyCutOff, speakerName, interruptJson, false);
-    }
-
-    /** v1.70: expectAnswer (see InputPostTask) — a successful post
-     *  of one of Nick's own conversational dictations arms the
-     *  automatic holding note (armHoldingNote). */
-    public void doPostInput(String text, boolean possiblyCutOff,
-                            String speakerName, String interruptJson,
-                            boolean expectAnswer) {
-        doPostInput(text, possiblyCutOff, speakerName, interruptJson,
-                expectAnswer, false);
-    }
-
-    /** v1.71 (riders G1+G2): justEnrolled marks the enrollment
-     *  sequence's first dictation; every post also carries the
-     *  ACTIVE guest roster (activeGuests) so composed answers know
-     *  who is in the conversation. */
-    public void doPostInput(String text, boolean possiblyCutOff,
-                            String speakerName, String interruptJson,
-                            boolean expectAnswer, boolean justEnrolled) {
-        HttpURLConnection conn = null;
-        try {
-            URL url = new URL(BASE_URL + "/api/selena-voice/input");
-            conn = (HttpURLConnection) url.openConnection();
-            conn.setRequestMethod("POST");
-            conn.setRequestProperty("Content-Type", "application/json");
-            conn.setConnectTimeout(8000);
-            conn.setReadTimeout(8000);
-            conn.setDoOutput(true);
-            JSONObject body = new JSONObject();
-            body.put("text", text);
-            body.put("timestamp", System.currentTimeMillis());
-            body.put("possiblyCutOff", possiblyCutOff);
-            if (speakerName != null) {
-                body.put("speakerName", speakerName);
-                body.put("speakerKind", "guest");
-            }
-            if (justEnrolled) {
-                body.put("justEnrolled", true);
-            }
-            // Rider G1: the ACTIVE guest roster rides on every
-            // dictation post (Nick's and guests' alike).
-            JSONArray roster = activeGuestsJson();
-            if (roster != null && roster.length() > 0) {
-                body.put("activeGuests", roster);
-            }
-            if (interruptJson != null) {
-                body.put("interrupts", new JSONObject(interruptJson));
-            }
-            OutputStream os = null;
-            try {
-                os = conn.getOutputStream();
-                os.write(body.toString().getBytes("UTF-8"));
-            } finally {
-                if (os != null) try { os.close(); } catch (Exception ignored) {}
-            }
-            int code = conn.getResponseCode();
-            log("input posted (" + code + "): " + text
-                    + (speakerName != null
-                            ? " [speaker: guest '" + speakerName + "']" : ""));
-            if (code == 200 || code == 201) {
-                onDictationPostSucceeded();
-                // Nick 2026-10-29 v1.70: the automatic holding note
-                // arms HERE — on proven delivery of one of his own
-                // dictations — never at dispatch (a failed post is
-                // the offline flow's story, not a waiting story).
-                if (expectAnswer) armHoldingNote();
-            }
-            // Nick 2026-10-18 v1.9: the INPUT_SENT broadcast now fires in
-            // onVoiceInput() before the POST, so the log is instant even
-            // when the network is down. Nothing to broadcast here anymore.
-        } catch (Exception e) {
-            Log.w(TAG, "postInput failed", e);
-            onDictationPostFailed(text);
-        } finally {
-            if (conn != null) conn.disconnect();
-        }
-    }
-
-    // ------------------------------------------------------------ v1.65 offline dictation (2026-10-29)
-
-    // Nick 2026-10-29 (14:52–14:56 rulings): when a dictation's
-    // delivery fails because the device is offline —
-    //  1. A PRE-RENDERED clip in Selena's voice plays (bundled asset
-    //     fallback/offline.mp3 — a server render is impossible
-    //     offline): apology + "send it when you're back" + the news
-    //     that the words are held. Once per offline episode.
-    //  2. The dictated text is NOT auto-delivered, ever: it STACKS,
-    //     in spoken order, in an on-device held list (the app's text
-    //     surface), and the USER manually resends when service is
-    //     back. The auto-delivery outbox shape was rejected.
-    //  3. When service reconnects AND held dictations are waiting,
-    //     a second pre-rendered clip announces it by name
-    //     (fallback/reconnected.mp3) — the send itself stays manual.
-    private volatile boolean offlineNoticePlayed = false;
-    private volatile boolean offlineEpisodeActive = false;
-    private android.net.ConnectivityManager.NetworkCallback offlineNetCallback;
-    // v1.66 refinement (Nick 2026-10-29 15:08): the FULL notice
-    // plays once per episode; later failures in the same episode
-    // get only a short confirmation, alternating the two bundled
-    // clips. Timing (15:11): ONE steady-connection window —
-    // STEADY_CONNECTION_MS of continuous connectivity — gates
-    // BOTH the reconnect announcement and the once-flag reset.
-    // A flicker shorter than the window counts as neither; the
-    // episode continues.
-    private volatile boolean shortConfirmAlt = false;
-    private volatile long steadyResetGen = 0;
-    private static final long STEADY_CONNECTION_MS = 7_000;
-
-    private void onDictationPostFailed(String text) {
-        handler.post(() -> {
-            stackUnsentDictation(text);
-            offlineEpisodeActive = true;
-            if (!offlineNoticePlayed) {
-                offlineNoticePlayed = true;
-                playBundledFallback("fallback/offline.mp3",
-                        "offline-notice.mp3");
-                log("offline: dictation held + fallback clip played");
-            } else {
-                shortConfirmAlt = !shortConfirmAlt;
-                if (shortConfirmAlt) {
-                    playBundledFallback("fallback/saved.mp3",
-                            "offline-saved.mp3");
-                } else {
-                    playBundledFallback("fallback/added.mp3",
-                            "offline-added.mp3");
-                }
-                log("offline: dictation stacked + short confirmation");
-            }
-        });
-    }
-
-    private void onDictationPostSucceeded() {
-        if (!offlineEpisodeActive) return;
-        handler.post(this::armSteadyReset);
-    }
-
-    /** Stack into the text box's persisted content, in spoken
-     *  order (newline-joined). NEVER auto-sent — the field is the
-     *  user's to send manually (14:53/14:54 rulings). MainActivity's
-     *  text box reads/writes the same preference. */
-    private void stackUnsentDictation(String text) {
-        try {
-            android.content.SharedPreferences prefs =
-                    getSharedPreferences(PREFS, MODE_PRIVATE);
-            String cur = prefs.getString(PREF_HELD_TEXT, "");
-            String next = (cur == null || cur.trim().isEmpty())
-                    ? text : cur + "\n" + text;
-            prefs.edit().putString(PREF_HELD_TEXT, next).apply();
-            log("offline: text box now holds "
-                    + next.split("\n").length
-                    + " stacked dictation(s) for manual send");
-        } catch (Exception e) {
-            Log.w(TAG, "offline: stack failed", e);
-        }
-    }
-
-    private boolean heldTextWaiting() {
-        try {
-            String cur = getSharedPreferences(PREFS, MODE_PRIVATE)
-                    .getString(PREF_HELD_TEXT, "");
-            return cur != null && !cur.trim().isEmpty();
-        } catch (Exception e) {
-            return false;
-        }
-    }
-
-    /** The steady-connection gate (Nick 2026-10-29 15:11): armed
-     *  on any sign of return (a succeeding post, the network
-     *  callback); after STEADY_CONNECTION_MS of CONTINUOUS
-     *  connectivity it fires BOTH gated behaviors — (a) the
-     *  reconnect announcement, only when held text is waiting,
-     *  and (b) the once-flag reset, so the next episode earns a
-     *  fresh full notice. A loss inside the window invalidates
-     *  the pending gate (onNetworkLost bumps the generation) and
-     *  the episode continues untouched. */
-    private void armSteadyReset() {
-        final long gen = ++steadyResetGen;
-        handler.postDelayed(() -> {
-            if (gen != steadyResetGen) return;
-            if (!isNetworkAvailableNow()) return;
-            if (offlineEpisodeActive && heldTextWaiting()) {
-                playBundledFallback("fallback/reconnected.mp3",
-                        "reconnected-notice.mp3");
-                log("offline: steady connection — reconnect "
-                        + "announcement played (text waiting)");
-            }
-            if (offlineNoticePlayed) {
-                log("offline: steady connection — episode closed; "
-                        + "full notice re-armed");
-            }
-            offlineEpisodeActive = false;
-            offlineNoticePlayed = false;
-        }, STEADY_CONNECTION_MS);
-    }
-
-    private boolean isNetworkAvailableNow() {
-        try {
-            android.net.ConnectivityManager cm =
-                    (android.net.ConnectivityManager)
-                            getSystemService(CONNECTIVITY_SERVICE);
-            if (cm == null) return false;
-            android.net.Network net = cm.getActiveNetwork();
-            if (net == null) return false;
-            android.net.NetworkCapabilities caps =
-                    cm.getNetworkCapabilities(net);
-            return caps != null && caps.hasCapability(
-                    android.net.NetworkCapabilities
-                            .NET_CAPABILITY_INTERNET);
-        } catch (Exception e) {
-            return false;
-        }
-    }
-
-    /** Play a bundled pre-rendered clip through the normal audio
-     *  queue (her player, her gain, no stream writes). */
-    private void playBundledFallback(String assetPath, String cacheName) {
-        // Nick 2026-10-30 v1.73: bundled clips are transient notices
-        // (offline / saved / reconnected) — while the earbuds-only
-        // lane is armed without earbuds they are dropped, never
-        // queued to burst out late. The information itself is not
-        // lost: held text still waits in the text box and the
-        // notification still shows.
-        if (laneBlocked()) {
-            log("lane: bundled clip dropped (earbuds-only, no "
-                    + "earbuds): " + assetPath);
-            return;
-        }
-        try {
-            File out = new File(getCacheDir(), cacheName);
-            try (java.io.InputStream in = getAssets().open(assetPath);
-                 java.io.FileOutputStream fos = new java.io.FileOutputStream(out)) {
-                byte[] buf = new byte[8192];
-                int n;
-                while ((n = in.read(buf)) > 0) fos.write(buf, 0, n);
-            }
-            enqueueAudio(out);
-        } catch (Exception e) {
-            Log.w(TAG, "clips: bundled clip failed: " + assetPath, e);
-        }
-    }
-
-    /** Watch connectivity so the reconnect announcement can fire
-     *  even if no new dictation proves the network is back first. */
-    private void registerOfflineWatcher() {
-        try {
-            android.net.ConnectivityManager cm =
-                    (android.net.ConnectivityManager)
-                            getSystemService(CONNECTIVITY_SERVICE);
-            if (cm == null) return;
-            offlineNetCallback = new OfflineNetworkCallback(this);
-            cm.registerDefaultNetworkCallback(offlineNetCallback);
-        } catch (Exception e) {
-            Log.w(TAG, "offline: watcher registration failed", e);
-        }
-    }
-
-    /** OfflineNetworkCallback: a network came up. */
-    public void onNetworkAvailable() {
-        handler.post(this::armSteadyReset);
-    }
-
-    /** OfflineNetworkCallback: the default network went away. */
-    public void onNetworkLost() {
-        steadyResetGen++; // a loss cancels any pending steady reset
-        offlineEpisodeActive = true;
-    }
-
-    // ------------------------------------------------------------ v1.70 automatic holding note
-
-    // Nick 2026-10-29 15:59: "It should just be automatic from
-    // Selena Voice. You shouldn't have to cue it." The parity
-    // batch's Item 3 put the trigger in the responder's hands (a
-    // helper to run when filing research); at 15:55 his questions
-    // waited ~4 minutes with no note at all, because nobody ran
-    // it. The guarantee now lives HERE, in the app, where it can't
-    // be forgotten:
-    //   - A successful post of one of Nick's own dictations (the
-    //     expectAnswer flag — not fast-lane, not offline-held, not
-    //     guest flows) arms a grace timer.
-    //   - If no answer playback has begun when it expires, the app
-    //     plays the next clip from the LOCALLY BUNDLED rotating
-    //     library (assets/holding/, the same 12 pre-rendered clips
-    //     as the bucket library — a note that waits on a render or
-    //     a download defeats its purpose). The clip promises
-    //     investigation only; the real answer follows as always.
-    //   - The timer dies the moment any of her speech starts
-    //     (queue MP3 or device TTS), on stop/interruption, when
-    //     Nick starts dictating again, and at conversation end.
-    //     Once per dictation: a fresh post re-arms, a fired or
-    //     cancelled note never replays for the same dictation.
-    // The responder helper (~/workspace/bin/selena-holding-note)
-    // still exists as an optional extra on top of this floor.
-    // Nick 2026-10-29 16:04: the grace is 1–2 s — "relatively
-    // immediately." Long enough for a fast answer to beat the
-    // note, short enough that a slow one never feels like silence.
-    private static final long HOLDING_NOTE_GRACE_MS = 1500;
-    private static final int HOLDING_NOTE_COUNT = 12;
-    private static final String PREF_HOLDING_NOTE_IDX = "holding_note_next_idx";
-    private static final String HOLDING_NOTE_CACHE = "holding-note-auto.mp3";
-    private Runnable holdingNoteTask = null;
-    private volatile boolean holdingNoteArmed = false;
-
-    /** Runs on the posting thread (doPostInput success) — hops to
-     *  the main handler, where all timer state lives. */
-    private void armHoldingNote() {
-        handler.post(() -> {
-            cancelHoldingNoteTask();
-            holdingNoteArmed = true;
-            holdingNoteTask = this::fireHoldingNote;
-            handler.postDelayed(holdingNoteTask, HOLDING_NOTE_GRACE_MS);
-            log("holdingnote: armed (" + HOLDING_NOTE_GRACE_MS + " ms grace)");
-        });
-    }
-
-    private void cancelHoldingNoteTask() {
-        if (holdingNoteTask != null) {
-            handler.removeCallbacks(holdingNoteTask);
-            holdingNoteTask = null;
-        }
-        holdingNoteArmed = false;
-    }
-
-    /** Retire a pending note (no-op when none is pending). */
-    private void cancelHoldingNote(String reason) {
-        if (!holdingNoteArmed && holdingNoteTask == null) return;
-        handler.post(() -> {
-            if (!holdingNoteArmed && holdingNoteTask == null) return;
-            cancelHoldingNoteTask();
-            log("holdingnote: cancelled (" + reason + ")");
-        });
-    }
-
-    /** Drop a fired-but-still-queued note file: her real answer is
-     *  starting, and a stale "hold on" must never play after it. */
-    private void purgeQueuedHoldingNote() {
-        synchronized (audioQueue) {
-            audioQueue.removeIf(
-                    f -> HOLDING_NOTE_CACHE.equals(f.getName()));
-        }
-    }
-
-    private void fireHoldingNote() {
-        holdingNoteTask = null;
-        if (!holdingNoteArmed || destroyed) return;
-        holdingNoteArmed = false;
-        // v1.72: never talk into his phone call — a note that comes
-        // due mid-call is simply skipped (the answer itself will
-        // still queue and play under the normal rules).
-        if (phoneCallMuted) {
-            log("holdingnote: skipped at fire time (phone call in progress)");
-            return;
-        }
-        // v1.73: earbuds-only lane armed but no earbuds — the note
-        // is DROPPED for this dictation, never queued: a stale
-        // "hold on" must not burst out when the earbuds connect.
-        // (Lane ENGAGED: the note plays through the lane normally.)
-        if (laneBlocked()) {
-            log("lane: holding note dropped (earbuds-only, no earbuds)");
-            return;
-        }
-        // The moment has passed if anything is already on its way
-        // to his ears, if he's talking again, or if the polite gate
-        // would only park the note behind his pause to go stale.
-        if (isPlayingAudio() || nickSpeaking || politeHoldActive()) {
-            log("holdingnote: skipped at fire time (speech/playback active)");
-            return;
-        }
-        synchronized (audioQueue) {
-            if (!audioQueue.isEmpty()) {
-                log("holdingnote: skipped at fire time (answer already queued)");
-                return;
-            }
-        }
-        int idx;
-        try {
-            android.content.SharedPreferences prefs =
-                    getSharedPreferences(PREFS, MODE_PRIVATE);
-            idx = prefs.getInt(PREF_HOLDING_NOTE_IDX, 0);
-            if (idx < 0 || idx >= HOLDING_NOTE_COUNT) idx = 0;
-            prefs.edit().putInt(PREF_HOLDING_NOTE_IDX,
-                    (idx + 1) % HOLDING_NOTE_COUNT).apply();
-        } catch (Exception e) {
-            idx = 0;
-        }
-        String asset = "holding/holding-note-"
-                + (idx + 1 < 10 ? "0" : "") + (idx + 1) + ".mp3";
-        playBundledFallback(asset, HOLDING_NOTE_CACHE);
-        log("holdingnote: played clip " + (idx + 1) + " after "
-                + HOLDING_NOTE_GRACE_MS + "ms (no answer yet)");
-    }
-
-    // ------------------------------------------------------------ v1.52 gate machinery
-
-    private long gateNow() {
-        return android.os.SystemClock.uptimeMillis();
-    }
-
-    /** Starts the 250ms gate evaluation loop (idempotent). */
-    private void startGateWatchdog() {
-        if (gateTickTask != null) return;
-        gateTickTask = () -> {
-            gateTick();
-            if (!destroyed) handler.postDelayed(gateTickTask, GATE_TICK_MS);
-        };
-        handler.postDelayed(gateTickTask, GATE_TICK_MS);
-    }
-
-    /**
-     * True when the recognizer's live RMS window reads as machine
-     * drone: loud (mean at/above the ADAPTIVE kill line — baseline
-     * + margin, bounded; see the v1.70 constants) AND steady
-     * (variation at/below GATE_STEADY_STD_DB) over a fresh,
-     * sufficiently long window. Speech fails the steadiness test
-     * by nature.
-     */
-    public boolean samplerSeesDrone() {
-        if (recognitionListener == null) return false;
-        float[] s = recognitionListener.samplerStats();
-        if (s[3] < 1f) return false;      // stale window — between sessions
-        if (s[2] < 700f) return false;    // not enough signal to judge
-        return s[0] >= gateKillLineDb() && s[1] <= GATE_STEADY_STD_DB;
-    }
-
-    /** The current adaptive kill line (recognizer scale). */
-    private float gateKillLineDb() {
-        float line = gateAmbientBaselineDb + GATE_KILL_MARGIN_DB;
-        if (line < GATE_KILL_LINE_MIN_DB) line = GATE_KILL_LINE_MIN_DB;
-        if (line > GATE_KILL_LINE_MAX_DB) line = GATE_KILL_LINE_MAX_DB;
-        return line;
-    }
-
-    /** Restore the persisted ambient baseline (v1.70). A fresh
-     *  value is trusted as-is; a stale one (older than
-     *  GATE_BASELINE_STALE_MS) decays halfway toward the default —
-     *  yesterday's shop shouldn't deafen this morning's kitchen,
-     *  and the default itself reproduces the pre-v1.70 line. */
-    private void loadGateBaseline() {
-        try {
-            android.content.SharedPreferences prefs =
-                    getSharedPreferences(PREFS, MODE_PRIVATE);
-            if (!prefs.contains(PREF_GATE_BASELINE)) {
-                log("gate: no stored ambient baseline — starting at default "
-                        + GATE_BASELINE_DEFAULT_DB + " dB (kill line "
-                        + gateKillLineDb() + " dB)");
-                return;
-            }
-            float stored = prefs.getFloat(PREF_GATE_BASELINE,
-                    GATE_BASELINE_DEFAULT_DB);
-            long age = System.currentTimeMillis()
-                    - prefs.getLong(PREF_GATE_BASELINE_MS, 0);
-            if (age > GATE_BASELINE_STALE_MS) {
-                stored = stored + (GATE_BASELINE_DEFAULT_DB - stored) * 0.5f;
-                log("gate: stored ambient baseline stale ("
-                        + (age / 3600000L) + "h) — decayed halfway to default");
-            }
-            if (stored < GATE_BASELINE_MIN_DB) stored = GATE_BASELINE_MIN_DB;
-            if (stored > GATE_BASELINE_MAX_DB) stored = GATE_BASELINE_MAX_DB;
-            gateAmbientBaselineDb = stored;
-            gateAmbientLastSaved = stored;
-            log(String.format(Locale.US,
-                    "gate: ambient baseline restored %.1f dB, kill line %.1f dB",
-                    gateAmbientBaselineDb, gateKillLineDb()));
-        } catch (Exception e) {
-            Log.w(TAG, "gate: baseline load failed", e);
-        }
-    }
-
-    private void saveGateBaseline() {
-        try {
-            getSharedPreferences(PREFS, MODE_PRIVATE).edit()
-                    .putFloat(PREF_GATE_BASELINE, gateAmbientBaselineDb)
-                    .putLong(PREF_GATE_BASELINE_MS,
-                            System.currentTimeMillis())
-                    .apply();
-            gateAmbientLastSaved = gateAmbientBaselineDb;
-            gateAmbientSaveTicks = 0;
-        } catch (Exception e) {
-            Log.w(TAG, "gate: baseline save failed", e);
-        }
-    }
-
-    /**
-     * Feed the ambient baseline one gate tick (v1.70). Called only
-     * in the AMBIENT state with the recognizer live and the mic not
-     * muted for playback. A tick teaches only when the window is
-     * fresh, Nick is not speaking (and hasn't for a short tail —
-     * his voice is never ambient), and nothing of hers is playing.
-     * Eligible windows must be STEADY or plainly QUIETER than the
-     * baseline; the step is EMA-smoothed and rate-clamped, so the
-     * baseline tracks the day over tens of seconds and cannot be
-     * dragged by a door slam, a shout, or a single loud second.
-     */
-    private void maybeLearnAmbientBaseline() {
-        if (recognitionListener == null || isPlayingAudio()) return;
-        if (nickSpeaking) {
-            gateAmbientLastSpeechMs = gateNow();
-            return;
-        }
-        if (gateNow() - gateAmbientLastSpeechMs
-                < GATE_AMBIENT_SPEECH_TAIL_MS) return;
-        float[] s = recognitionListener.samplerStats();
-        if (s[3] < 1f || s[2] < 700f) return; // stale / too little signal
-        boolean steady = s[1] <= GATE_AMBIENT_LEARN_STD_DB;
-        boolean quiet = s[0] < gateAmbientBaselineDb - 6f;
-        if (!steady && !quiet) return;
-        float step = (s[0] - gateAmbientBaselineDb) * GATE_AMBIENT_ALPHA;
-        if (step > GATE_AMBIENT_MAX_STEP_DB) step = GATE_AMBIENT_MAX_STEP_DB;
-        if (step < -GATE_AMBIENT_MAX_STEP_DB) step = -GATE_AMBIENT_MAX_STEP_DB;
-        gateAmbientBaselineDb += step;
-        if (gateAmbientBaselineDb < GATE_BASELINE_MIN_DB) {
-            gateAmbientBaselineDb = GATE_BASELINE_MIN_DB;
-        }
-        if (gateAmbientBaselineDb > GATE_BASELINE_MAX_DB) {
-            gateAmbientBaselineDb = GATE_BASELINE_MAX_DB;
-        }
-        if (gateNow() - gateBaselineLogMs > 20000) {
-            gateBaselineLogMs = gateNow();
-            log(String.format(Locale.US,
-                    "gate: baseline %.1f dB, kill line %.1f dB",
-                    gateAmbientBaselineDb, gateKillLineDb()));
-        }
-        if (++gateAmbientSaveTicks >= 200
-                || Math.abs(gateAmbientBaselineDb - gateAmbientLastSaved)
-                        >= 1.0f) {
-            saveGateBaseline();
-        }
-    }
-
-    /**
-     * Nick 2026-10-28 v1.52: consulted by ServiceRecognitionListener
-     * before accepting a result — while the gate is killed, or while
-     * the live window reads as drone at this moment, recognizer
-     * "results" are the machine talking, not the user.
-     */
-    public boolean isGateDroneActiveNow() {
-        if (gateState == GATE_KILLED || gateState == GATE_DRONE) return true;
-        if (gateDisabled || gateBypassSession) return false;
-        return samplerSeesDrone();
-    }
-
-    /**
-     * Gate evaluation, every 250ms. Only the AMBIENT side lives here
-     * (KILLED exits are driven by probes). Any exception disables the
-     * gate — spec §4.4: fall back to plain recognizer behavior.
-     */
-    private void gateTick() {
-        if (destroyed || gateDisabled) return;
-        try {
-            if (gateState == GATE_KILLED) return; // probes drive exits
-            if (gateState == GATE_DRONE) return; // the drone session drives exits
-            if (!recognizerActive || recognizer == null || micMutedForPlayback) {
-                gateDroneSinceMs = 0;
-                return;
-            }
-            if (gateBypassSession) {
-                // Override session (§4.1): the gate stays out of the
-                // way until the drone has been gone a while, then it
-                // quietly resumes duty for the next noise event.
-                if (!samplerSeesDrone()) {
-                    if (gateDroneAbsentSinceMs == 0) {
-                        gateDroneAbsentSinceMs = gateNow();
-                    } else if (gateNow() - gateDroneAbsentSinceMs > 5000) {
-                        gateBypassSession = false;
-                        gateDroneAbsentSinceMs = 0;
-                        log("gate: override session over — gate back on duty");
-                    }
-                } else {
-                    gateDroneAbsentSinceMs = 0;
-                }
-                return;
-            }
-            if (gateNow() < gateGraceUntilMs) {
-                gateDroneSinceMs = 0;
-                return;
-            }
-            // v1.70: every ambient tick first FEEDS the learned
-            // baseline (steady/quiet, non-speech windows only), so
-            // the drone test below judges against the room as it is
-            // today, not a line compiled for one room in October.
-            maybeLearnAmbientBaseline();
-            boolean droneNow = samplerSeesDrone();
-            if (droneNow) {
-                // Nick 2026-10-28 v1.53: the drone is a free NOISE
-                // profile sample (§5: the system learns two profiles).
-                // Throttled — a mower offers the same lesson for hours.
-                vpDroneSeenMs = gateNow();
-                if (voiceprint != null && gateNow() - vpLastNoiseFeedMs > 5000) {
-                    vpLastNoiseFeedMs = gateNow();
-                    float[] nf = recognitionListener.samplerTraceFeatures();
-                    if (nf != null) voiceprint.learnNoiseRecog(nf, 1.0);
-                }
-            }
-            if (droneNow) {
-                if (gateDroneSinceMs == 0) {
-                    gateDroneSinceMs = gateNow();
-                } else if (gateNow() - gateDroneSinceMs >= GATE_KILL_SUSTAIN_MS) {
-                    // Nick 2026-10-29 v1.61: extraction first — if
-                    // the drone pipeline is ready, the session stays
-                    // alive over the machine; the kill is the
-                    // fallback, not the default.
-                    if (!tryEnterDroneMode()) enterGateKill();
-                }
-            } else {
-                gateDroneSinceMs = 0;
-            }
-        } catch (Exception e) {
-            disableGate("tick failed: " + e);
-        }
-    }
-
-    /**
-     * Loud + steady sustained past the kill timing → KILLED. The
-     * recognizer session is cancelled and launchRecognizer() refuses
-     * to relaunch while killed: nothing is recorded or sent. If real
-     * accepted dictation is buffered, this becomes a noise HOLD
-     * instead — pause-and-remember, never discard (§3).
-     */
-    private void enterGateKill() {
-        gateState = GATE_KILLED;
-        gateDroneSinceMs = 0;
-        gateDroneBaselineDbfs = Float.NaN;
-        gateProbeCount = 0;
-        gateProbeDropCount = 0;
-        boolean holding = sentenceBuffer.length() > 0;
-        if (holding) {
-            noiseHoldActive = true;
-            bufferCutOffFlag = true;
-            if (sentenceFlushTask != null) {
-                handler.removeCallbacks(sentenceFlushTask);
-                sentenceFlushTask = null;
-            }
-            armNoiseHoldTimer();
-            log("gate: loud steady noise — dictation PAUSED and held ("
-                    + sentenceBuffer.length() + " chars kept)"
-                    + String.format(Locale.US,
-                            " [baseline %.1f dB, kill line %.1f dB]",
-                            gateAmbientBaselineDb, gateKillLineDb()));
-        } else {
-            log("gate: loud steady noise — recognizer killed, nothing recorded"
-                    + String.format(Locale.US,
-                            " [baseline %.1f dB, kill line %.1f dB]",
-                            gateAmbientBaselineDb, gateKillLineDb()));
-        }
-        saveGateBaseline();
-        // Cancel the in-flight session: the "utterance" in progress is
-        // the drone itself. Its error callback routes to
-        // onRecognizerDone, whose restarts launchRecognizer() then
-        // suppresses — the recognizer stays off until a probe re-arms
-        // or the user overrides.
-        if (recognizer != null) {
-            try { recognizer.cancel(); } catch (Exception ignored) {}
-        }
-        nickSpeaking = false;
-        updateNotification(holding
-                ? "🚜 Paused — loud noise (dictation held)"
-                : "🚜 Paused — loud noise");
-        broadcastListeningState();
-        scheduleGateProbe(300);
-    }
-
-    /** (Re)arm the 60s noise clock for a held dictation (§3). */
-    private void armNoiseHoldTimer() {
-        if (noiseHoldSendTask != null) handler.removeCallbacks(noiseHoldSendTask);
-        noiseHoldSendTask = () -> sendHeldSentence();
-        handler.postDelayed(noiseHoldSendTask, NOISE_HOLD_SEND_MS);
-    }
-
-    /**
-     * The 60s noise clock fired with no further dictation: send the
-     * held dictation now, flagged possiblyCutOff for the brain.
-     */
-    private void sendHeldSentence() {
-        noiseHoldSendTask = null;
-        if (!noiseHoldActive) return;
-        noiseHoldActive = false;
-        bufferCutOffFlag = false;
-        if (sentenceBuffer.length() == 0) return;
-        String sentence = sentenceBuffer.toString();
-        sentenceBuffer.setLength(0);
-        // v1.62: a new-voice candidate rode the noise hold — the ask
-        // owns this sentence now, not the 60s send.
-        if (bufferNewVoiceCandidate && pendingGuestSentence == null) {
-            bufferNewVoiceCandidate = false;
-            startNewVoiceFlow(sentence);
-            return;
-        }
-        log("gate: 60s with no further dictation — sending held dictation"
-                + " flagged possiblyCutOff");
-        MessageHistory.addNick(sentence);
-        Intent sent = new Intent(ACTION_INPUT_SENT);
-        sent.putExtra(EXTRA_TEXT, sentence);
-        sendAppBroadcast(sent);
-        // Nick 2026-10-29 v1.60: a noise-held dictation BYPASSES the
-        // wake gate (the §3 60-second send is a promise — the words
-        // were dictated inside a live exchange the drone interrupted).
-        // It also re-opens/extends the wake conversation: the exchange
-        // it belongs to is still live.
-        if (wakeSpotter != null && wakeSpotterReady && !wakeSpotterFailed
-                && !wakeConvoOpen && isAlwaysListening()) {
-            openWakeConversation("noise-hold");
-        } else {
-            noteWakeConversationActivity();
-        }
-        final String heldSpk = bufferGuestName;
-        bufferGuestName = null;
-        // v1.64 earbud mode: same private-relay rule as the normal
-        // flush — a known guest's noise-held words relay, never post.
-        if (heldSpk != null && isEarbudsConnected()) {
-            postGuestDirective("guest_relay", heldSpk, null, sentence);
-            log("guests(earbuds): known guest '" + heldSpk
-                    + "' (noise-held) — private relay only");
-        } else {
-            if (heldSpk != null) {
-                postGuestDirective("guest_speaking", heldSpk, null, sentence);
-            }
-            new Thread(new InputPostTask(this, sentence, true, heldSpk,
-                    snapshotInterruption(sentence))).start();
-        }
-        // Nick 2026-10-29 v1.59: held dictation sent, buffer empty —
-        // release the duck (the watchdog would stale-release anyway;
-        // this is the prompt path).
-        maybeReleaseDictationDuck();
-        releasePoliteHold();
-    }
-
-    // ------------------------------------------------------------ gate probes (KILLED side)
-
-    private void scheduleGateProbe(long delayMs) {
-        if (gateState != GATE_KILLED || destroyed) return;
-        if (gateProbeScheduleTask != null) {
-            handler.removeCallbacks(gateProbeScheduleTask);
-        }
-        gateProbeScheduleTask = () -> runGateProbe();
-        handler.postDelayed(gateProbeScheduleTask, delayMs);
-    }
-
-    private void runGateProbe() {
-        gateProbeScheduleTask = null;
-        if (gateState != GATE_KILLED || destroyed || gateDisabled) return;
-        // Selena's own voice over the speaker would read as a speech
-        // burst — never probe while she is audible.
-        // v1.72: never probe during a phone call either — a probe is
-        // a mic capture, and the call owns the mic.
-        if (isPlayingAudio() || micMutedForPlayback || phoneCallMuted) {
-            scheduleGateProbe(800);
-            return;
-        }
-        if (gateProbeInFlight) {
-            scheduleGateProbe(400);
-            return;
-        }
-        gateProbeInFlight = true;
-        new Thread(new GateProbeTask(this)).start();
-    }
-
-    /** Called by GateProbeTask on its worker thread. */
-    public void onGateProbeResult(float meanDbfs, float stdDb,
-                                  float peakDbfs, float zcr, float bright,
-                                  boolean ok, float[] spectrum) {
-        handler.post(() -> handleGateProbeResult(
-                meanDbfs, stdDb, peakDbfs, zcr, bright, ok, spectrum));
-    }
-
-    private void handleGateProbeResult(float meanDbfs, float stdDb,
-                                       float peakDbfs, float zcr, float bright,
-                                       boolean ok, float[] spectrum) {
-        gateProbeInFlight = false;
-        if (gateState != GATE_KILLED || destroyed) return;
-        if (!ok) {
-            // Spec §4.4: sampler failure → plain recognizer behavior.
-            disableGate("mic probe failed");
-            return;
-        }
-        try {
-            float[] probeFeats = new float[]{meanDbfs, stdDb, peakDbfs, zcr, bright};
-            // Nick 2026-10-28 v1.53: the voiceprint booster at the
-            // probe gate (§5/§4.3). When confirmed bursts have taught
-            // the probe-domain voice profile what the user sounds like
-            // over a drone, a burst that matches it (and doesn't match
-            // the drone) earns RELAXED thresholds. A non-match changes
-            // nothing — the standard thresholds judge it, exactly as
-            // before the voiceprint existed.
-            boolean vpBoost = voiceprint != null
-                    && voiceprint.probeBoostApplies(probeFeats);
-            float burstStd = vpBoost ? 2.0f : GATE_PROBE_BURST_STD_DB;
-            float burstPeakMargin = vpBoost ? 3.5f : GATE_PROBE_BURST_PEAK_DB;
-            // Re-arm B (§3): a speech-shaped burst riding clearly above
-            // the learned drone baseline. Judged BEFORE this sample can
-            // move the baseline. Before a baseline exists, only an
-            // unmistakably loud + varied probe counts.
-            boolean burst;
-            if (gateProbeCount >= 2 && !Float.isNaN(gateDroneBaselineDbfs)) {
-                burst = stdDb >= burstStd
-                        && peakDbfs >= gateDroneBaselineDbfs + burstPeakMargin;
-            } else {
-                burst = stdDb >= burstStd && meanDbfs >= -20f;
-            }
-            if (burst) {
-                if (vpBoost) {
-                    log("voiceprint: probe boost — voice-like burst over the drone, thresholds relaxed");
-                }
-                // Remember this burst: if a real dictation lands
-                // within the confirm window, it was the user, and the
-                // probe-domain voice profile learns from it (§5).
-                vpPendingBurstFeats = probeFeats;
-                vpBurstConfirmUntilMs = gateNow() + 12000;
-                exitGateKill("speech burst over the drone");
-                return;
-            }
-            // Learn / drift-track the drone baseline. The first probes
-            // set it; afterwards only near-baseline samples move it, so
-            // a level drop cannot drag it down and mask itself.
-            if (gateProbeCount < 3 || Float.isNaN(gateDroneBaselineDbfs)) {
-                gateDroneBaselineDbfs = Float.isNaN(gateDroneBaselineDbfs)
-                        ? meanDbfs
-                        : (gateDroneBaselineDbfs * gateProbeCount + meanDbfs)
-                                / (gateProbeCount + 1);
-            } else if (Math.abs(meanDbfs - gateDroneBaselineDbfs) < 3f) {
-                gateDroneBaselineDbfs =
-                        gateDroneBaselineDbfs * 0.9f + meanDbfs * 0.1f;
-            }
-            // Nick 2026-10-28 v1.53: near-baseline probes are the
-            // drone itself — teach the probe-domain NOISE profile
-            // (§5's second profile, device/environment, outside the
-            // per-user wall).
-            if (voiceprint != null && !Float.isNaN(gateDroneBaselineDbfs)
-                    && Math.abs(meanDbfs - gateDroneBaselineDbfs) < 3f) {
-                voiceprint.learnNoiseProbe(probeFeats,
-                        gateProbeCount < 3 ? 0.7 : 1.0);
-            }
-            // Nick 2026-10-29 v1.61 (13:17): near-baseline probes are
-            // the machine itself — teach the MACHINE-PROFILE library
-            // from their spectra (distinct profile per machine), and
-            // once the drone is confirmed + a baseline exists, hand
-            // the session UP to Drone Dictation if the extraction
-            // pipeline is ready: capture stays alive instead of the
-            // recognizer sitting dead until a re-arm.
-            if (machineProfiles != null && spectrum != null
-                    && !Float.isNaN(gateDroneBaselineDbfs)
-                    && Math.abs(meanDbfs - gateDroneBaselineDbfs) < 3f
-                    && (gateProbeCount < 3 || gateProbeCount % 3 == 0)) {
-                boolean[] created = new boolean[1];
-                MachineProfiles.Profile mp = machineProfiles.matchOrCreate(
-                        this, machineUserKey(), spectrum, created);
-                if (mp != null) {
-                    // Nick 2026-10-29 v1.70 (13:11 ruling): a known
-                    // machine's STORED LEVEL anchors this episode —
-                    // read it before today's probe can move it, seed
-                    // the still-forming drone baseline from it, then
-                    // teach the profile today's level. Mower-on /
-                    // blades-on noise IS the baseline condition while
-                    // it runs; a recognized machine says how loud
-                    // that condition is from the first probes.
-                    double storedLevel = mp.levelDbfs;
-                    machineProfiles.noteLevel(this, machineUserKey(),
-                            mp.id, meanDbfs);
-                    if (!created[0] && gateProbeCount < 3
-                            && !Double.isNaN(storedLevel)
-                            && Math.abs((float) storedLevel
-                                    - gateDroneBaselineDbfs) > 0.5f) {
-                        gateDroneBaselineDbfs = (float) storedLevel;
-                        log("gate: machine anchor — '" + mp.name
-                                + "' stored level " + storedLevel
-                                + " dBFS seeds the drone baseline");
-                    }
-                }
-                if (droneReady && gateProbeCount >= 3
-                        && tryEnterDroneMode()) {
-                    return; // drone session owns the mic now
-                }
-            }
-            gateProbeCount++;
-            // Re-arm A (§3): the level fell well below the drone
-            // baseline and stayed there — the machine stopped.
-            if (gateProbeCount >= 3
-                    && meanDbfs <= gateDroneBaselineDbfs - GATE_PROBE_DROP_DB) {
-                gateProbeDropCount++;
-                if (gateProbeDropCount >= 2) {
-                    exitGateKill("noise stopped");
-                    return;
-                }
-            } else {
-                gateProbeDropCount = 0;
-            }
-            scheduleGateProbe(GATE_PROBE_INTERVAL_MS);
-        } catch (Exception e) {
-            disableGate("probe handling failed: " + e);
-        }
-    }
-
-    /**
-     * Leave KILLED: recognizer restarts (unless muted for playback),
-     * the gate gets a short grace period so a dictation in flow is
-     * never instantly re-killed, and a held dictation gets a fresh
-     * 60s noise clock for its continuation.
-     */
-    private void exitGateKill(String reason) {
-        if (gateState != GATE_KILLED) return;
-        gateState = GATE_AMBIENT;
-        gateDroneSinceMs = 0;
-        gateGraceUntilMs = gateNow() + 6000;
-        if (gateProbeScheduleTask != null) {
-            handler.removeCallbacks(gateProbeScheduleTask);
-            gateProbeScheduleTask = null;
-        }
-        log("gate: re-armed (" + reason + ")"
-                + (noiseHoldActive ? " — held dictation resumes" : ""));
-        // Nick 2026-10-29 v1.61: the level just dropped near ambient
-        // after a machine run — if that machine is still unnamed,
-        // this is the ruled moment to ask its name (13:21/13:25).
-        if ("noise stopped".equals(reason)) maybeAskMachineName();
-        if (noiseHoldActive) armNoiseHoldTimer();
-        updateNotification("🎤 Listening…");
-        broadcastListeningState();
-        if (recognizerActive && !micMutedForPlayback && !destroyed
-                && !phoneCallMuted) {
-            restartRecognizerNow();
-        }
-    }
-
-    // ------------------------------------------------------------ v1.61 drone dictation (extraction over a running machine)
-
-    /** Profile the playful during-drone line fired for this run (-1 = not fired). */
-    private int duringLineProfileId = -1;
-
-    private String machineUserKey() {
-        try {
-            return SupabaseAuth.userKey(this);
-        } catch (Exception e) {
-            return null;
-        }
-    }
-
-    /**
-     * Background prep: fetch the ASR model (43.6 MB checksummed
-     * download into app-private storage — never baked into the APK)
-     * and build the extraction session when it's verified. Until
-     * droneReady flips, the gate behaves exactly as v1.60.
-     */
-    private void initDroneAsync() {
-        fetchUserDisplayNameAsync();
-        final android.content.Context app = getApplicationContext();
-        DroneModelStore.ensureAsync(app, () -> {
-            if (destroyed) return;
-            try {
-                if (!DroneModelStore.isReady(app)) {
-                    log("drone: ASR model unavailable — extraction stays off (gate unchanged)");
-                    return;
-                }
-                DroneSession s = new DroneSession(VoiceService.this,
-                        machineProfiles);
-                if (s.init(app)) {
-                    droneSession = s;
-                    droneReady = true;
-                    log("drone: extraction pipeline READY (own capture + spectral suppression + streaming zipformer)");
-                } else {
-                    log("drone: ASR session init failed — extraction stays off (gate unchanged)");
-                }
-            } catch (Exception e) {
-                log("drone: init failed: " + e);
-            }
-        });
-    }
-
-    /**
-     * Nick's order (2026-10-29): extraction active + session alive
-     * OVER the kill. Called from the gate tick (instead of
-     * enterGateKill) and from the KILLED-side probes (upgrade once a
-     * drone is confirmed). Returns false — caller falls back to the
-     * kill — whenever the pipeline isn't ready.
-     */
-    private boolean tryEnterDroneMode() {
-        if (!droneReady || droneSession == null || destroyed) return false;
-        if (gateState == GATE_DRONE) return true;
-        if (gateDisabled || gateBypassSession) return false;
-        if (gateState == GATE_KILLED && gateProbeScheduleTask != null) {
-            handler.removeCallbacks(gateProbeScheduleTask);
-            gateProbeScheduleTask = null;
-        }
-        enterDroneMode();
-        return gateState == GATE_DRONE;
-    }
-
-    /** Mirrors enterGateKill's holding bookkeeping exactly. */
-    private void enterDroneMode() {
-        gateState = GATE_DRONE;
-        gateDroneSinceMs = 0;
-        duringLineProfileId = -1;
-        boolean holding = sentenceBuffer.length() > 0;
-        if (holding) {
-            noiseHoldActive = true;
-            bufferCutOffFlag = true;
-            if (sentenceFlushTask != null) {
-                handler.removeCallbacks(sentenceFlushTask);
-                sentenceFlushTask = null;
-            }
-            armNoiseHoldTimer();
-            log("drone: loud steady noise — extraction takes the mic ("
-                    + sentenceBuffer.length() + " chars held)");
-        } else {
-            log("drone: loud steady noise — extraction takes the mic");
-        }
-        if (recognizer != null) {
-            try { recognizer.cancel(); } catch (Exception ignored) {}
-        }
-        nickSpeaking = false;
-        gateProbeInFlight = false;
-        updateNotification("🚜 Listening over the noise…");
-        broadcastListeningState();
-        droneSession.beginCapture(machineUserKey());
-    }
-
-    /** Mirrors exitGateKill: grace window, recognizer back, naming ask. */
-    private void exitDroneMode(String reason) {
-        if (gateState != GATE_DRONE) return;
-        if (droneSession != null) droneSession.endCapture();
-        gateState = GATE_AMBIENT;
-        gateDroneSinceMs = 0;
-        gateGraceUntilMs = gateNow() + 6000;
-        if ("manual override".equals(reason)) {
-            gateBypassSession = true;
-            gateDroneAbsentSinceMs = 0;
-        }
-        log("drone: extraction ended (" + reason + ")"
-                + (noiseHoldActive ? " — held dictation resumes" : ""));
-        if ("noise stopped".equals(reason)) maybeAskMachineName();
-        if (noiseHoldActive) armNoiseHoldTimer();
-        updateNotification("🎤 Listening…");
-        broadcastListeningState();
-        if (recognizerActive && !micMutedForPlayback && !destroyed
-                && !phoneCallMuted) {
-            restartRecognizerNow();
-        }
-    }
-
-    /** DroneSession polls this: park capture while she's talking or we're gone. */
-    public boolean droneSessionParked() {
-        return destroyed || isPlayingAudio() || micMutedForPlayback
-                || phoneCallMuted
-                || System.currentTimeMillis() < droneSelfTalkUntilMs;
-    }
-
-    /**
-     * The extraction pipeline failed mid-run: fall back to the exact
-     * v1.60 kill bookkeeping (held text keeps its 60 s promise; the
-     * probe cadence takes over from here).
-     */
-    public void onDroneFailed(String why) {
-        handler.post(() -> {
-            if (gateState != GATE_DRONE) return;
-            log("drone: pipeline failed (" + why
-                    + ") — falling back to the gate kill");
-            if (droneSession != null) droneSession.endCapture();
-            gateState = GATE_KILLED;
-            gateProbeCount = 0;
-            gateProbeDropCount = 0;
-            gateDroneBaselineDbfs = Float.NaN;
-            updateNotification(noiseHoldActive
-                    ? "🚜 Paused — loud noise (dictation held)"
-                    : "🚜 Paused — loud noise");
-            broadcastListeningState();
-            scheduleGateProbe(300);
-        });
-    }
-
-    /** DroneSession saw the level drop near ambient: the run is over. */
-    public void onDroneGone(int profileId) {
-        handler.post(() -> {
-            if (gateState != GATE_DRONE) return;
-            exitDroneMode("noise stopped");
-        });
-    }
-
-    public void onDronePartial(String text) {
-        handler.post(() -> {
-            if (gateState != GATE_DRONE || text == null) return;
-            onPartialVoiceInput(text);
-        });
-    }
-
-    /**
-     * A finished utterance from the drone ASR. Feeds the EXISTING
-     * acceptance path (sentence buffer, wake gating, POST) unchanged
-     * — plus the two drone-only extras: a during-drone naming answer
-     * is consumed as a name, and the raw-branch probe features teach
-     * the SEPARATE drone-domain voice profile (never the platform
-     * voiceprint — different measurement domain).
-     */
-    public void onDroneDictation(String text, float[] feats) {
-        handler.post(() -> {
-            if (text == null || text.trim().isEmpty()) return;
-            acquireDictationDuck(); // capture is live — music fades (v1.59 rule)
-            String trimmed = text.trim();
-            // 13:28: an answer to the during-drone line names the
-            // machine on the spot — short, prefix-shaped ("it's the
-            // mower", "the blower") while that line fired this run.
-            if (gateState == GATE_DRONE && machineProfiles != null
-                    && duringLineProfileId >= 0 && droneSession != null
-                    && droneSession.activeProfileId() == duringLineProfileId) {
-                MachineProfiles.Profile p = machineProfiles.get(
-                        this, machineUserKey(), duringLineProfileId);
-                String low = trimmed.toLowerCase(Locale.US);
-                if (p != null && !p.named
-                        && trimmed.split("\\s+").length <= 4
-                        && (low.startsWith("it's ") || low.startsWith("it is ")
-                                || low.startsWith("that's ")
-                                || low.startsWith("that is ")
-                                || low.startsWith("the "))) {
-                    String name = cleanMachineName(trimmed);
-                    if (!name.isEmpty()) {
-                        machineProfiles.rename(this, machineUserKey(),
-                                p.id, name);
-                        log("drone: machine " + p.id + " named '" + name
-                                + "' (during-drone answer)");
-                        updateNotification("🚜 Got it — that was the " + name);
-                        if (pendingNameProfileId == p.id) {
-                            disarmNamingCapture();
-                        }
-                        duringLineProfileId = -1;
-                        return;
-                    }
-                }
-            }
-            onVoiceInput(text);
-            if (machineProfiles != null && feats != null) {
-                String low = trimmed.toLowerCase(Locale.US);
-                if (low.startsWith("ignore that")
-                        || low.startsWith("that wasn't me")
-                        || low.startsWith("that wasnt me")
-                        || low.startsWith("not me")
-                        || low.startsWith("disregard that")) {
-                    machineProfiles.undoLastVoiceSample(
-                            this, machineUserKey());
-                } else {
-                    machineProfiles.learnVoiceSample(
-                            this, machineUserKey(), feats);
-                }
-            }
-        });
-    }
-
-    /**
-     * DroneSession: an UNNAMED machine has been running a while —
-     * say the playful line (Nick 13:28/13:31, verbatim with its
-     * emphasis styling). Non-blocking; nothing waits on an answer.
-     */
-    public void onDroneSustainedUnnamed(int profileId, String profileName) {
-        handler.post(() -> {
-            if (gateState != GATE_DRONE) return;
-            duringLineProfileId = profileId;
-            speakDronePrompt(DURING_DRONE_LINE, "machine_during_drone",
-                    profileId, profileName);
-        });
-    }
-
-    // ------------------------------------------------------------ machine naming (13:21/13:25/13:27)
-
-    /**
-     * After a run of a still-unnamed machine, ask its name — exactly
-     * "Hey, {user}, what was that noise?" — once per run, on every
-     * run, until it's named; never again after. The reply is
-     * captured in onVoiceInput (short) / onDroneDictation.
-     */
-    private void maybeAskMachineName() {
-        if (machineProfiles == null) return;
-        MachineProfiles.Profile p = machineProfiles.lastActiveUnnamed(
-                this, machineUserKey());
-        if (p == null) return;
-        pendingNameProfileId = p.id;
-        namingCaptureUntilMs = System.currentTimeMillis() + NAMING_CAPTURE_MS;
-        String name = userDisplayName();
-        String q = (name != null && !name.isEmpty())
-                ? "Hey, " + name + ", what was that noise?"
-                : "Hey, what was that noise?";
-        log("drone: naming ask for profile " + p.id + " (" + p.name
-                + "): " + q);
-        speakDronePrompt(q, "machine_naming_ask", p.id, p.name);
-        fetchUserDisplayNameAsync(); // keep the name fresh for next time
-    }
-
-    /**
-     * Deliver a drone prompt: a durable directive POST through the
-     * normal input path (the brain sees the question and the naming
-     * context), the notification line, and the on-device voice when
-     * she's not already speaking — never over a queued reply.
-     */
-    private void speakDronePrompt(String text, String action,
-                                  int profileId, String profileName) {
-        new Thread(new MachineNameDirectiveTask(
-                this, action, profileId, profileName, text)).start();
-        updateNotification("🚜 " + text);
-        if (tts != null && ttsReady && !isPlayingAudio() && !playing
-                && !ttsSpeaking) {
-            // Park her own ears while she talks: the drone capture
-            // stands down for the estimated utterance so she can't
-            // transcribe herself (the platform side is echo-guarded
-            // inside speakOnDevice).
-            int words = Math.max(1, text.split("\\s+").length);
-            droneSelfTalkUntilMs = System.currentTimeMillis()
-                    + words * 650L + 1200L;
-            speakOnDevice(text, false);
-        } else {
-            log("drone: prompt not spoken (tts busy/unavailable) — "
-                    + "directive + notification only: " + text);
-        }
-    }
-
-    private void applyMachineName(String spoken) {
-        int pid = pendingNameProfileId;
-        disarmNamingCapture();
-        if (machineProfiles == null || pid < 0) return;
-        String name = cleanMachineName(spoken);
-        if (name.isEmpty()) return;
-        machineProfiles.rename(this, machineUserKey(), pid, name);
-        log("drone: machine " + pid + " named '" + name + "' (voice reply)");
-        updateNotification("🚜 Got it — that was the " + name);
-    }
-
-    private void disarmNamingCapture() {
-        pendingNameProfileId = -1;
-        namingCaptureUntilMs = 0;
-    }
-
-    /** Light cleanup of a spoken machine name ("that was the mower." → "mower"). */
-    static String cleanMachineName(String spoken) {
-        String s = spoken.trim().replaceAll("[.!?]+$", "").trim();
-        String low = s.toLowerCase(Locale.US);
-        String[] prefixes = {
-                "that was the ", "that was a ", "that was ",
-                "it was the ", "it was a ", "it was ",
-                "it's the ", "it's a ", "it's ",
-                "it is the ", "it is a ", "it is ",
-                "that's the ", "that's a ", "that's ", "the "};
-        for (String pre : prefixes) {
-            if (low.startsWith(pre)) {
-                s = s.substring(pre.length());
-                break;
-            }
-        }
-        return s.trim();
-    }
-
-    /** First name of the signed-in user, cached from their Siteview profile. */
-    private String userDisplayName() {
-        String full = getSharedPreferences(PREFS, MODE_PRIVATE)
-                .getString("user_display_name", "");
-        if (full == null || full.isEmpty()) return null;
-        int sp = full.indexOf(' ');
-        return sp > 0 ? full.substring(0, sp) : full;
-    }
-
-    /**
-     * One-shot profiles fetch for the naming prompt's {user}. Quiet
-     * failure by design: the prompt falls back to the nameless form
-     * and the next run tries again.
-     */
-    private void fetchUserDisplayNameAsync() {
-        new Thread(() -> {
-            try {
-                String have = getSharedPreferences(PREFS, MODE_PRIVATE)
-                        .getString("user_display_name", "");
-                if (have != null && !have.isEmpty()) return;
-                String userKey = SupabaseAuth.userKey(this);
-                if (userKey == null || userKey.startsWith("em_")) return;
-                String token = SupabaseAuth.validAccessToken(this);
-                if (token == null) return;
-                URL url = new URL("https://api.siteviewoperations.com"
-                        + "/rest/v1/profiles?id=eq." + userKey
-                        + "&select=display_name");
-                HttpURLConnection c = (HttpURLConnection) url.openConnection();
-                c.setRequestProperty("apikey", SupabaseAuth.apiKey());
-                c.setRequestProperty("Authorization", "Bearer " + token);
-                c.setConnectTimeout(8000);
-                c.setReadTimeout(8000);
-                if (c.getResponseCode() != 200) return;
-                java.io.InputStream in = c.getInputStream();
-                StringBuilder sb = new StringBuilder();
-                byte[] buf = new byte[1024];
-                int n;
-                while ((n = in.read(buf)) > 0) {
-                    sb.append(new String(buf, 0, n, "UTF-8"));
-                }
-                org.json.JSONArray arr = new org.json.JSONArray(sb.toString());
-                if (arr.length() > 0) {
-                    String dn = arr.getJSONObject(0)
-                            .optString("display_name", "");
-                    if (!dn.isEmpty()) {
-                        getSharedPreferences(PREFS, MODE_PRIVATE).edit()
-                                .putString("user_display_name", dn).apply();
-                        log("drone: user display name cached for prompts");
-                    }
-                }
-            } catch (Exception e) {
-                log("drone: display-name fetch failed: " + e);
-            }
-        }).start();
-    }
-
-    /** MachineNameDirectiveTask's POST — mirrors doPostWakeDirective. */
-    public void doPostMachineDirective(String action, int profileId,
-                                       String profileName, String line) {
-        HttpURLConnection conn = null;
-        try {
-            URL url = new URL(BASE_URL + "/api/selena-voice/input");
-            conn = (HttpURLConnection) url.openConnection();
-            conn.setRequestMethod("POST");
-            conn.setRequestProperty("Content-Type", "application/json");
-            conn.setConnectTimeout(8000);
-            conn.setReadTimeout(8000);
-            conn.setDoOutput(true);
-            JSONObject body = new JSONObject();
-            body.put("action", action);
-            body.put("profileId", profileId);
-            body.put("profileName", profileName);
-            body.put("line", line);
-            body.put("timestamp", System.currentTimeMillis());
-            OutputStream os = null;
-            try {
-                os = conn.getOutputStream();
-                os.write(body.toString().getBytes("UTF-8"));
-            } finally {
-                if (os != null) try { os.close(); } catch (Exception ignored) {}
-            }
-            int code = conn.getResponseCode();
-            log("drone: directive posted (" + code + "): " + action);
-        } catch (Exception e) {
-            Log.w(TAG, "drone: directive post failed", e);
-        } finally {
-            if (conn != null) conn.disconnect();
-        }
-    }
-
-    // ------------------------------------------------------------ v1.62 new-voice flow (group mode)
-
-    /**
-     * v1.64: the mode switch for the second-voice system. The mode
-     * is decided by WHICH device is the active output right now —
-     * Nick's earbuds by product-name identity (isEarbudsConnected,
-     * the v1.48 mechanism) mean PRIVATE output → the earbud
-     * sample-hold flow; anything else (phone speaker, truck radio,
-     * car kit — Ford Sync is not earbuds) means SHARED output → the
-     * v1.62 group flow. Never Bluetooth-yes/no.
-     */
-    private void startNewVoiceFlow(String sentence) {
-        if (isEarbudsConnected()) {
-            startEarbudHold(sentence);
-        } else {
-            startNewVoiceAsk(sentence);
-        }
-    }
-
-    /**
-     * v1.64 earbud mode, step 1: a second voice was detected and the
-     * output is private. Say NOTHING. Hold the words, try to grab a
-     * ~3 s sample of the room for later identification playback, and
-     * arm the silent-period identification. The sample capture runs
-     * alongside the recognizer (which is between utterances at flush
-     * time); if the device refuses a parallel capture, the flow
-     * continues without a sample — fail open, logged.
-     */
-    private void startEarbudHold(String sentence) {
-        pendingGuestSentence = sentence;
-        pendingGuestEarbud = true;
-        earbudHoldSinceMs = System.currentTimeMillis();
-        guestAskCooldownUntilMs = System.currentTimeMillis()
-                + GUEST_ASK_COOLDOWN_MS;
-        if (guestProfiles != null && pendingGuestFeats != null) {
-            guestProfiles.noteUnmatched(this, pendingGuestFeats);
-        }
-        log("guests(earbuds): new voice held silently (" + sentence.length()
-                + " chars) — identification at the next quiet moment");
-        updateNotification("🗣️ Heard someone new — I'll ask you about it shortly");
-        new Thread(() -> captureGuestSample(), "guest-sample").start();
-        if (earbudIdentifyTask != null) {
-            handler.removeCallbacks(earbudIdentifyTask);
-        }
-        earbudIdentifyTask = () -> earbudIdentifyTick();
-        handler.postDelayed(earbudIdentifyTask, EARBUD_IDENTIFY_POLL_MS);
-    }
-
-    /** v1.64: the transient ~3 s room sample. Memory only; nulled
-     *  the moment identification resolves. Never written to disk
-     *  except the momentary WAV the player needs (cache dir, deleted
-     *  by the normal unreferenced-file cleanup after playback). */
-    private void captureGuestSample() {
-        AudioRecord rec = null;
-        try {
-            int total = EARBUD_SAMPLE_RATE * EARBUD_SAMPLE_SECONDS;
-            int minBuf = AudioRecord.getMinBufferSize(EARBUD_SAMPLE_RATE,
-                    AudioFormat.CHANNEL_IN_MONO,
-                    AudioFormat.ENCODING_PCM_16BIT);
-            if (minBuf <= 0) {
-                log("guests(earbuds): sample capture unsupported (minBuf)");
-                return;
-            }
-            rec = new AudioRecord(MediaRecorder.AudioSource.VOICE_RECOGNITION,
-                    EARBUD_SAMPLE_RATE, AudioFormat.CHANNEL_IN_MONO,
-                    AudioFormat.ENCODING_PCM_16BIT,
-                    Math.max(minBuf, total * 2));
-            if (rec.getState() != AudioRecord.STATE_INITIALIZED) {
-                log("guests(earbuds): sample recorder not initialized "
-                        + "(mic busy?) — identification goes without a sample");
-                return;
-            }
-            short[] buf = new short[total];
-            rec.startRecording();
-            int off = 0;
-            long deadline = System.currentTimeMillis() + 4000;
-            while (off < total && System.currentTimeMillis() < deadline) {
-                int n = rec.read(buf, off, total - off);
-                if (n <= 0) break;
-                off += n;
-            }
-            try { rec.stop(); } catch (Exception ignored) {}
-            if (off < EARBUD_SAMPLE_RATE) {
-                log("guests(earbuds): sample too short (" + off
-                        + " samples) — discarded");
-                return;
-            }
-            short[] trimmed = new short[off];
-            System.arraycopy(buf, 0, trimmed, 0, off);
-            long sumSq = 0;
-            for (short s : trimmed) sumSq += (long) s * s;
-            double rms = Math.sqrt((double) sumSq / trimmed.length) / 32768.0;
-            if (rms < 0.01) {
-                log("guests(earbuds): sample was silence — discarded");
-                return;
-            }
-            if (pendingGuestEarbud) {
-                heldGuestSamplePcm = trimmed;
-                log("guests(earbuds): sample held (" + (off / EARBUD_SAMPLE_RATE)
-                        + "s, transient, memory only)");
-            }
-        } catch (Exception e) {
-            log("guests(earbuds): sample capture failed (fail-open): " + e);
-        } finally {
-            if (rec != null) {
-                try { rec.release(); } catch (Exception ignored) {}
-            }
-        }
-    }
-
-    /** v1.64: poll for a silent period, then run the identification. */
-    private void earbudIdentifyTick() {
-        earbudIdentifyTask = null;
-        if (!pendingGuestEarbud || pendingGuestSentence == null) return;
-        long now = System.currentTimeMillis();
-        boolean capped = now - earbudHoldSinceMs >= EARBUD_IDENTIFY_CAP_MS;
-        boolean quiet = !nickSpeaking && !isPlayingAudio() && !playing
-                && !ttsSpeaking && sentenceBuffer.length() == 0
-                && android.os.SystemClock.uptimeMillis()
-                        - lastDictationActivityMs >= EARBUD_IDENTIFY_QUIET_MS;
-        if (!quiet && !capped) {
-            earbudIdentifyTask = () -> earbudIdentifyTick();
-            handler.postDelayed(earbudIdentifyTask, EARBUD_IDENTIFY_POLL_MS);
-            return;
-        }
-        if (isPlayingAudio() || playing || ttsSpeaking) {
-            // Cap reached but she's mid-sentence — wait for the gap
-            // rather than talk over herself.
-            earbudIdentifyTask = () -> earbudIdentifyTick();
-            handler.postDelayed(earbudIdentifyTask, EARBUD_IDENTIFY_POLL_MS);
-            return;
-        }
-        runEarbudIdentification();
-    }
-
-    /**
-     * v1.64 earbud mode, step 2: ask NICK (the output is his earbuds
-     * only — private by construction) who that was, playing the held
-     * sample first when one exists. Nick's short reply is captured
-     * by the existing name-capture interception and lands in
-     * handleGuestNameReply, whose earbud branch enrolls + relays.
-     */
-    private void runEarbudIdentification() {
-        short[] sample = heldGuestSamplePcm;
-        String line1 = sample != null
-                ? "Quick thing — someone spoke a moment ago that I don't "
-                        + "recognize. Here's them:"
-                : "Quick thing — someone spoke a moment ago that I don't "
-                        + "recognize, and I couldn't grab a sample of "
-                        + "their voice.";
-        log("guests(earbuds): running identification (sample="
-                + (sample != null) + ")");
-        postGuestDirective("guest_identify_ask", null, "Who was that?", null);
-        updateNotification("🗣️ Who was that?");
-        if (tts != null && ttsReady) {
-            int words = Math.max(1, line1.split("\\s+").length);
-            droneSelfTalkUntilMs = System.currentTimeMillis()
-                    + words * 650L + 4500L;
-            // Enqueue (never speakOnDevice directly — it QUEUE_FLUSHes):
-            // line 1 via the TTS pump, the sample via the audio pump,
-            // then the question. The pumps mutually exclude (a pump
-            // won't start while the other path is active, and each
-            // completion pumps the other), so the three play in order.
-            enqueueTts(line1);
-            if (sample != null) {
-                File wav = writeGuestSampleWav(sample);
-                if (wav != null) {
-                    enqueueAudio(wav);
-                }
-            }
-            enqueueTts("Who was that?");
-        } else {
-            log("guests(earbuds): identification ask not spoken (tts "
-                    + "unavailable) — directive + notification only");
-        }
-        guestNameCaptureUntilMs = System.currentTimeMillis()
-                + GUEST_NAME_CAPTURE_MS;
-        if (earbudCaptureTask != null) {
-            handler.removeCallbacks(earbudCaptureTask);
-        }
-        earbudCaptureTask = () -> earbudHoldTimeout();
-        handler.postDelayed(earbudCaptureTask, GUEST_NAME_CAPTURE_MS);
-    }
-
-    /** Minimal 16-bit PCM WAV for the held sample (player needs a file). */
-    private File writeGuestSampleWav(short[] pcm) {
-        try {
-            File f = new File(getCacheDir(), "guest-sample.wav");
-            int dataLen = pcm.length * 2;
-            try (java.io.FileOutputStream os = new java.io.FileOutputStream(f)) {
-                byte[] header = new byte[44];
-                java.nio.ByteBuffer hb = java.nio.ByteBuffer.wrap(header)
-                        .order(java.nio.ByteOrder.LITTLE_ENDIAN);
-                hb.put("RIFF".getBytes("US-ASCII"));
-                hb.putInt(36 + dataLen);
-                hb.put("WAVE".getBytes("US-ASCII"));
-                hb.put("fmt ".getBytes("US-ASCII"));
-                hb.putInt(16);
-                hb.putShort((short) 1); // PCM
-                hb.putShort((short) 1); // mono
-                hb.putInt(EARBUD_SAMPLE_RATE);
-                hb.putInt(EARBUD_SAMPLE_RATE * 2);
-                hb.putShort((short) 2);
-                hb.putShort((short) 16);
-                hb.put("data".getBytes("US-ASCII"));
-                hb.putInt(dataLen);
-                os.write(header);
-                java.nio.ByteBuffer bb = java.nio.ByteBuffer
-                        .allocate(dataLen).order(java.nio.ByteOrder.LITTLE_ENDIAN);
-                for (short s : pcm) bb.putShort(s);
-                os.write(bb.array());
-            }
-            return f;
-        } catch (Exception e) {
-            log("guests(earbuds): sample WAV write failed: " + e);
-            return null;
-        }
-    }
-
-    /**
-     * The dictation has stopped and its speaker matched nobody: ask
-     * who that was. Form by content (13:54 disambiguation — the
-     * slash form is never spoken): a statement gets "Who's
-     * talking?"; a question gets "Who's asking?", alternating with
-     * "Who wants to know?". The held dictation is NOT in the ask's
-     * directive — the brain answers the tagged dictation post that
-     * follows enrollment, never the ask itself.
-     */
-    private void startNewVoiceAsk(String sentence) {
-        pendingGuestSentence = sentence;
-        guestAskCooldownUntilMs = System.currentTimeMillis()
-                + GUEST_ASK_COOLDOWN_MS;
-        if (guestProfiles != null && pendingGuestFeats != null) {
-            guestProfiles.noteUnmatched(this, pendingGuestFeats);
-        }
-        String line;
-        if (!isQuestion(sentence)) {
-            line = "Who's talking?";
-        } else {
-            boolean alt = getSharedPreferences(PREFS, MODE_PRIVATE)
-                    .getBoolean("guest_ask_alt", false);
-            getSharedPreferences(PREFS, MODE_PRIVATE).edit()
-                    .putBoolean("guest_ask_alt", !alt).apply();
-            line = alt ? "Who wants to know?" : "Who's asking?";
-        }
-        log("guests: new voice — asking '" + line + "' (held dictation: "
-                + sentence.length() + " chars)");
-        postGuestDirective("new_voice_ask", null, line, null);
-        updateNotification("🗣️ " + line);
-        if (tts != null && ttsReady && !isPlayingAudio() && !playing
-                && !ttsSpeaking) {
-            int words = Math.max(1, line.split("\\s+").length);
-            droneSelfTalkUntilMs = System.currentTimeMillis()
-                    + words * 650L + 1200L;
-            speakOnDevice(line, false);
-        } else {
-            log("guests: ask not spoken (tts busy/unavailable) — "
-                    + "directive + notification only");
-        }
-        guestNameCaptureUntilMs = System.currentTimeMillis()
-                + GUEST_NAME_CAPTURE_MS;
-        if (guestHoldReleaseTask != null) {
-            handler.removeCallbacks(guestHoldReleaseTask);
-        }
-        guestHoldReleaseTask = () -> releaseHeldGuestSentence(null);
-        handler.postDelayed(guestHoldReleaseTask, GUEST_NAME_CAPTURE_MS);
-    }
-
-    /**
-     * Post the held dictation — tagged with the guest's name when
-     * the ask was answered, untagged when it wasn't (the question
-     * still gets answered either way; only the name is missing).
-     * Mirrors flushSentence's post section, wake gate included.
-     */
-    private void releaseHeldGuestSentence(String speakerName) {
-        if (guestHoldReleaseTask != null) {
-            handler.removeCallbacks(guestHoldReleaseTask);
-            guestHoldReleaseTask = null;
-        }
-        guestNameCaptureUntilMs = 0;
-        if (pendingGuestSentence == null) return;
-        String sentence = pendingGuestSentence;
-        pendingGuestSentence = null;
-        pendingGuestFeats = null;
-        MessageHistory.addNick(sentence);
-        boolean heldByWakeGate = false;
-        if (wakeGateBlocksPost()) {
-            if (sentenceStartsWithWakeWord(sentence)) {
-                openWakeConversation("transcript");
-            } else {
-                heldByWakeGate = true;
-                log("guests: held dictation had no wake word — stays local");
-            }
-        }
-        // Rider G2: one-shot — only the release that immediately
-        // follows an enrollment carries the justEnrolled mark.
-        boolean justEnrolled = speakerName != null
-                && speakerName.equals(justEnrolledGuestName);
-        justEnrolledGuestName = null;
-        if (!heldByWakeGate) {
-            Intent sent = new Intent(ACTION_INPUT_SENT);
-            sent.putExtra(EXTRA_TEXT, sentence);
-            sendAppBroadcast(sent);
-            if (speakerName != null) {
-                postGuestDirective("guest_speaking", speakerName, null,
-                        sentence, justEnrolled);
-            }
-            new Thread(new InputPostTask(this, sentence, false,
-                    speakerName, snapshotInterruption(sentence), false,
-                    justEnrolled)).start();
-            noteWakeConversationActivity();
-            log("guests: held dictation released"
-                    + (speakerName != null
-                            ? " as guest '" + speakerName + "'" : " untagged"));
-        }
-        maybeReleaseDictationDuck();
-        releasePoliteHold();
-    }
-
-    /**
-     * The name reply landed. "It's me" (or Nick's own name) means the
-     * new-voice flag was a false alarm — Nick with a cold — and the
-     * held dictation simply posts as his, no guest created.
-     * Anything else enrolls a guest seeded from the held speech's
-     * measurements, and the held dictation posts under their name.
-     */
-    private void handleGuestNameReply(String spoken) {
-        String low = spoken.trim().toLowerCase(Locale.US)
-                .replaceAll("[.!?]+$", "").trim();
-        if (low.equals("me") || low.equals("it's me")
-                || low.equals("it is me") || low.equals("that's me")
-                || low.equals("this is me") || low.equals("just me")
-                || low.equals("nick") || low.equals("this is nick")) {
-            log("guests: name reply says it's Nick himself — false "
-                    + "alarm, no guest created");
-            if (pendingGuestEarbud) {
-                // v1.64: the "guest" was Nick all along — the held
-                // words are HIS dictation and post as his.
-                clearEarbudHold();
-            }
-            releaseHeldGuestSentence(null);
-            return;
-        }
-        String name = cleanGuestName(spoken);
-        if (name.isEmpty() || guestProfiles == null) {
-            if (pendingGuestEarbud) {
-                earbudHoldTimeout();
-                return;
-            }
-            releaseHeldGuestSentence(null);
-            return;
-        }
-        GuestProfiles.Guest g = guestProfiles.enroll(
-                this, name, pendingGuestFeats);
-        postGuestDirective("guest_enrolled", g.name, null, null);
-        updateNotification("🗣️ Got it — hi, " + g.name);
-        log("guests: enrolled '" + g.name + "' from the name reply");
-        if (pendingGuestEarbud) {
-            // v1.64: identification complete — NOW the overheard
-            // content may move, and only as a private relay to Nick
-            // with a consent query (the brain composes it). The held
-            // dictation itself is never posted.
-            String held = pendingGuestSentence;
-            clearEarbudHold();
-            pendingGuestSentence = null;
-            pendingGuestFeats = null;
-            guestNameCaptureUntilMs = 0;
-            postGuestDirective("guest_relay", g.name, null, held);
-            log("guests(earbuds): identified as '" + g.name
-                    + "' — content relayed privately to Nick");
-            maybeReleaseDictationDuck();
-            releasePoliteHold();
-            return;
-        }
-        justEnrolledGuestName = g.name;
-        releaseHeldGuestSentence(g.name);
-    }
-
-    /** v1.64: tear down the earbud hold's timers + sample. Does NOT
-     *  touch pendingGuestSentence/pendingGuestFeats — callers decide
-     *  what happens to the held words. */
-    private void clearEarbudHold() {
-        pendingGuestEarbud = false;
-        heldGuestSamplePcm = null; // transient sample: discarded
-        if (earbudIdentifyTask != null) {
-            handler.removeCallbacks(earbudIdentifyTask);
-            earbudIdentifyTask = null;
-        }
-        if (earbudCaptureTask != null) {
-            handler.removeCallbacks(earbudCaptureTask);
-            earbudCaptureTask = null;
-        }
-    }
-
-    /**
-     * v1.64: the earbud hold was never identified (no name in the
-     * capture window, or the reply wasn't a name). The overheard
-     * content is reported as guest_unidentified — the brain may ask
-     * Nick about it later — and is NEVER posted as a dictation,
-     * never executed, never addressed to the speaker.
-     */
-    private void earbudHoldTimeout() {
-        if (earbudCaptureTask != null) {
-            handler.removeCallbacks(earbudCaptureTask);
-            earbudCaptureTask = null;
-        }
-        guestNameCaptureUntilMs = 0;
-        if (pendingGuestSentence == null) {
-            clearEarbudHold();
-            return;
-        }
-        String held = pendingGuestSentence;
-        pendingGuestSentence = null;
-        pendingGuestFeats = null;
-        clearEarbudHold();
-        postGuestDirective("guest_unidentified", null, null, held);
-        log("guests(earbuds): never identified — content reported "
-                + "unidentified, not posted");
-        maybeReleaseDictationDuck();
-        releasePoliteHold();
-    }
-
-    /** "I'm Amber" / "this is Amber" / "my name is Amber" → "Amber". */
-    static String cleanGuestName(String spoken) {
-        String s = spoken.trim().replaceAll("[.!?]+$", "").trim();
-        String low = s.toLowerCase(Locale.US);
-        String[] prefixes = {
-                "my name is ", "the name is ", "this is ", "i'm ",
-                "im ", "it's ", "it is ", "call me "};
-        for (String pre : prefixes) {
-            if (low.startsWith(pre)) {
-                s = s.substring(pre.length());
-                break;
-            }
-        }
-        s = s.trim();
-        if (!s.isEmpty()) {
-            s = s.substring(0, 1).toUpperCase(Locale.US) + s.substring(1);
-        }
-        return s;
-    }
-
-    /** Statement vs question, for the ask's form (13:54 ruling). */
-    static boolean isQuestion(String sentence) {
-        String s = sentence.trim().toLowerCase(Locale.US);
-        if (s.endsWith("?")) return true;
-        String first = s.split("\\s+")[0].replaceAll("[^a-z']", "");
-        switch (first) {
-            case "who": case "what": case "when": case "where":
-            case "why": case "how": case "can": case "could":
-            case "would": case "will": case "do": case "does":
-            case "did": case "is": case "are": case "was":
-            case "were": case "should": case "may":
-                return true;
-            default:
-                return false;
-        }
-    }
-
-    private void postGuestDirective(String action, String speakerName,
-                                    String line, String text) {
-        postGuestDirective(action, speakerName, line, text, false);
-    }
-
-    /** v1.71 (rider G2): justEnrolled rides the guest_speaking
-     *  directive on the enrollment sequence's first dictation. */
-    private void postGuestDirective(String action, String speakerName,
-                                    String line, String text,
-                                    boolean justEnrolled) {
-        new Thread(new GuestDirectiveTask(
-                this, action, speakerName, line, text, justEnrolled)).start();
-    }
-
-    /** GuestDirectiveTask's POST — mirrors doPostMachineDirective. */
-    public void doPostGuestDirective(String action, String speakerName,
-                                     String line, String text) {
-        doPostGuestDirective(action, speakerName, line, text, false);
-    }
-
-    public void doPostGuestDirective(String action, String speakerName,
-                                     String line, String text,
-                                     boolean justEnrolled) {
-        HttpURLConnection conn = null;
-        try {
-            URL url = new URL(BASE_URL + "/api/selena-voice/input");
-            conn = (HttpURLConnection) url.openConnection();
-            conn.setRequestMethod("POST");
-            conn.setRequestProperty("Content-Type", "application/json");
-            conn.setConnectTimeout(8000);
-            conn.setReadTimeout(8000);
-            conn.setDoOutput(true);
-            JSONObject body = new JSONObject();
-            body.put("action", action);
-            if (speakerName != null) body.put("speakerName", speakerName);
-            if (line != null) body.put("line", line);
-            if (text != null) body.put("text", text);
-            if (justEnrolled) body.put("justEnrolled", true);
-            body.put("timestamp", System.currentTimeMillis());
-            OutputStream os = null;
-            try {
-                os = conn.getOutputStream();
-                os.write(body.toString().getBytes("UTF-8"));
-            } finally {
-                if (os != null) try { os.close(); } catch (Exception ignored) {}
-            }
-            int code = conn.getResponseCode();
-            log("guests: directive posted (" + code + "): " + action);
-        } catch (Exception e) {
-            Log.w(TAG, "guests: directive post failed", e);
-        } finally {
-            if (conn != null) conn.disconnect();
-        }
-    }
-
-    /**
-     * Spec §4.1: manual override — the user tapped the mic (or asked
-     * for dictation from the earbud) while the gate had the recognizer
-     * killed. Force the session open; the gate is bypassed for this
-     * session and resumes duty once the drone has been gone a while.
-     */
-    public void forceGateOverride() {
-        if (gateState != GATE_KILLED) return;
-        gateBypassSession = true;
-        gateDroneAbsentSinceMs = 0;
-        log("gate: MANUAL OVERRIDE — session forced open, gate bypassed");
-        exitGateKill("manual override");
-    }
-
-    /**
-     * Spec §4.4: sampler/analyzer failure — disable the gate and fall
-     * back to today's plain SpeechRecognizer behavior. Failing open
-     * for the user beats a gate that can't hear.
-     */
-    private void disableGate(String why) {
-        if (gateDisabled) return;
-        gateDisabled = true;
-        log("gate: DISABLED (" + why + ") — plain recognizer fallback (fail open)");
-        if (gateState == GATE_KILLED) {
-            exitGateKill("sampler failure fallback");
-        }
-    }
-
     // ------------------------------------------------------------ helpers
 
     private String lastPollStatus = "Poll: not started";
@@ -9605,22 +5583,6 @@ public class VoiceService extends Service
         sendAppBroadcast(i);
     }
 
-    private void broadcastListeningState() {
-        Intent i = new Intent(ACTION_LISTENING_STATE);
-        i.putExtra(EXTRA_STATE, recognizerActive);
-        // Nick 2026-10-28 v1.52: gate state for the UI's subtle
-        // "Paused — loud noise" indicator (§4.5). recognizerActive
-        // stays true while killed (listening mode is still on — the
-        // sessions are what's suppressed), so this extra is what
-        // distinguishes "listening" from "held off by noise".
-        i.putExtra(EXTRA_GATE_STATE,
-                gateState == GATE_KILLED
-                        ? (noiseHoldActive ? "noise_hold" : "killed")
-                        : "ambient");
-        sendAppBroadcast(i);
-        refreshMediaSessionActive();
-    }
-
     private long getLastTs() {
         // Nick 2026-10-19 v1.15: fresh install used to default to 0, so the
         // first poll asked for ?since=0 and the server returned EVERY message
@@ -9639,28 +5601,6 @@ public class VoiceService extends Service
 
     private void setLastTs(long ts) {
         getSharedPreferences(PREFS, MODE_PRIVATE).edit().putLong(KEY_LAST_TS, ts).apply();
-    }
-
-    private boolean isAlwaysListening() {
-        return getSharedPreferences(PREFS, MODE_PRIVATE).getBoolean(KEY_ALWAYS_ON, true);
-    }
-
-    private void setAlwaysListening(boolean on) {
-        getSharedPreferences(PREFS, MODE_PRIVATE).edit().putBoolean(KEY_ALWAYS_ON, on).apply();
-    }
-
-    public static void setAlwaysListening(Context ctx, boolean on) {
-        ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-                .edit().putBoolean(KEY_ALWAYS_ON, on).apply();
-        Intent i = new Intent(ctx, VoiceService.class);
-        i.setAction("TOGGLE_LISTENING");
-        i.putExtra("on", on);
-        ctx.startForegroundService(i);
-    }
-
-    public static boolean getAlwaysListening(Context ctx) {
-        return ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-                .getBoolean(KEY_ALWAYS_ON, true);
     }
 
     // Nick 2026-10-19 v1.17: no-auto-readout toggle. When on, incoming

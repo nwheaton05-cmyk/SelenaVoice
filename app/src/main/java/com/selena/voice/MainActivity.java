@@ -1,16 +1,13 @@
 package com.selena.voice;
 
 import android.Manifest;
-import android.animation.ObjectAnimator;
 import android.app.Activity;
 import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
 import android.content.pm.PackageManager;
-import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
-import android.provider.Settings;
 import android.text.Html;
 import android.text.TextUtils;
 import android.util.Log;
@@ -27,12 +24,17 @@ import java.util.List;
 /**
  * Selena Voice main UI (Nick, 2026-10-18).
  *
- * Nick 2026-10-19 v1.16: BACKGROUND OPERATION. The activity is now a pure
- * UI shell — status line, always-listening toggle, pulse dot, message log,
- * mic button fallback, voice-mode toggle, version label. ALL voice work
- * (Realtime push, queue polling, heartbeat, MP3/TTS playback, mic) lives
+ * Nick 2026-10-19 v1.16: BACKGROUND OPERATION. The activity is a pure
+ * UI shell — status line, message history with replay, playback
+ * controls, output toggles, version label. ALL playback work
+ * (Realtime push, queue polling, heartbeat, MP3/TTS playback) lives
  * in VoiceService, which keeps running with the screen locked. The
  * activity just starts the service and renders the service's broadcasts.
+ *
+ * v1.82 (Nick, 2026-11-02): PLAYBACK-ONLY — the microphone, the
+ * dictation popup, the always-listening switch, the mic button, the
+ * voiceprint/machine dialogs, and the dictation text box are gone.
+ * Nick replies in the Muse app; this screen is a player.
  */
 public class MainActivity extends Activity {
     private static final String TAG = "SelenaVoice";
@@ -43,21 +45,8 @@ public class MainActivity extends Activity {
     // Nick 2026-10-23 v1.38: was the inner message-box scroller; the box
     // now flows in the page scroll, so this is the outer ScrollView.
     private ScrollView outerScroll;
-    private Switch alwaysOnSwitch;
-    private View pulseDot;
-    private ObjectAnimator pulseAnimator;
 
     private final MessageReceiver receiver;
-
-    // Nick 2026-10-18 v1.8: the mic button is a real on/off toggle (manual
-    // fallback when always-listening is off). One press starts, next stops.
-    private Button micButton;
-    private boolean manualMicOn = false;
-
-    // Nick 2026-10-23 v1.46: live dictation popup — shows exactly what
-    // Nick is dictating in real time (one-shot mic, or always-listening).
-    private android.app.Dialog dictationDialog;
-    private TextView dictationTextView;
 
     // Nick 2026-10-21: pause/resume button for playback.
     private Button pauseButton;
@@ -82,21 +71,6 @@ public class MainActivity extends Activity {
     // the delete-key dialog — never hardcoded.
     private Button signInButton;
     private Button deleteKeyButton;
-    private Button voiceprintButton;
-    private Button machinesButton;
-    // v1.65 (2026-10-29): the text box (offline workflow). The field
-    // mirrors the PREF_HELD_TEXT preference the service stacks into;
-    // the activity is the field's editor + manual sender.
-    private android.widget.EditText heldTextBox;
-    private android.content.SharedPreferences heldPrefs;
-    private boolean heldBoxSelfWrite = false;
-    private final android.content.SharedPreferences.OnSharedPreferenceChangeListener
-            heldListener = (prefs, key) -> {
-                if (VoiceService.PREF_HELD_TEXT.equals(key)
-                        && !heldBoxSelfWrite) {
-                    runOnUiThread(this::refreshHeldTextBox);
-                }
-            };
 
     // Nick 2026-10-22 v1.33: in-app auto-updater banner. Hidden until the
     // version check finds a newer APK; tap downloads + installs it.
@@ -117,11 +91,10 @@ public class MainActivity extends Activity {
         receiver = new MessageReceiver(this);
     }
 
-    // Nick 2026-10-18 v1.9: the log shows the full conversation. Nick's own
-    // words appear as "You:" in muted purple; Selena's replies as "Selena:"
-    // in dark. Nick's inputs are NEVER spoken aloud — the audio queue only
-    // ever plays audioUrl MP3s from /api/selena-voice/queue (Selena's
-    // replies). His inputs go to /api/selena-voice/input as text only.
+    // Nick 2026-10-18 v1.9: history shows Selena's messages (and, in
+    // pre-v1.82 histories, Nick's dictated entries, rendered "You:"
+    // style). The audio queue only ever plays audioUrl MP3s from
+    // /api/selena-voice/queue — Selena's replies.
     private static final String COLOR_SELENA = "#2D2A32"; // selena_dark
     private static final String COLOR_NICK = "#6B4FA1";   // selena_purple
 
@@ -130,133 +103,6 @@ public class MainActivity extends Activity {
         // Nick 2026-10-21 v1.24: history is the UI now; re-render.
         // Nick 2026-10-22 v1.26: new message — scroll to it.
         renderHistory(true);
-    }
-
-    /** Called by MessageReceiver when Nick's voice input was accepted. */
-    public void onInputSent(String text) {
-        VoiceService.log("log: showing Nick's message");
-        // Nick 2026-10-21 v1.24: voice inputs aren't in history; just re-render.
-        // Nick 2026-10-23 v1.46: they ARE now — from-Nick history entries.
-        // The sentence landed below: clear the popup for the next one.
-        // Toast only for one-shot; always-listening would spam it per sentence.
-        clearDictationPopup();
-        renderHistory();
-        if (manualMicOn) {
-            runOnUiThread(() ->
-                    Toast.makeText(this, "Sent to Selena", Toast.LENGTH_SHORT).show());
-        }
-    }
-
-    /**
-     * Nick 2026-10-23 v1.46: live dictation text from the service
-     * (partial results + in-progress sentence). Shows/updates the popup.
-     */
-    public void onPartialInput(String text) {
-        if (text == null) return;
-        // One-shot: the popup was shown on mic-ON. Always-listening: pop
-        // it up on first live dictation so it doesn't sit empty while idle.
-        if (dictationDialog == null && VoiceService.getAlwaysListening(this)) {
-            showDictationPopup();
-        }
-        updateDictationPopup(text);
-    }
-
-    /** Nick 2026-10-23 v1.46: show the live dictation popup. */
-    private void showDictationPopup() {
-        if (dictationDialog != null || isFinishing()) return;
-        runOnUiThread(() -> {
-            if (dictationDialog != null || isFinishing()) return;
-            android.widget.LinearLayout layout = new android.widget.LinearLayout(this);
-            layout.setOrientation(android.widget.LinearLayout.VERTICAL);
-            int pad = (int) (24 * getResources().getDisplayMetrics().density);
-            layout.setPadding(pad, pad, pad, pad);
-
-            TextView status = new TextView(this);
-            status.setText("🎙️ Listening…");
-            status.setTextSize(14);
-            status.setTextColor(0xFF888888);
-            layout.addView(status);
-
-            dictationTextView = new TextView(this);
-            dictationTextView.setText("");
-            dictationTextView.setTextSize(22);
-            dictationTextView.setTextColor(getResources().getColor(R.color.selena_dark));
-            dictationTextView.setPadding(0, pad / 2, 0, 0);
-            layout.addView(dictationTextView);
-
-            android.app.AlertDialog dialog =
-                    new android.app.AlertDialog.Builder(this)
-                            .setTitle("Dictation")
-                            .setView(layout)
-                            .create();
-            dialog.setCanceledOnTouchOutside(true);
-            dialog.setOnDismissListener(d -> {
-                dictationDialog = null;
-                dictationTextView = null;
-            });
-            dictationDialog = dialog;
-            dialog.show();
-            // Wide popup — dictation text needs room.
-            android.view.Window w = dialog.getWindow();
-            if (w != null) {
-                w.setLayout(android.view.WindowManager.LayoutParams.MATCH_PARENT,
-                        android.view.WindowManager.LayoutParams.WRAP_CONTENT);
-            }
-        });
-    }
-
-    /** Nick 2026-10-23 v1.46: update the popup's live text. */
-    private void updateDictationPopup(String text) {
-        runOnUiThread(() -> {
-            if (dictationTextView != null) {
-                dictationTextView.setText(text);
-            }
-        });
-    }
-
-    /** Nick 2026-10-23 v1.46: blank the popup for the next sentence. */
-    private void clearDictationPopup() {
-        updateDictationPopup("");
-    }
-
-    /** Nick 2026-10-23 v1.46: take the popup down. */
-    private void dismissDictationPopup() {
-        runOnUiThread(() -> {
-            if (dictationDialog != null) {
-                try {
-                    dictationDialog.dismiss();
-                } catch (Exception ignored) {}
-                dictationDialog = null;
-                dictationTextView = null;
-            }
-        });
-    }
-
-    /** Called by MessageReceiver when speech is detected (pulse the dot). */
-    public void onSpeechDetected() {
-        pulse();
-    }
-
-    /** Called by MessageReceiver when the listening state changes. */
-    public void onListeningState(boolean listening) {
-        onListeningState(listening, null);
-    }
-
-    /**
-     * Nick 2026-10-28 v1.52: while the noise gate holds the recognizer
-     * off, the status line says so — a working gate must never look
-     * like a broken mic (spec §4.5). The mic button still forces a
-     * session open, which is the discoverable override.
-     */
-    public void onListeningState(boolean listening, String gateState) {
-        if ("killed".equals(gateState) || "noise_hold".equals(gateState)) {
-            final String text = "noise_hold".equals(gateState)
-                    ? "🚜 Paused — loud noise (dictation held)"
-                    : "🚜 Paused — loud noise";
-            runOnUiThread(() -> statusText.setText(text));
-            return;
-        }
-        updateListeningUi(listening);
     }
 
     /** Called by MessageReceiver with the last queue-poll result. */
@@ -328,7 +174,7 @@ public class MainActivity extends Activity {
             ((TextView) findViewById(R.id.versionText)).setText("v" + vn + " (" + buildDate + ")");
         } catch (Exception ignored) {}
         // Nick 2026-10-23 v1.48: long-press version text to set earbuds
-        // BT device name (one-time setup for voice-interrupt mode).
+        // BT device name (one-time setup for the earbuds-only lane).
         findViewById(R.id.versionText).setOnLongClickListener(v -> {
             showEarbudsSetupDialog();
             return true;
@@ -337,9 +183,6 @@ public class MainActivity extends Activity {
         MessageHistory.init(this);
         messageList = findViewById(R.id.messageList);
         outerScroll = findViewById(R.id.outerScroll);
-        alwaysOnSwitch = findViewById(R.id.alwaysOnSwitch);
-        pulseDot = findViewById(R.id.pulseDot);
-        micButton = findViewById(R.id.micButton);
         pauseButton = findViewById(R.id.pauseButton);
         // Nick 2026-10-22 v1.28: always enabled from launch — a tap always
         // reaches the service, which toasts what it did.
@@ -392,21 +235,7 @@ public class MainActivity extends Activity {
         deleteKeyButton = findViewById(R.id.deleteKeyButton);
         deleteKeyButton.setEnabled(true);
         deleteKeyButton.setOnClickListener(v -> showDeleteKeyDialog());
-        voiceprintButton = findViewById(R.id.voiceprintButton);
-        voiceprintButton.setEnabled(true);
-        voiceprintButton.setOnClickListener(v -> showVoiceprintDialog());
-        machinesButton = findViewById(R.id.machinesButton);
-        machinesButton.setEnabled(true);
-        machinesButton.setOnClickListener(v -> showMachinesDialog());
         refreshSignInButton();
-
-        // v1.65: text box wiring (offline workflow).
-        heldPrefs = getSharedPreferences(VoiceService.PREFS, MODE_PRIVATE);
-        heldTextBox = findViewById(R.id.heldTextBox);
-        Button heldSendButton = findViewById(R.id.heldSendButton);
-        refreshHeldTextBox();
-        heldPrefs.registerOnSharedPreferenceChangeListener(heldListener);
-        heldSendButton.setOnClickListener(v -> sendHeldText());
 
         // Nick 2026-10-22 v1.33: in-app auto-updater. Hidden until the
         // version check finds a newer APK — v1.33 is the last manual
@@ -414,65 +243,6 @@ public class MainActivity extends Activity {
         updateBanner = findViewById(R.id.updateBanner);
         updateBanner.setVisibility(View.GONE);
         checkForAppUpdate();
-
-        alwaysOnSwitch.setChecked(VoiceService.getAlwaysListening(this));
-        alwaysOnSwitch.setOnCheckedChangeListener((v, on) -> {
-            // Nick 2026-10-23 v1.41: don't auto-start mic listening until
-            // RECORD_AUDIO is granted. Revert the flip, prompt, retry on grant.
-            if (on && !hasMicPermission()) {
-                alwaysOnSwitch.setChecked(false);
-                pendingMicAction = "always";
-                ensureMicPermission();
-                return;
-            }
-            VoiceService.setAlwaysListening(this, on);
-            if (on) {
-                // The switch owns the mic now — drop any manual toggle state.
-                manualMicOn = false;
-            } else {
-                // Nick 2026-10-23 v1.46: always-listening off — popup down.
-                dismissDictationPopup();
-            }
-            updateMicButton();
-        });
-
-        micButton.setOnClickListener(v -> {
-            if (alwaysOnSwitch.isChecked()) {
-                Toast.makeText(this, "Already always listening — mic is live",
-                        Toast.LENGTH_SHORT).show();
-                return;
-            }
-            // Nick 2026-10-23 v1.41: no mic without RECORD_AUDIO — prompt
-            // first, engage on grant.
-            if (!hasMicPermission()) {
-                pendingMicAction = "manual";
-                ensureMicPermission();
-                return;
-            }
-            if (!manualMicOn) {
-                Intent i = new Intent(this, VoiceService.class);
-                i.setAction("MANUAL_LISTEN");
-                startForegroundService(i);
-                manualMicOn = true;
-                VoiceService.log("mic: manual toggle ON");
-                // Nick 2026-10-23 v1.46: live dictation popup.
-                showDictationPopup();
-                Toast.makeText(this, "Listening… tap mic again to stop",
-                        Toast.LENGTH_SHORT).show();
-            } else {
-                Intent i = new Intent(this, VoiceService.class);
-                i.setAction("MANUAL_STOP");
-                startForegroundService(i);
-                manualMicOn = false;
-                VoiceService.log("mic: manual toggle OFF");
-                // Nick 2026-10-23 v1.46: dictation done — popup down. Any
-                // in-progress sentence still flushes to history via the
-                // service's sentence timer.
-                dismissDictationPopup();
-                Toast.makeText(this, "Mic off", Toast.LENGTH_SHORT).show();
-            }
-            updateMicButton();
-        });
 
         // Nick 2026-10-18 v1.11: voice mode toggle — Phone (fast, on-device
         // TTS, default) vs Achernar (quality, in-app Google Cloud TTS
@@ -558,10 +328,9 @@ public class MainActivity extends Activity {
         });
 
         requestPermissions();
-        // Nick 2026-10-23 v1.41: the service starts as mediaPlayback, which
-        // needs NO runtime permission — playback, polling, and the queue
-        // work with the mic denied. Mic listening only engages after
-        // RECORD_AUDIO is granted (the service refuses otherwise).
+        // The service starts as mediaPlayback, which needs NO runtime
+        // permission — playback, polling, and the queue just work.
+        // v1.82: the app holds no microphone permission at all.
         startVoiceService();
     }
 
@@ -814,90 +583,6 @@ public class MainActivity extends Activity {
                 .show();
     }
 
-    /**
-     * Nick 2026-10-28 v1.53 (Phase 4, spec §5): voiceprint status +
-     * per-profile reset. The reset itself runs in VoiceService (the
-     * RESET_VOICEPRINT intent) because the service owns the live
-     * profile; this dialog only reports status and asks.
-     */
-    private void showVoiceprintDialog() {
-        String status = Voiceprint.statusLine(this);
-        new android.app.AlertDialog.Builder(this)
-                .setTitle("Learned voiceprint")
-                .setMessage(status
-                        + "\n\nThe voiceprint only ever makes the noise gate MORE"
-                        + " willing to hear you — it can never block you. Reset"
-                        + " deletes this account's learned profile and its"
-                        + " server archive; learning starts over from scratch.")
-                .setPositiveButton("Reset voiceprint", (d, w) -> {
-                    Intent ri = new Intent(
-                            MainActivity.this, VoiceService.class);
-                    ri.setAction("RESET_VOICEPRINT");
-                    startForegroundService(ri);
-                    android.widget.Toast.makeText(MainActivity.this,
-                            "Voiceprint reset",
-                            android.widget.Toast.LENGTH_SHORT).show();
-                })
-                .setNegativeButton("Keep", null)
-                .show();
-    }
-
-    /**
-     * Nick 2026-10-29 v1.61: the learned machine-sound library. The
-     * app names new machines by VOICE first (it asks after the noise
-     * stops); this dialog is the fallback label path — tap a machine
-     * to rename it. Renaming here counts as named: the voice prompts
-     * stop for that machine.
-     */
-    private void showMachinesDialog() {
-        java.util.List<MachineProfiles.Profile> profiles =
-                MachineProfiles.listForUi(this);
-        if (profiles == null || profiles.isEmpty()) {
-            new android.app.AlertDialog.Builder(this)
-                    .setTitle("Machine sounds")
-                    .setMessage("No machine sounds learned yet.\n\n"
-                            + "When something loud and steady runs — the"
-                            + " mower, a weed whacker, a blower — the app"
-                            + " learns its sound as its own profile, and"
-                            + " after it stops she'll ask you what it was.")
-                    .setPositiveButton("OK", null)
-                    .show();
-            return;
-        }
-        String[] labels = new String[profiles.size()];
-        for (int i = 0; i < profiles.size(); i++) {
-            labels[i] = MachineProfiles.describe(profiles.get(i));
-        }
-        new android.app.AlertDialog.Builder(this)
-                .setTitle("Machine sounds (tap to rename)")
-                .setItems(labels, (d, which) ->
-                        showMachineRenameDialog(profiles.get(which)))
-                .setNegativeButton("Close", null)
-                .show();
-    }
-
-    private void showMachineRenameDialog(MachineProfiles.Profile p) {
-        final android.widget.EditText nameIn =
-                new android.widget.EditText(this);
-        nameIn.setHint("Machine name");
-        nameIn.setText(p.name);
-        nameIn.setSelection(nameIn.getText().length());
-        new android.app.AlertDialog.Builder(this)
-                .setTitle("Name this machine")
-                .setView(nameIn)
-                .setPositiveButton("Save", (d, w) -> {
-                    String name = nameIn.getText().toString().trim();
-                    if (!name.isEmpty()
-                            && MachineProfiles.renameForUi(this, p.id, name)) {
-                        android.widget.Toast.makeText(MainActivity.this,
-                                "Saved: " + name,
-                                android.widget.Toast.LENGTH_SHORT).show();
-                    }
-                })
-                .setNegativeButton("Cancel", null)
-                .show();
-    }
-
     private void showDeleteKeyDialog() {
         final android.widget.EditText keyIn =
                 new android.widget.EditText(this);
@@ -1006,111 +691,15 @@ public class MainActivity extends Activity {
         spkSwitch.setChecked(VoiceService.getForceSpeaker(this));
     }
 
-    private static final int REQ_MIC = 1;
-    // Nick 2026-10-23 v1.41: a mic action the user tapped while RECORD_AUDIO
-    // was missing — retried once the permission is granted ("always" =
-    // the always-listen switch, "manual" = the mic button).
-    private String pendingMicAction = null;
-
-    private boolean hasMicPermission() {
-        return checkSelfPermission(Manifest.permission.RECORD_AUDIO)
-                == PackageManager.PERMISSION_GRANTED;
-    }
-
-    private boolean micAskedBefore() {
-        return getPreferences(MODE_PRIVATE).getBoolean("mic_asked", false);
-    }
-
-    private void setMicAskedBefore() {
-        getPreferences(MODE_PRIVATE).edit().putBoolean("mic_asked", true).apply();
-    }
-
-    @Override
-    public void onRequestPermissionsResult(int requestCode, String[] permissions,
-                                           int[] grantResults) {
-        super.onRequestPermissionsResult(requestCode, permissions, grantResults);
-        // Nick 2026-10-23 v1.41: the service is already running (started in
-        // onCreate as mediaPlayback — no permission needed). Mic features
-        // engage only if granted; a denial never crashes anything.
-        if (hasMicPermission()) {
-            if (pendingMicAction != null) {
-                String a = pendingMicAction;
-                pendingMicAction = null;
-                engageMicAction(a);
-            } else if (alwaysOnSwitch.isChecked()) {
-                // Service-side auto-start refused while denied; user intent
-                // (switch on) stands, so engage now that it's granted.
-                VoiceService.setAlwaysListening(this, true);
-            }
-        } else {
-            Toast.makeText(this,
-                    "Mic permission denied — voice input stays off. "
-                            + "Enable it in Settings > Apps > Selena Voice > Permissions.",
-                    Toast.LENGTH_LONG).show();
-        }
-    }
-
-    /** Retry a mic action the user tapped before the permission arrived. */
-    private void engageMicAction(String action) {
-        if ("always".equals(action)) {
-            // Fires the switch listener -> setAlwaysListening(true) -> service.
-            alwaysOnSwitch.setChecked(true);
-        } else {
-            Intent i = new Intent(this, VoiceService.class);
-            i.setAction("MANUAL_LISTEN");
-            startForegroundService(i);
-            manualMicOn = true;
-            // Nick 2026-10-23 v1.46: permission-grant path — popup too.
-            showDictationPopup();
-            updateMicButton();
-        }
-    }
-
-    /**
-     * Nick 2026-10-23 v1.41: surface the RECORD_AUDIO prompt. First ask goes
-     * through the system dialog; after a denial we explain and ask again;
-     * once the user has blocked it ("don't ask again" / Settings revoke),
-     * only Settings can fix it — take them there.
-     */
-    public void ensureMicPermission() {
-        if (hasMicPermission()) return;
-        if (shouldShowRequestPermissionRationale(Manifest.permission.RECORD_AUDIO)) {
-            Toast.makeText(this,
-                    "Selena Voice needs the mic to hear you — please allow it",
-                    Toast.LENGTH_LONG).show();
-            requestPermissions(new String[]{Manifest.permission.RECORD_AUDIO}, REQ_MIC);
-        } else if (!micAskedBefore()) {
-            setMicAskedBefore();
-            requestPermissions(new String[]{Manifest.permission.RECORD_AUDIO}, REQ_MIC);
-        } else {
-            Toast.makeText(this,
-                    "Mic is blocked — enable it in Settings > Apps > Selena Voice > Permissions",
-                    Toast.LENGTH_LONG).show();
-            startActivity(new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
-                    Uri.parse("package:" + getPackageName())));
-        }
-    }
-
     private void requestPermissions() {
-        List<String> needed = new ArrayList<>();
-        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO)
-                != PackageManager.PERMISSION_GRANTED) {
-            needed.add(Manifest.permission.RECORD_AUDIO);
-        }
-        // v1.72: call-state watch (the phone-call mic mute). Asked
-        // alongside the mic; if refused, the service logs it once
-        // and the mute simply stays inactive — nothing else changes.
-        if (checkSelfPermission(Manifest.permission.READ_PHONE_STATE)
-                != PackageManager.PERMISSION_GRANTED) {
-            needed.add(Manifest.permission.READ_PHONE_STATE);
-        }
+        // v1.82: POST_NOTIFICATIONS is the only runtime permission
+        // this app asks for anymore (RECORD_AUDIO and READ_PHONE_STATE
+        // left with the microphone and the phone-call mic mute).
         if (Build.VERSION.SDK_INT >= 33
                 && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS)
                 != PackageManager.PERMISSION_GRANTED) {
-            needed.add(Manifest.permission.POST_NOTIFICATIONS);
-        }
-        if (!needed.isEmpty()) {
-            requestPermissions(needed.toArray(new String[0]), 1);
+            requestPermissions(
+                    new String[]{Manifest.permission.POST_NOTIFICATIONS}, 1);
         }
     }
 
@@ -1124,13 +713,6 @@ public class MainActivity extends Activity {
         super.onResume();
         IntentFilter f = new IntentFilter();
         f.addAction(VoiceService.ACTION_MESSAGE);
-        f.addAction(VoiceService.ACTION_INPUT_SENT);
-        f.addAction(VoiceService.ACTION_SPEECH_DETECTED);
-        f.addAction(VoiceService.ACTION_LISTENING_STATE);
-        // Nick 2026-10-23 v1.46: live dictation popup text.
-        f.addAction(VoiceService.ACTION_PARTIAL_INPUT);
-        // Nick 2026-10-23 v1.41: service asks the activity to prompt for mic.
-        f.addAction(VoiceService.ACTION_REQUEST_MIC_PERMISSION);
         f.addAction(VoiceService.ACTION_POLL_STATUS);
         f.addAction(VoiceService.ACTION_PLAYBACK_STATE);
         f.addAction(VoiceService.ACTION_TOAST);
@@ -1142,17 +724,6 @@ public class MainActivity extends Activity {
         // Nick 2026-10-19 v1.16: no more activity-owned loops. The service
         // keeps polling/heartbeat/realtime alive with the screen locked;
         // the activity only renders broadcasts while visible.
-        // Nick 2026-10-18 v1.8: if the activity was recreated while the
-        // service was in manual-listen mode, pick up the real state.
-        manualMicOn = VoiceService.isManualListening();
-        updateMicButton();
-        refreshHeldTextBox(); // v1.65: pick up anything stacked while away
-        // Nick 2026-10-23 v1.46: recreate the dictation popup if a manual
-        // session was already running (the service's sentence buffer and
-        // partials will refill it).
-        if (manualMicOn) {
-            showDictationPopup();
-        }
         // Nick 2026-10-21 v1.24: load persistent message history on open
         // (catches messages that arrived while backgrounded).
         MessageHistory.purgeExpired();
@@ -1168,122 +739,7 @@ public class MainActivity extends Activity {
     @Override
     protected void onPause() {
         super.onPause();
-        persistHeldTextBox(); // v1.65: the user's edits are the field truth
-        // Nick 2026-10-23 v1.46: popup is activity-scoped — take it down
-        // to avoid a window leak. Re-shown on resume if still listening.
-        dismissDictationPopup();
         try { unregisterReceiver(receiver); } catch (Exception ignored) {}
-    }
-
-    // ------------------------------------------------------------ v1.65 text box
-
-    /** Mirror the persisted held text into the field (no-op when
-     *  already in sync, so typing is never clobbered by our own
-     *  writes). */
-    private void refreshHeldTextBox() {
-        if (heldTextBox == null || heldPrefs == null) return;
-        String held = heldPrefs.getString(VoiceService.PREF_HELD_TEXT, "");
-        if (held == null) held = "";
-        if (!held.equals(heldTextBox.getText().toString())) {
-            heldTextBox.setText(held);
-            try {
-                heldTextBox.setSelection(held.length());
-            } catch (Exception ignored) {}
-        }
-    }
-
-    /** Persist the field's current content (edits and clears are
-     *  authoritative — the reconnect announcement keys off this). */
-    private void persistHeldTextBox() {
-        if (heldTextBox == null || heldPrefs == null) return;
-        String cur = heldTextBox.getText().toString();
-        String held = heldPrefs.getString(VoiceService.PREF_HELD_TEXT, "");
-        if (held == null) held = "";
-        if (!cur.equals(held)) {
-            heldBoxSelfWrite = true;
-            try {
-                if (cur.trim().isEmpty()) {
-                    heldPrefs.edit().remove(VoiceService.PREF_HELD_TEXT).apply();
-                } else {
-                    heldPrefs.edit()
-                            .putString(VoiceService.PREF_HELD_TEXT, cur).apply();
-                }
-            } finally {
-                heldBoxSelfWrite = false;
-            }
-        }
-    }
-
-    /**
-     * The manual send — the ONLY way text leaves the box
-     * (2026-10-29 disposition rule: no auto-delivery, ever). Sends
-     * the field's whole content as one input post, mirroring
-     * VoiceService.doPostInput's wire shape. Success clears the box;
-     * failure keeps everything held and says so.
-     */
-    private void sendHeldText() {
-        if (heldTextBox == null) return;
-        final String text = heldTextBox.getText().toString().trim();
-        if (text.isEmpty()) {
-            android.widget.Toast.makeText(this, "The text box is empty",
-                    android.widget.Toast.LENGTH_SHORT).show();
-            return;
-        }
-        new Thread(() -> {
-            boolean ok = false;
-            java.net.HttpURLConnection conn = null;
-            try {
-                java.net.URL url = new java.net.URL(
-                        VoiceService.BASE_URL + "/api/selena-voice/input");
-                conn = (java.net.HttpURLConnection) url.openConnection();
-                conn.setRequestMethod("POST");
-                conn.setRequestProperty("Content-Type", "application/json");
-                conn.setConnectTimeout(8000);
-                conn.setReadTimeout(8000);
-                conn.setDoOutput(true);
-                org.json.JSONObject body = new org.json.JSONObject();
-                body.put("text", text);
-                body.put("timestamp", System.currentTimeMillis());
-                java.io.OutputStream os = conn.getOutputStream();
-                try {
-                    os.write(body.toString().getBytes("UTF-8"));
-                } finally {
-                    try { os.close(); } catch (Exception ignored) {}
-                }
-                int code = conn.getResponseCode();
-                ok = code == 200 || code == 201;
-            } catch (Exception e) {
-                ok = false;
-            } finally {
-                if (conn != null) conn.disconnect();
-            }
-            final boolean sent = ok;
-            runOnUiThread(() -> {
-                if (sent) {
-                    // Nick 2026-10-29 15:19: typed sends are recorded
-                    // in the window's conversation record, in order,
-                    // alongside dictations — same MessageHistory the
-                    // dictation path writes — and rendered at once.
-                    MessageHistory.addNick(text);
-                    renderHistory(true);
-                    heldBoxSelfWrite = true;
-                    try {
-                        heldPrefs.edit()
-                                .remove(VoiceService.PREF_HELD_TEXT).apply();
-                    } finally {
-                        heldBoxSelfWrite = false;
-                    }
-                    heldTextBox.setText("");
-                    android.widget.Toast.makeText(this, "Sent",
-                            android.widget.Toast.LENGTH_SHORT).show();
-                } else {
-                    persistHeldTextBox();
-                    android.widget.Toast.makeText(this,
-                            "Still offline — your words stay in the text box",
-                            android.widget.Toast.LENGTH_LONG).show();
-                }
-            });
-        }).start();
     }
 
     // ------------------------------------------------------------ UI helpers
@@ -1396,46 +852,11 @@ public class MainActivity extends Activity {
         return card;
     }
 
-    private void updateListeningUi(boolean listening) {
-        runOnUiThread(() -> statusText.setText(
-                listening ? "🎙️ Listening for Selena…" : "⏸️ Paused — toggle to resume"));
-    }
-
-    /**
-     * Nick 2026-10-18: the mic button is a real toggle. Green = manual
-     * listening is ON (tap to stop), purple/default = OFF (tap to talk).
-     * When always-listening owns the mic, the button stays in its OFF look.
-     */
-    private void updateMicButton() {
-        runOnUiThread(() -> {
-            if (manualMicOn) {
-                micButton.setText("🎤 ON\ntap to stop");
-                micButton.setBackgroundTintList(
-                        android.content.res.ColorStateList.valueOf(0xFF2E7D32));
-            } else {
-                micButton.setText("🎤");
-                micButton.setBackgroundTintList(
-                        android.content.res.ColorStateList.valueOf(0xFF6B4FA1));
-            }
-        });
-    }
-
-    /** Nick 2026-10-18: visual pulse so he knows the app hears him. */
-    private void pulse() {
-        runOnUiThread(() -> {
-            if (pulseAnimator != null && pulseAnimator.isRunning()) return;
-            pulseAnimator = ObjectAnimator.ofFloat(pulseDot, "alpha", 1f, 0.2f, 1f);
-            pulseAnimator.setDuration(600);
-            pulseAnimator.start();
-        });
-    }
-
     /**
      * Nick 2026-10-23 v1.48: one-time earbuds setup. Long-press the
      * version text to open this. Enter the Bluetooth name of Nick's
-     * earbuds (as shown in Android BT settings). When this device is
-     * connected, Selena uses voice-interrupt (mic stays on during her
-     * speech); otherwise tap-to-interrupt.
+     * earbuds (as shown in Android BT settings). The name drives the
+     * earbuds-only playback lane (v1.73).
      */
     private void showEarbudsSetupDialog() {
         android.widget.EditText input = new android.widget.EditText(this);
@@ -1451,8 +872,7 @@ public class MainActivity extends Activity {
                 .setTitle("Earbuds device")
                 .setMessage("Enter the Bluetooth name of your earbuds "
                         + "(as shown in Android Bluetooth settings). "
-                        + "When connected, you can interrupt Selena by voice. "
-                        + "This name also drives earbuds-only playback: "
+                        + "This name drives earbuds-only playback: "
                         + "with that switch on, she plays only into these "
                         + "earbuds and stays silent while they're away.")
                 .setView(input)
