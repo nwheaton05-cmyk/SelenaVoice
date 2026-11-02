@@ -634,6 +634,27 @@ public class VoiceService extends Service
     // and a stale generation or already-started playback drops it.
     private Runnable pendingSegmentAdvance = null;
     private int segmentAdvanceGen = 0;
+    // Nick 2026-11-02 v1.79: almost-done wire. Selena segments long
+    // messages herself and feeds them just-in-time: the next segment
+    // must be SENT 10-15 s before the current one ends, so the
+    // completion report (playback_row_played) arrives too late. The
+    // first time the playing row's remaining time drops to
+    // ALMOST_DONE_LEAD_MS, fire PlaybackProgressTask with action
+    // "playback_almost_done" — once per row. MediaPlayer path: a 1 s
+    // position watch against the real duration. On-device TTS path:
+    // utterances have no real duration, so a one-shot is scheduled at
+    // (estimated duration - lead), estimated at ~14 chars/sec (the
+    // 0.95 speaking rate).
+    private static final long ALMOST_DONE_LEAD_MS = 12000;
+    private static final long ALMOST_DONE_TICK_MS = 1000;
+    // Rows the almost-done report already fired for — never twice
+    // for one row. Bounded FIFO, same discipline as spokenTexts.
+    private final LinkedList<String> almostDoneFiredRows =
+            new LinkedList<>();
+    // MediaPlayer almost-done watch (self-rescheduling 1 s tick).
+    private Runnable almostDoneWatchTask = null;
+    // On-device TTS almost-done one-shot (estimate-based).
+    private Runnable almostDoneTtsTask = null;
     // MP3 path: the row id rides with the queued File (path -> row id),
     // consumed when playFileNow starts the file.
     private final java.util.Map<String, String> audioFileServerIds =
@@ -1799,7 +1820,14 @@ public class VoiceService extends Service
         }
     }
 
-    /** Runs on main thread: starts MediaPlayer for the downloaded file. */
+    /** Runs on main thread: starts MediaPlayer for the downloaded file.
+     *
+     * Nick 2026-11-02: Selena segments; the app plays each queue row
+     * whole — never split row text here. (Long messages arrive as
+     * multiple selena_voice_queue rows, each ~20-30 s of speech,
+     * pre-segmented by the sender. Every playback path — in-app
+     * synthesis, MediaPlayer, on-device TTS — treats one row as one
+     * indivisible unit.) */
     // setSpeakerphoneOn is deprecated (API 31+) but still functional through
     // API 34; its replacement (setCommunicationDevice) is for voice-call
     // routing — the wrong semantic for media playback.
@@ -2150,6 +2178,9 @@ public class VoiceService extends Service
             String mappedGroup = audioFileSegmentGroups.remove(
                     f.getAbsolutePath());
             if (mappedGroup != null) currentPlaySegmentGroup = mappedGroup;
+            // v1.79: a queue row just started on the MediaPlayer —
+            // arm the almost-done watch (self-skips for id-less files).
+            armAlmostDoneWatch();
             broadcastPlaybackState();
             return true;
         } catch (Exception e) {
@@ -2206,6 +2237,115 @@ public class VoiceService extends Service
         for (String rowId : ids) {
             log("stop: reporting row stopped: " + rowId);
             new Thread(new PlaybackProgressTask(rowId, "playback_stopped")).start();
+        }
+    }
+
+    /**
+     * v1.79 (Nick, 2026-11-02): fire the almost-done report for a
+     * row, once per row ever. Both playback paths funnel here. The
+     * callers check at fire time that the row is still the playing
+     * one and still unreported: the played report consumes
+     * currentPlayServerId (so a finished row reads null hereafter)
+     * and a stop releases the player / halts TTS (so the watches
+     * below die before they could fire) — a stale watch can never
+     * report almost-done for a row that already played or stopped.
+     * Priority interjections are not server rows — never reported.
+     */
+    private void reportAlmostDone(String rowId) {
+        if (rowId == null || rowId.isEmpty()
+                || "priority".equals(rowId)) return;
+        synchronized (almostDoneFiredRows) {
+            if (almostDoneFiredRows.contains(rowId)) return;
+            almostDoneFiredRows.add(rowId);
+            while (almostDoneFiredRows.size() > 20) {
+                almostDoneFiredRows.removeFirst();
+            }
+        }
+        log("progress: reporting row almost done: " + rowId);
+        new Thread(new PlaybackProgressTask(rowId,
+                "playback_almost_done")).start();
+    }
+
+    /** v1.79: arm the MediaPlayer almost-done watch. Called when a
+     *  queue row starts playing (playFileNow success, MP3 resume).
+     *  The tick re-reads the CURRENT row id every second, so a
+     *  priority interrupt / resume retargets it naturally; it ends
+     *  by itself when playback stops or completes (player released),
+     *  when the tracker goes null (row reported played), or when
+     *  the row already fired. While paused it idles without firing —
+     *  position isn't moving, so "almost done" isn't either. */
+    private void armAlmostDoneWatch() {
+        cancelAlmostDoneWatch();
+        almostDoneWatchTask = () -> almostDoneWatchTick();
+        handler.postDelayed(almostDoneWatchTask,
+                ALMOST_DONE_TICK_MS / 2);
+    }
+
+    private void cancelAlmostDoneWatch() {
+        if (almostDoneWatchTask != null) {
+            handler.removeCallbacks(almostDoneWatchTask);
+            almostDoneWatchTask = null;
+        }
+    }
+
+    private void almostDoneWatchTick() {
+        almostDoneWatchTask = null;
+        String rowId = currentPlayServerId;
+        if (player == null || !playing || rowId == null
+                || rowId.isEmpty() || "priority".equals(rowId)) {
+            return;
+        }
+        synchronized (almostDoneFiredRows) {
+            if (almostDoneFiredRows.contains(rowId)) return;
+        }
+        if (!playbackPaused && safeIsPlaying()) {
+            try {
+                int dur = player.getDuration();
+                if (dur > 0
+                        && dur - player.getCurrentPosition()
+                                <= ALMOST_DONE_LEAD_MS) {
+                    reportAlmostDone(rowId);
+                    return;
+                }
+            } catch (Exception ignored) {}
+        }
+        almostDoneWatchTask = () -> almostDoneWatchTick();
+        handler.postDelayed(almostDoneWatchTask, ALMOST_DONE_TICK_MS);
+    }
+
+    /** v1.79: arm the on-device TTS almost-done one-shot for the
+     *  utterance that just started. No real duration exists, so the
+     *  fire time is estimated from the text being spoken (on a
+     *  resume, the remainder — the right thing to estimate) at
+     *  ~14 chars/sec. A row shorter than the lead fires immediately,
+     *  which is correct: the next segment should come at once. At
+     *  fire time the utterance must still be speaking THIS row. */
+    private void armAlmostDoneTts(String spokenText) {
+        cancelAlmostDoneTts();
+        final String rowId = currentPlayServerId;
+        if (rowId == null || rowId.isEmpty()
+                || "priority".equals(rowId)) return;
+        synchronized (almostDoneFiredRows) {
+            if (almostDoneFiredRows.contains(rowId)) return;
+        }
+        long estMs = spokenText != null
+                ? (long) (spokenText.length() * 1000.0 / 14.0) : 0;
+        long delay = Math.max(0, estMs - ALMOST_DONE_LEAD_MS);
+        almostDoneTtsTask = () -> {
+            almostDoneTtsTask = null;
+            if (ttsSpeaking && rowId.equals(currentPlayServerId)) {
+                reportAlmostDone(rowId);
+            }
+        };
+        handler.postDelayed(almostDoneTtsTask, delay);
+        log("progress: almost-done armed for row " + rowId
+                + " in ~" + delay + "ms (est " + estMs + "ms)");
+    }
+
+    private void cancelAlmostDoneTts() {
+        if (almostDoneTtsTask != null) {
+            handler.removeCallbacks(almostDoneTtsTask);
+            almostDoneTtsTask = null;
         }
     }
 
@@ -2427,6 +2567,10 @@ public class VoiceService extends Service
      * Text-to-Speech (Achernar). Runs on a worker thread — never call on
      * the main thread. One retry, then throws; the caller falls back to
      * on-device TTS so the message is never dropped silently.
+     *
+     * v1.79 (Nick, 2026-11-02): the text here is ONE queue row and is
+     * synthesized as ONE request (see synthesizeOnce) — never chunk
+     * row text here; Selena segments on her side.
      */
     private File synthesizeToCache(String text) throws Exception {
         Exception last = null;
@@ -2657,7 +2801,9 @@ public class VoiceService extends Service
         speakOnDevice(text, false);
     }
 
-    /** Runs on main thread: speak text with Android's built-in TTS. */
+    /** Runs on main thread: speak text with Android's built-in TTS.
+     *  v1.79 (Nick, 2026-11-02): the text is one queue row, spoken as
+     *  one utterance — never split it here; Selena segments. */
     @SuppressWarnings("deprecation") // setSpeakerphoneOn, see playFileNow
     private void speakOnDevice(String text, boolean isResume) {
         // v1.70: device-TTS speech starting is answer/local speech —
@@ -2787,6 +2933,10 @@ public class VoiceService extends Service
             if (rc != TextToSpeech.SUCCESS) {
                 log("tts: speak() returned " + rc);
                 onTtsDone();
+            } else {
+                // v1.79: arm the estimate-based almost-done report
+                // for this utterance's queue row.
+                armAlmostDoneTts(text);
             }
         } catch (Exception e) {
             log("tts: speak failed: " + e);
@@ -2953,6 +3103,9 @@ public class VoiceService extends Service
                 player.start();
                 playbackPaused = false;
                 didResume = true;
+                // v1.79: re-arm the almost-done watch on resume
+                // (insurance — the tick normally idles through pause).
+                armAlmostDoneWatch();
                 log("playback: resumed at " + safePosition() + "ms");
             } catch (Exception e) {
                 log("playback: resume failed: " + e.getMessage());

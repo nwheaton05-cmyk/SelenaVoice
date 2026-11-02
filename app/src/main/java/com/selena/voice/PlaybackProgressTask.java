@@ -44,6 +44,15 @@ import java.nio.charset.StandardCharsets;
  * morning — paused messages are held and delete server-side when
  * the rework's successor message is queued — so v1.58 removed the
  * wire again. This class carries played/stopped reports only.)
+ *
+ * v1.79 (2026-11-02): a third action rides this wire —
+ * 'playback_almost_done', fired ONCE per row the first time its
+ * remaining playback drops to ≤12 s. Nick's just-in-time segment
+ * feeding (2026-11-02): Selena segments long messages herself and
+ * sends the next segment when the current one has ~10-15 s left,
+ * which the completion report alone can never time. Advisory only:
+ * a lost almost-done just means the next segment arrives at
+ * completion instead of just before it — nothing corrupts.
  */
 public class PlaybackProgressTask implements Runnable {
     private static final String TAG = "SelenaVoice";
