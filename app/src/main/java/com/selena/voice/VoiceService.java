@@ -17,6 +17,7 @@ import android.media.AudioAttributes;
 import android.media.AudioDeviceInfo;
 import android.media.AudioFocusRequest;
 import android.media.AudioManager;
+import android.media.AudioRecordingConfiguration;
 import android.media.MediaPlayer;
 import android.media.audiofx.LoudnessEnhancer;
 import android.media.session.MediaSession;
@@ -45,6 +46,7 @@ import java.net.HttpURLConnection;
 import java.net.URL;
 import java.net.URLEncoder;
 import java.util.LinkedList;
+import java.util.List;
 import java.util.Locale;
 import java.util.Queue;
 
@@ -73,6 +75,14 @@ import java.util.Queue;
  *     Nick replies in the Muse app; this app only speaks. Nothing
  *     in here may ever consult a listening state again: playback
  *     pumps run purely on queue/lane state.
+ *  3. v1.83 (Nick, 2026-11-02): MIC-ACTIVITY AUTO-PAUSE. The app
+ *     itself still never records — but it now WATCHES whether any
+ *     OTHER app is using the phone's microphone (his case: dictation
+ *     in the Muse app, where her voice was being picked up into
+ *     his dictation). While the mic is busy elsewhere, playback
+ *     pauses/holds; ~2 s after it frees, a pause the hold caused
+ *     resumes. This is an external-activity hold, a sibling of the
+ *     earbuds-only lane hold — not a listening state of this app.
  *
  * NOTE: All helpers are top-level classes (no inner/anonymous classes
  * extending Android listener types) because d8 8.2.2 crashes on inner-class
@@ -295,6 +305,15 @@ public class VoiceService extends Service
     // can hold the ruled segment gap before a same-group successor
     // starts (see advanceAfterSegmentGap).
     private String currentPlaySegmentGroup = null;
+    // Nick 2026-11-02 v1.83: true while the play in flight is a
+    // serious-critical row (priority "critical") — the class that
+    // breaks through every hold, the mic hold included. Set beside
+    // currentPlayServerId on the priority paths; cleared when a
+    // queue play adopts its row id, and on stop. A witness for the
+    // orphan guard (a parked critical stays critical) and for the
+    // mic hold's critical exemption (a playing critical is never
+    // mic-paused).
+    private boolean currentPlayCritical = false;
     // Nick 2026-11-02 v1.80: the gap between segments of one
     // message must land between 1.5 s and 3 s end-to-start, as
     // close to real-time as possible — a 2000 ms hold plus normal
@@ -418,15 +437,23 @@ public class VoiceService extends Service
         // superseded mid-play by a newer start and parked for replay
         // (see the orphan guard in playFileNow).
         boolean wasOrphaned;
+        // v1.83: serious-critical rows (priority "critical") — the
+        // class that breaks through the mic hold even from the FIFO.
+        final boolean critical;
         WaitingPriority(File audioFile, String text, String serverId) {
             this(audioFile, text, serverId, null);
         }
         WaitingPriority(File audioFile, String text, String serverId,
                 String segmentGroup) {
+            this(audioFile, text, serverId, segmentGroup, false);
+        }
+        WaitingPriority(File audioFile, String text, String serverId,
+                String segmentGroup, boolean critical) {
             this.audioFile = audioFile;
             this.text = text;
             this.serverId = serverId;
             this.segmentGroup = segmentGroup;
+            this.critical = critical;
         }
     }
     private final java.util.ArrayDeque<WaitingPriority> waitingPriority =
@@ -495,6 +522,7 @@ public class VoiceService extends Service
         startHeartbeat();
         startRealtime();
         registerLaneDeviceWatch(); // v1.73: earbuds-only lane watch
+        startMicHoldWatch(); // v1.83: mic-activity auto-pause watch
         log("lane: earbuds-only state at create: " + laneModeName()
                 + (getEarbudsDeviceName() != null
                         ? " (earbuds '" + getEarbudsDeviceName() + "')"
@@ -605,6 +633,7 @@ public class VoiceService extends Service
         // this app writes the system media volume anymore (v1.17
         // boost restore and the v1.61 deep-duck release are gone).
         unregisterLaneDeviceWatch(); // v1.73
+        stopMicHoldWatch(); // v1.83
         laneEnd(); // v1.73: never leave the headset channel pinned
         releasePlayer();
         // Nick 2026-10-28 v1.51: release the media session.
@@ -839,6 +868,9 @@ public class VoiceService extends Service
      * worker schedules the next poll when it finishes.
      */
     public void pollOnce() {
+        // v1.83: fallback mic-config check on every poll cycle —
+        // catches anything the recording callback missed.
+        refreshMicHold("poll");
         broadcastPollStatus("Poll: starting…");
         new Thread(() -> doPollWork()).start();
     }
@@ -1000,6 +1032,11 @@ public class VoiceService extends Service
             // Low-priority (segments of one long message) falls through
             // to the normal polite queueing below.
             String priority = m.optString("priority", "high");
+            // v1.83: serious-critical rows (priority "critical")
+            // are the break-through class — they route through the
+            // priority path like any non-low row, and the mic hold
+            // exempts them at every gate.
+            final boolean critical = "critical".equalsIgnoreCase(priority);
             // v1.81 (Nick, 2026-11-02): intake disposition — EVERY
             // accepted row logs its id and intended disposition here,
             // before any dispatch, so a row that later vanishes can
@@ -1030,7 +1067,7 @@ public class VoiceService extends Service
                 markSpokenLocked(text);
                 if (isPhoneVoiceMode()) {
                     final String speakText = text;
-                    handler.post(() -> onPriorityArrivalTts(speakText, sid, sgroup));
+                    handler.post(() -> onPriorityArrivalTts(speakText, sid, sgroup, critical));
                 } else if (!audioUrl.isEmpty() && audioUrl.startsWith("http")) {
                     // Nick 2026-10-23 v1.43: backward-compat MP3 path. The
                     // server still renders MP3s during transition; a row
@@ -1042,12 +1079,12 @@ public class VoiceService extends Service
                         final File pf = downloadToCache(audioUrl);
                         final String ptext = text;
                         final String psid = sid;
-                        handler.post(() -> onPriorityArrivalMp3(pf, ptext, psid, sgroup));
+                        handler.post(() -> onPriorityArrivalMp3(pf, ptext, psid, sgroup, critical));
                     } catch (Exception e) {
                         log("priority: MP3 download failed: "
                                 + e.getMessage() + " — TTS fallback");
                         final String speakText = text;
-                        handler.post(() -> onPriorityArrivalTts(speakText, sid, sgroup));
+                        handler.post(() -> onPriorityArrivalTts(speakText, sid, sgroup, critical));
                     }
                 } else {
                     // Nick 2026-10-23 v1.43: in-app synthesis (Achernar since v1.45; Callirrhoe v1.44).
@@ -1060,11 +1097,11 @@ public class VoiceService extends Service
                     new Thread(() -> {
                         try {
                             final File sf = synthesizeToCache(stext);
-                            handler.post(() -> onPriorityArrivalMp3(sf, stext, ssid, sgroup));
+                            handler.post(() -> onPriorityArrivalMp3(sf, stext, ssid, sgroup, critical));
                         } catch (Exception e) {
                             log("priority: synthesis failed, on-device TTS "
                                     + "fallback: " + e.getMessage());
-                            handler.post(() -> onPriorityArrivalTts(stext, ssid, sgroup));
+                            handler.post(() -> onPriorityArrivalTts(stext, ssid, sgroup, critical));
                         }
                     }).start();
                 }
@@ -1200,12 +1237,20 @@ public class VoiceService extends Service
 
     /** Runs on main thread: start the next queued file if idle. */
     private void pumpAudioQueue() {
+        refreshMicHold("pump"); // v1.83: fresh config count at start time
         if (playing) return;
         // Nick 2026-10-30 v1.73: earbuds-only lane armed but no
         // earbuds — the file stays queued, unplayed and unreported;
         // the device watch pumps again when the earbuds connect.
         if (laneBlocked()) {
             logLaneHeld("MP3 playback");
+            return;
+        }
+        // Nick 2026-11-02 v1.83: mic hold — another app is using
+        // the microphone; the file stays queued until it frees
+        // (the mic-free flow pumps again).
+        if (micHold) {
+            logMicHeld("MP3 playback");
             return;
         }
         File f;
@@ -1361,6 +1406,17 @@ public class VoiceService extends Service
             playing = false;
             return false;
         }
+        // v1.83: mic-hold backstop (the lane twin above) — while
+        // another app holds the microphone, a direct play attempt
+        // must not sound: her voice would land in his dictation.
+        // Serious-critical plays carry the bypass, set by
+        // playPriorityMp3 for the duration of the start call.
+        if (micHold && !micCriticalBypass) {
+            log("michold: held — direct play attempt held off: "
+                    + f.getName());
+            playing = false;
+            return false;
+        }
         try {
             // Nick 2026-10-18 v1.7: THE SILENT-PLAYBACK FIX. v1.5/v1.6 used
             // USAGE_VOICE_COMMUNICATION, which Android routes to the
@@ -1455,7 +1511,8 @@ public class VoiceService extends Service
                             currentAudioFile.getAbsolutePath())) {
                 WaitingPriority orphan = new WaitingPriority(
                         currentAudioFile, currentPriorityPlayText,
-                        currentPlayServerId, currentPlaySegmentGroup);
+                        currentPlayServerId, currentPlaySegmentGroup,
+                        currentPlayCritical);
                 orphan.wasOrphaned = true;
                 waitingPriority.addFirst(orphan);
                 log("priority: in-flight priority play superseded "
@@ -1705,7 +1762,13 @@ public class VoiceService extends Service
             // one did (the priority path sets it explicitly beforehand
             // and its files never enter the map).
             String mappedSid = audioFileServerIds.remove(f.getAbsolutePath());
-            if (mappedSid != null) currentPlayServerId = mappedSid;
+            if (mappedSid != null) {
+                currentPlayServerId = mappedSid;
+                // v1.83: a queue play is never the critical class —
+                // criticals take the priority path and set the
+                // witness themselves before this call.
+                currentPlayCritical = false;
+            }
             // v1.58: adopt the segment group the same way (the
             // priority path sets it explicitly beforehand, mirroring
             // the row id).
@@ -2054,11 +2117,24 @@ public class VoiceService extends Service
         final int gen = ++segmentAdvanceGen;
         log("segments: holding " + SEGMENT_GAP_MS
                 + "ms gap before next segment of " + finishedGroup);
+        final Runnable[] self = new Runnable[1];
         Runnable delayed = () -> {
             if (segmentAdvanceGen != gen) return; // cancelled/superseded
+            // v1.83: the mic hold defers the start itself — the
+            // advance re-checks every 500 ms and fires the moment
+            // the mic frees, so the exact advance logic (not a
+            // reconstruction) runs then. Generation discipline is
+            // untouched: pause / stop / priority still cancel it
+            // outright via cancelPendingSegmentAdvance.
+            if (micHold) {
+                logMicHeld("segment advance");
+                handler.postDelayed(self[0], 500);
+                return;
+            }
             pendingSegmentAdvance = null;
             advance.run();
         };
+        self[0] = delayed;
         pendingSegmentAdvance = delayed;
         handler.postDelayed(delayed, SEGMENT_GAP_MS);
     }
@@ -2357,6 +2433,7 @@ public class VoiceService extends Service
 
     /** Runs on main thread: speak the next queued text if nothing is playing. */
     private void pumpTtsQueue() {
+        refreshMicHold("pump"); // v1.83: fresh config count at start time
         // Nick 2026-10-22 v1.27: ttsPaused blocks the pump — a paused
         // message holds its place until resume.
         if (ttsSpeaking || playing || ttsPaused) return;
@@ -2366,6 +2443,12 @@ public class VoiceService extends Service
         // — device TTS cannot be pinned to the earbuds.
         if (laneTtsBlocked()) {
             logLaneHeld("TTS playback");
+            return;
+        }
+        // Nick 2026-11-02 v1.83: mic hold — the text stays queued,
+        // unspoken, until the microphone frees.
+        if (micHold) {
+            logMicHeld("TTS playback");
             return;
         }
         String text;
@@ -2416,6 +2499,20 @@ public class VoiceService extends Service
             broadcastPlaybackState();
             return;
         }
+        // v1.83: mic-hold backstop (the lane twin above) — unwind
+        // exactly like it: nothing was heard, no report.
+        if (micHold && !micCriticalBypass) {
+            log("michold: held — direct TTS attempt held off");
+            ttsSpeaking = false;
+            isPlayingAudio = false;
+            setPlayingAudio(false);
+            pendingTtsServerId = null;
+            pendingTtsSegmentGroup = null;
+            currentPlayServerId = null;
+            currentPlaySegmentGroup = null;
+            broadcastPlaybackState();
+            return;
+        }
         if (tts == null || !ttsReady) {
             log("tts: on-device not ready, dropping text");
             onTtsDone();
@@ -2431,6 +2528,7 @@ public class VoiceService extends Service
             // pending null, so it is never clobbered here).
             if (pendingTtsServerId != null) {
                 currentPlayServerId = pendingTtsServerId;
+                currentPlayCritical = false; // v1.83: queue play, see playFileNow
                 pendingTtsServerId = null;
             }
             // v1.58: adopt the queued segment group the same way.
@@ -2599,7 +2697,211 @@ public class VoiceService extends Service
     // resume continues from there. The queue is untouched.
     private boolean playbackPaused = false;
 
+    // ------------------------------------------------------------ v1.83 mic hold
+    // Nick 2026-11-02 v1.83: MIC-ACTIVITY AUTO-PAUSE (his design).
+    // When ANY other app uses the phone's microphone — his case:
+    // dictating in the Muse app — her voice would be picked up
+    // into that app's dictation, so playback pauses and new starts
+    // hold until the mic frees; ~2 s of continuous mic-free later,
+    // a pause THIS hold caused resumes on its own. Detection is
+    // the count of active recording configurations (post-v1.82
+    // this app never records, so every configuration is external;
+    // AOSP anonymizes the entries for a regular app — the count is
+    // device-wide, which is all this needs): an AudioRecordingCallback
+    // (API 29+, instant) is primary, and a getActiveRecordingConfigurations()
+    // re-read rides every poll cycle and every start gateway as the
+    // fallback. No permission is required for either. The hold is a
+    // sibling of the earbuds-only lane hold and composes with it:
+    // the two flags are independent, and a start or resume needs
+    // BOTH clear. EXCEPTION, standing rule: serious-critical rows
+    // (priority "critical") break through — they are never paused
+    // by the hold and never held by it.
+    private boolean micHold = false;
+    // True only when the CURRENT pause was caused by this hold.
+    // Mic-free resumes only its own pauses; a user's pause is never
+    // auto-resumed, and a manual pause during a hold clears this
+    // (the pause becomes his — see pausePlayback()).
+    private boolean micPausedByUs = false;
+    // Set only for the duration of a serious-critical start call,
+    // so the playFileNow / speakOnDevice backstops let it through.
+    private boolean micCriticalBypass = false;
+    // Last seen recording-config count (-1 = never read). Logged
+    // on every change — the field log proves which detection
+    // mechanism actually fires on the A17.
+    private int micConfigCount = -1;
+    private long micHeldLogAtMs = 0;
+    private Runnable micResumeTask = null;
+    private MicRecordingCallback micRecordingCallback = null;
+    private static final long MIC_RESUME_DELAY_MS = 2000;
+
+    /** Register the recording-config callback (API 29+). The
+     *  config-count fallback in refreshMicHold covers older levels
+     *  and any event the callback somehow misses. */
+    private void startMicHoldWatch() {
+        if (audioManager != null
+                && Build.VERSION.SDK_INT >= 29
+                && micRecordingCallback == null) {
+            micRecordingCallback = new MicRecordingCallback(this);
+            try {
+                audioManager.registerAudioRecordingCallback(
+                        micRecordingCallback, handler);
+                log("michold: recording callback registered");
+            } catch (Exception e) {
+                log("michold: callback register failed: "
+                        + e.getMessage());
+                micRecordingCallback = null;
+            }
+        }
+        refreshMicHold("startup");
+    }
+
+    private void stopMicHoldWatch() {
+        if (audioManager != null && micRecordingCallback != null) {
+            try {
+                audioManager.unregisterAudioRecordingCallback(
+                        micRecordingCallback);
+            } catch (Exception ignored) {}
+            micRecordingCallback = null;
+        }
+        cancelMicResume();
+    }
+
+    /** Main-thread entry from MicRecordingCallback. */
+    public void onMicRecordingConfigsChanged(int count) {
+        applyMicConfigCount(count, "callback");
+    }
+
+    /** Active recording configurations right now (see the section
+     *  comment: every one of them is another app's). */
+    private int currentRecordingConfigCount() {
+        if (audioManager == null) return 0;
+        try {
+            List<AudioRecordingConfiguration> configs =
+                    audioManager.getActiveRecordingConfigurations();
+            return configs == null ? 0 : configs.size();
+        } catch (Exception e) {
+            return 0;
+        }
+    }
+
+    /** Re-read the config count and drive the hold state. Called
+     *  on every poll cycle, at every start gateway, and (through
+     *  the callback) the instant the set changes. Main thread. */
+    private void refreshMicHold(String source) {
+        applyMicConfigCount(currentRecordingConfigCount(), source);
+    }
+
+    private void applyMicConfigCount(int count, String source) {
+        if (count != micConfigCount) {
+            micConfigCount = count;
+            log("michold: recording configs=" + count
+                    + " (" + source + ")");
+        }
+        if (count > 0) {
+            onMicActive();
+        } else {
+            onMicFree();
+        }
+    }
+
+    private void onMicActive() {
+        cancelMicResume();
+        if (!micHold) {
+            micHold = true;
+            log("michold: mic active — pausing/holding"
+                    + ((safeIsPlaying() || ttsSpeaking)
+                            ? "" : " (nothing playing — starts held)"));
+        }
+        // Pause live playback with the existing machinery (the
+        // position is kept). Never claim a pause that is already
+        // the user's, and never pause a serious-critical play.
+        if ((safeIsPlaying() || ttsSpeaking)
+                && !playbackPaused && !ttsPaused
+                && !currentPlayCritical) {
+            micPausedByUs = true;
+            doPausePlayback();
+        }
+    }
+
+    private void onMicFree() {
+        if (!micHold || micResumeTask != null) return;
+        // Anti-flap: the resume lands only after ~2 s of CONTINUOUS
+        // mic-free — onMicActive cancels this task if the mic is
+        // grabbed again inside the window.
+        micResumeTask = () -> {
+            micResumeTask = null;
+            if (micHold && micConfigCount == 0) finishMicHold();
+        };
+        handler.postDelayed(micResumeTask, MIC_RESUME_DELAY_MS);
+    }
+
+    private void cancelMicResume() {
+        if (micResumeTask != null) {
+            handler.removeCallbacks(micResumeTask);
+            micResumeTask = null;
+        }
+    }
+
+    private void finishMicHold() {
+        micHold = false;
+        boolean wasMicPaused = micPausedByUs;
+        micPausedByUs = false;
+        if (playbackPaused || ttsPaused) {
+            if (!wasMicPaused) {
+                // His pause, not ours — mic-free never resumes it.
+                log("michold: mic free — staying paused (user pause)");
+                return;
+            }
+            log("michold: mic free — resuming");
+            // resumePlayback re-checks the lane gate itself: if the
+            // earbuds lane also blocks, the item stays paused under
+            // the lane's authority — the two holds compose.
+            resumePlayback();
+        } else {
+            log("michold: mic free — resuming");
+        }
+        // Restart whatever the hold kept from starting. Every
+        // starter re-checks its own gates, and a deferred segment
+        // advance fires on its own re-check too — double-starts are
+        // impossible because each path re-tests live state.
+        if (!playing && !ttsSpeaking && !playbackPaused && !ttsPaused) {
+            if (!waitingPriority.isEmpty()) {
+                playNextWaitingPriority();
+            } else if (!interruptStack.isEmpty()) {
+                resumeNextInterrupted();
+            } else {
+                pumpAudioQueue();
+                pumpTtsQueue();
+            }
+        }
+    }
+
+    /** Throttled held-state log so the gates can call it freely
+     *  (the logLaneHeld pattern). */
+    private void logMicHeld(String what) {
+        long now = android.os.SystemClock.uptimeMillis();
+        if (now - micHeldLogAtMs < 60_000) return;
+        micHeldLogAtMs = now;
+        log("michold: held — " + what
+                + " waiting for the microphone to free up");
+    }
+
     private void pausePlayback() {
+        // v1.83: a manual pause during a mic hold converts the
+        // hold's pause into the USER's pause — mic-free must not
+        // auto-resume a pause he claimed for himself.
+        if (micPausedByUs) {
+            micPausedByUs = false;
+            log("michold: user pause during mic hold — "
+                    + "auto-resume cancelled");
+        }
+        doPausePlayback();
+    }
+
+    /** The pause machinery itself (the v1.28 body). Callers: the
+     *  user's pause controls via pausePlayback(), and the mic hold
+     *  — which must not trip the user-pause conversion above. */
+    private void doPausePlayback() {
         // v1.58: pausing during a segment gap cancels the pending
         // start — the successor stays queued and the pumps start it
         // later with no gap owed.
@@ -2673,6 +2975,15 @@ public class VoiceService extends Service
             toast("Earbuds-only is on — connect your earbuds to listen");
             return;
         }
+        // Nick 2026-11-02 v1.83: same for the mic hold — a paused
+        // item must not resume into an active dictation. The
+        // mic-free timer performs the resume when the mic frees
+        // (finishMicHold clears the hold before calling in here).
+        if (micHold && (playbackPaused || ttsPaused)) {
+            log("michold: resume held — mic still active");
+            toast("Microphone in use — resumes when it's free");
+            return;
+        }
         boolean didResume = false;
         // MP3 path (Aria/quality mode, replays).
         if (player != null && playbackPaused) {
@@ -2737,6 +3048,10 @@ public class VoiceService extends Service
         cancelPendingResume();
         // Nick 2026-10-23 v1.40: stop cancels any priority flow too.
         priorityMode = false;
+        // v1.83: a stop also retires any mic-hold pause claim —
+        // nothing remains for mic-free to resume.
+        micPausedByUs = false;
+        currentPlayCritical = false;
         priorityInterruptDepth = 0;
         currentPriorityPlayText = null;
         // Nick 2026-10-23 v1.42: stop also drops queued priority items.
@@ -2843,11 +3158,15 @@ public class VoiceService extends Service
      * must already be downloaded.
      */
     private void playPriorityMp3(final File f, final String text,
-            final String serverId, final String segmentGroup) {
+            final String serverId, final String segmentGroup,
+            final boolean critical) {
         log("priority: playing high-priority MP3"
                 + (serverId != null ? " id=" + serverId : ""));
         priorityMode = true;
         interruptCurrentPlayback();
+        // v1.83: the interrupt stack now owns any paused state —
+        // retire the mic hold's resume claim on it.
+        micPausedByUs = false;
         markSpokenLocked(text);
         // MessageHistory entry so the card exists for replay.
         MessageHistory.add(text, f, serverId);
@@ -2858,6 +3177,8 @@ public class VoiceService extends Service
         currentPlayServerId = serverId;
         // v1.58: same for the segment group.
         currentPlaySegmentGroup = segmentGroup;
+        // v1.83: critical witness for the orphan guard + mic hold.
+        currentPlayCritical = critical;
         // v1.80: raise the playing flag exactly as the queue pump
         // (playNext) does before playFileNow. interruptCurrentPlayback
         // cleared it and playFileNow never sets it, so on this path
@@ -2870,17 +3191,26 @@ public class VoiceService extends Service
         // playFileNow can park this play complete if a newer start
         // supersedes it mid-play.
         currentPriorityPlayText = text;
-        if (!playFileNow(f)) {
+        // v1.83: a serious-critical row plays through the mic
+        // hold — the bypass covers the playFileNow start gate only.
+        micCriticalBypass = critical;
+        boolean started = playFileNow(f);
+        micCriticalBypass = false;
+        if (!started) {
             // v1.75: parked at the lane gate — back to the head of
             // the waiting queue; the priority chain releases it when
             // the lane can actually play.
             playing = false;
             currentPlayServerId = null;
             currentPlaySegmentGroup = null;
+            currentPlayCritical = false;
             currentPriorityPlayText = null;
             priorityMode = false;
+            // v1.83: the row keeps its class across the park — a
+            // critical parked by the lane is still a critical when
+            // the FIFO drains it.
             waitingPriority.addFirst(new WaitingPriority(f, text,
-                    serverId, segmentGroup));
+                    serverId, segmentGroup, critical));
             log("lane: priority play parked — returned to the "
                     + "waiting queue (" + waitingPriority.size()
                     + " waiting)");
@@ -2897,10 +3227,12 @@ public class VoiceService extends Service
      * on-device TTS, interrupting whatever is playing. Runs on main thread.
      */
     private void playPriorityTts(final String text, final String serverId,
-            final String segmentGroup) {
+            final String segmentGroup, final boolean critical) {
         log("priority: speaking high-priority text via on-device TTS");
         priorityMode = true;
         interruptCurrentPlayback();
+        // v1.83: see playPriorityMp3 — the stack owns the pause now.
+        micPausedByUs = false;
         markSpokenLocked(text);
         broadcastMessage(text);
         MessageHistory.add(text, null, serverId);
@@ -2910,7 +3242,13 @@ public class VoiceService extends Service
         currentPlayServerId = serverId;
         // v1.58: same for the segment group.
         currentPlaySegmentGroup = segmentGroup;
+        // v1.83: critical witness (see playPriorityMp3).
+        currentPlayCritical = critical;
+        // v1.83: a serious-critical row plays through the mic hold —
+        // the bypass covers the speakOnDevice start gate only.
+        micCriticalBypass = critical;
         speakOnDevice(text, false);
+        micCriticalBypass = false;
     }
 
     /**
@@ -2920,16 +3258,30 @@ public class VoiceService extends Service
      * right after it finishes.
      */
     private void onPriorityArrivalMp3(final File f, final String text,
-            final String serverId, final String segmentGroup) {
+            final String serverId, final String segmentGroup,
+            final boolean critical) {
+        refreshMicHold("arrival"); // v1.83: fresh count before a start
         // v1.58: a priority arrival preempts any pending post-gap
         // start — whether it plays now or parks, it outranks the gap.
         cancelPendingSegmentAdvance();
         if (priorityMode) {
             waitingPriority.offer(new WaitingPriority(f, text, serverId,
-                    segmentGroup));
+                    segmentGroup, critical));
             log("priority: queued behind playing priority ("
                     + waitingPriority.size() + " waiting)"
                     + (serverId != null ? " id=" + serverId : ""));
+            toast("Priority message queued");
+            return;
+        }
+        // Nick 2026-11-02 v1.83: mic hold — a priority item parks
+        // while another app uses the microphone (her voice would
+        // land in his dictation). EXCEPTION: serious-critical rows
+        // play anyway — critical alerts break through, always.
+        if (micHold && !critical) {
+            waitingPriority.offer(new WaitingPriority(f, text, serverId,
+                    segmentGroup, critical));
+            log("michold: priority MP3 parked — microphone in use ("
+                    + waitingPriority.size() + " waiting)");
             toast("Priority message queued");
             return;
         }
@@ -2944,7 +3296,7 @@ public class VoiceService extends Service
             toast("Priority message queued");
             return;
         }
-        playPriorityMp3(f, text, serverId, segmentGroup);
+        playPriorityMp3(f, text, serverId, segmentGroup, critical);
     }
 
     /**
@@ -2954,14 +3306,26 @@ public class VoiceService extends Service
      * item, never interrupt it.
      */
     private void onPriorityArrivalTts(final String text, final String serverId,
-            final String segmentGroup) {
+            final String segmentGroup, final boolean critical) {
+        refreshMicHold("arrival"); // v1.83: fresh count before a start
         // v1.58: priority preempts a pending post-gap start (see
         // onPriorityArrivalMp3).
         cancelPendingSegmentAdvance();
         if (priorityMode) {
             waitingPriority.offer(new WaitingPriority(null, text, serverId,
-                    segmentGroup));
+                    segmentGroup, critical));
             log("priority: queued behind playing priority ("
+                    + waitingPriority.size() + " waiting)");
+            toast("Priority message queued");
+            return;
+        }
+        // Nick 2026-11-02 v1.83: mic hold — park instead of
+        // speaking into his dictation (see the MP3 twin).
+        // Serious-critical rows are exempt: they play anyway.
+        if (micHold && !critical) {
+            waitingPriority.offer(new WaitingPriority(null, text, serverId,
+                    segmentGroup, critical));
+            log("michold: priority TTS parked — microphone in use ("
                     + waitingPriority.size() + " waiting)");
             toast("Priority message queued");
             return;
@@ -2977,7 +3341,7 @@ public class VoiceService extends Service
             toast("Priority message queued");
             return;
         }
-        playPriorityTts(text, serverId, segmentGroup);
+        playPriorityTts(text, serverId, segmentGroup, critical);
     }
 
     /**
@@ -2988,11 +3352,22 @@ public class VoiceService extends Service
      * to interrupt — the flow simply continues with priorityMode held.
      */
     private void playNextWaitingPriority() {
+        refreshMicHold("drain"); // v1.83: fresh count before a start
         // Nick 2026-10-30 v1.73: earbuds-only lane armed but no
         // earbuds — the queued priority item waits for the earbuds.
         if (laneBlocked()) {
             logLaneHeld("queued priority playback");
             return;
+        }
+        // Nick 2026-11-02 v1.83: mic hold — the FIFO waits for the
+        // microphone, UNLESS its head is a serious-critical row:
+        // critical alerts break through, always.
+        if (micHold) {
+            WaitingPriority head = waitingPriority.peek();
+            if (head == null || !head.critical) {
+                logMicHeld("queued priority playback");
+                return;
+            }
         }
         WaitingPriority wp = waitingPriority.poll();
         if (wp == null) return;
@@ -3008,9 +3383,10 @@ public class VoiceService extends Service
         }
         if (wp.audioFile != null) {
             playPriorityMp3(wp.audioFile, wp.text, wp.serverId,
-                    wp.segmentGroup);
+                    wp.segmentGroup, wp.critical);
         } else {
-            playPriorityTts(wp.text, wp.serverId, wp.segmentGroup);
+            playPriorityTts(wp.text, wp.serverId, wp.segmentGroup,
+                    wp.critical);
         }
     }
 
@@ -3039,11 +3415,19 @@ public class VoiceService extends Service
      * Runs on the main thread.
      */
     private void resumeNextInterrupted() {
+        refreshMicHold("resume"); // v1.83: fresh count before a start
         // Nick 2026-10-30 v1.73: earbuds-only lane armed but no
         // earbuds — the interrupted item stays on the stack,
         // unresumed, until the earbuds return.
         if (laneBlocked()) {
             logLaneHeld("interrupted-item resume");
+            return;
+        }
+        // Nick 2026-11-02 v1.83: mic hold — the interrupted item
+        // likewise stays on the stack until the mic frees (the
+        // mic-free flow re-enters here).
+        if (micHold) {
+            logMicHeld("interrupted-item resume");
             return;
         }
         InterruptedState st = interruptStack.poll();
