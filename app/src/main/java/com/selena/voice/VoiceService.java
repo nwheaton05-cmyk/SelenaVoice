@@ -2725,14 +2725,48 @@ public class VoiceService extends Service
     // Set only for the duration of a serious-critical start call,
     // so the playFileNow / speakOnDevice backstops let it through.
     private boolean micCriticalBypass = false;
-    // Last seen recording-config count (-1 = never read). Logged
-    // on every change — the field log proves which detection
-    // mechanism actually fires on the A17.
+    // Last seen RELEVANT recording-config count (-1 = never read)
+    // — the count AFTER the v1.84 source filtering below; the hold
+    // keys on this. Logged on every change — the field log proves
+    // which detection mechanism actually fires on the A17.
     private int micConfigCount = -1;
     private long micHeldLogAtMs = 0;
     private Runnable micResumeTask = null;
     private MicRecordingCallback micRecordingCallback = null;
     private static final long MIC_RESUME_DELAY_MS = 2000;
+
+    // ------------------------------------------------------------ v1.84 filter
+    // Nick's plan (banked 2026-11-02): MIC-HOLD SOURCE FILTERING.
+    // v1.83 held on the RAW device-wide count, so a PERSISTENT
+    // system recording configuration — the always-on hotword
+    // detector is the standing example — would hold ordinary
+    // playback forever. v1.84 classifies every configuration by
+    // its AUDIO SOURCE and ignores the class that is not a person
+    // using the mic:
+    //   - HOTWORD source (1999), on either the effective source
+    //     (getAudioSource) or the client-requested source
+    //     (getClientAudioSource): always-on hotword sessions
+    //     (Assistant / Bixby wake-word detectors). Persistent by
+    //     design; nobody is dictating at them.
+    // Source is the ONLY discriminator the public API offers a
+    // regular app: AudioRecordingConfiguration exposes no client
+    // package or uid (those accessors are system-API only), which
+    // is also why no own-package rule is needed — post-v1.82 this
+    // app never records, so it never creates a configuration.
+    // Everything non-hotword COUNTS — voice communication, voice
+    // recognition, plain mic, camcorder: a genuine app recording a
+    // person. The filter fails toward holding: any configuration
+    // whose source cannot be read still holds, so Nick dictating
+    // in any app is protected exactly as in v1.83. Every change
+    // logs raw + relevant counts and the per-config
+    // classification, so field logs show precisely what was
+    // ignored and why. The critical bypass is untouched: critical
+    // rows were never held and still are not.
+    private static final int AUDIO_SOURCE_HOTWORD = 1999;
+    // Last seen RAW (unfiltered) count + classification summary,
+    // for change logging only — the hold never reads these.
+    private int micRawConfigCount = -1;
+    private String micConfigDetail = "";
 
     /** Register the recording-config callback (API 29+). The
      *  config-count fallback in refreshMicHold covers older levels
@@ -2767,41 +2801,85 @@ public class VoiceService extends Service
     }
 
     /** Main-thread entry from MicRecordingCallback. */
-    public void onMicRecordingConfigsChanged(int count) {
-        applyMicConfigCount(count, "callback");
+    public void onMicRecordingConfigsChanged(
+            List<AudioRecordingConfiguration> configs) {
+        applyMicConfigs(configs, "callback");
     }
 
-    /** Active recording configurations right now (see the section
-     *  comment: every one of them is another app's). */
-    private int currentRecordingConfigCount() {
-        if (audioManager == null) return 0;
-        try {
-            List<AudioRecordingConfiguration> configs =
-                    audioManager.getActiveRecordingConfigurations();
-            return configs == null ? 0 : configs.size();
-        } catch (Exception e) {
-            return 0;
+    /** Why a recording configuration does NOT hold playback, or
+     *  null when it counts as a genuine external mic user (v1.84
+     *  filtering — see the section comment). An unreadable source
+     *  (-1) fails toward holding. */
+    private String micIgnoreReason(int audioSource, int clientSource) {
+        if (audioSource == AUDIO_SOURCE_HOTWORD
+                || clientSource == AUDIO_SOURCE_HOTWORD) {
+            return "hotword";
         }
+        return null;
     }
 
-    /** Re-read the config count and drive the hold state. Called
-     *  on every poll cycle, at every start gateway, and (through
-     *  the callback) the instant the set changes. Main thread. */
-    private void refreshMicHold(String source) {
-        applyMicConfigCount(currentRecordingConfigCount(), source);
-    }
-
-    private void applyMicConfigCount(int count, String source) {
-        if (count != micConfigCount) {
-            micConfigCount = count;
-            log("michold: recording configs=" + count
-                    + " (" + source + ")");
+    /** Classify the current configuration set and drive the hold
+     *  state from the RELEVANT count (v1.84). Logs raw + relevant
+     *  counts with the per-config classification whenever any of
+     *  them changes. */
+    private void applyMicConfigs(
+            List<AudioRecordingConfiguration> configs, String source) {
+        int raw = configs == null ? 0 : configs.size();
+        int relevant = 0;
+        StringBuilder detail = new StringBuilder();
+        if (configs != null) {
+            for (AudioRecordingConfiguration c : configs) {
+                int src = -1;
+                int csrc = -1;
+                try {
+                    src = c.getAudioSource();
+                } catch (Exception ignored) {}
+                try {
+                    csrc = c.getClientAudioSource();
+                } catch (Exception ignored) {}
+                String why = micIgnoreReason(src, csrc);
+                if (why == null) relevant++;
+                if (detail.length() > 0) detail.append(", ");
+                detail.append("src=").append(src)
+                        .append(" csrc=").append(csrc);
+                if (why != null) {
+                    detail.append(" ignored(").append(why).append(")");
+                }
+            }
         }
-        if (count > 0) {
+        String detailStr = detail.toString();
+        if (raw != micRawConfigCount || relevant != micConfigCount
+                || !detailStr.equals(micConfigDetail)) {
+            micRawConfigCount = raw;
+            micConfigDetail = detailStr;
+            log("michold: recording configs=" + raw
+                    + " relevant=" + relevant
+                    + " (" + source + ")"
+                    + (detailStr.isEmpty()
+                            ? "" : " [" + detailStr + "]"));
+        }
+        micConfigCount = relevant;
+        if (relevant > 0) {
             onMicActive();
         } else {
             onMicFree();
         }
+    }
+
+    /** Re-read the configurations and drive the hold state.
+     *  Called on every poll cycle, at every start gateway, and
+     *  (through the callback) the instant the set changes. Main
+     *  thread. */
+    private void refreshMicHold(String source) {
+        List<AudioRecordingConfiguration> configs = null;
+        if (audioManager != null) {
+            try {
+                configs = audioManager.getActiveRecordingConfigurations();
+            } catch (Exception e) {
+                configs = null;
+            }
+        }
+        applyMicConfigs(configs, source);
     }
 
     private void onMicActive() {
