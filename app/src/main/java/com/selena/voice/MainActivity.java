@@ -84,8 +84,6 @@ public class MainActivity extends Activity {
     private Switch noReadoutSwitch;
     private Switch btSwitch;
     private Switch spkSwitch;
-    private Switch earbudsOnlySwitch;
-    private Switch headsetFallbackSwitch;
 
     public MainActivity() {
         receiver = new MessageReceiver(this);
@@ -173,12 +171,6 @@ public class MainActivity extends Activity {
             String buildDate = "2026-10-22";
             ((TextView) findViewById(R.id.versionText)).setText("v" + vn + " (" + buildDate + ")");
         } catch (Exception ignored) {}
-        // Nick 2026-10-23 v1.48: long-press version text to set earbuds
-        // BT device name (one-time setup for the earbuds-only lane).
-        findViewById(R.id.versionText).setOnLongClickListener(v -> {
-            showEarbudsSetupDialog();
-            return true;
-        });
         // Nick 2026-10-21 v1.24: persistent message history with replay.
         MessageHistory.init(this);
         messageList = findViewById(R.id.messageList);
@@ -288,43 +280,6 @@ public class MainActivity extends Activity {
             VoiceService.setForceSpeaker(this, on); // clears BT pref
             VoiceService.log("voice: output=speaker" + (on ? " (exclusive)" : " (auto)"));
             syncOutputSwitches();
-        });
-
-        // Nick 2026-10-30 v1.73: earbuds-only playback lane. ON
-        // (the default): Selena plays ONLY into the named earbuds
-        // (headset channel, Spotify untouched) and not at all when
-        // they're disconnected. Needs the earbuds name (long-press
-        // the version text) — without one the lane stays inert.
-        earbudsOnlySwitch = findViewById(R.id.earbudsOnlySwitch);
-        earbudsOnlySwitch.setChecked(VoiceService.getEarbudsOnly(this));
-        earbudsOnlySwitch.setOnCheckedChangeListener((v, on) -> {
-            VoiceService.setEarbudsOnly(this, on);
-            VoiceService.log("lane: earbuds-only=" + on);
-            if (on) {
-                String name = getSharedPreferences(
-                        "selena_voice_prefs", MODE_PRIVATE)
-                        .getString("earbuds_device_name", "");
-                if (name == null || name.isEmpty()) {
-                    android.widget.Toast.makeText(this,
-                            "Set your earbuds name first "
-                                    + "(long-press the version text)",
-                            android.widget.Toast.LENGTH_LONG).show();
-                }
-            }
-        });
-
-        // Nick 2026-10-30 v1.77: headset fallback for the earbuds
-        // lane. ON (the default): when the clean earbuds route is
-        // refused or unprovable in a split case (Android Auto
-        // refuses the media pin), Selena falls back to the earbuds'
-        // headset channel instead of staying silent. OFF restores
-        // the v1.76 park-on-refusal behavior.
-        headsetFallbackSwitch = findViewById(R.id.headsetFallbackSwitch);
-        headsetFallbackSwitch.setChecked(
-                VoiceService.getHeadsetFallback(this));
-        headsetFallbackSwitch.setOnCheckedChangeListener((v, on) -> {
-            VoiceService.setHeadsetFallback(this, on);
-            VoiceService.log("lane: headset-fallback=" + on);
         });
 
         requestPermissions();
@@ -850,42 +805,5 @@ public class MainActivity extends Activity {
         }
         card.addView(row);
         return card;
-    }
-
-    /**
-     * Nick 2026-10-23 v1.48: one-time earbuds setup. Long-press the
-     * version text to open this. Enter the Bluetooth name of Nick's
-     * earbuds (as shown in Android BT settings). The name drives the
-     * earbuds-only playback lane (v1.73).
-     */
-    private void showEarbudsSetupDialog() {
-        android.widget.EditText input = new android.widget.EditText(this);
-        input.setHint("Earbuds Bluetooth name");
-        // Pre-fill with current saved value, if any.
-        try {
-            android.content.SharedPreferences prefs =
-                    getSharedPreferences("selena_voice_prefs", MODE_PRIVATE);
-            String cur = prefs.getString("earbuds_device_name", "");
-            if (cur != null) input.setText(cur);
-        } catch (Exception ignored) {}
-        new android.app.AlertDialog.Builder(this)
-                .setTitle("Earbuds device")
-                .setMessage("Enter the Bluetooth name of your earbuds "
-                        + "(as shown in Android Bluetooth settings). "
-                        + "This name drives earbuds-only playback: "
-                        + "with that switch on, she plays only into these "
-                        + "earbuds and stays silent while they're away.")
-                .setView(input)
-                .setPositiveButton("Save", (d, w) -> {
-                    String name = input.getText().toString().trim();
-                    getSharedPreferences("selena_voice_prefs", MODE_PRIVATE)
-                            .edit().putString("earbuds_device_name", name).apply();
-                    android.widget.Toast.makeText(this,
-                            name.isEmpty() ? "Earbuds cleared"
-                                    : "Earbuds set: " + name,
-                            android.widget.Toast.LENGTH_SHORT).show();
-                })
-                .setNegativeButton("Cancel", null)
-                .show();
     }
 }
