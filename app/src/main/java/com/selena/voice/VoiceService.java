@@ -516,6 +516,18 @@ public class VoiceService extends Service
         initOnDeviceTts();
         // Nick 2026-10-21 v1.24: persistent 3-day message history.
         MessageHistory.init(this);
+        // Nick 2026-11-03 v1.85: startup sweep — any history entry
+        // whose playback started but whose playback-end deletion
+        // never ran (the process died mid-play) is deleted now,
+        // entry + cached audio. This is also what clears entries
+        // left behind by pre-v1.85 builds, whose delete fired only
+        // on a live full completion — on the 2026-11-02 failure the
+        // messages played on stale pre-v1.82 in-memory code, so no
+        // delete ever ran for them. Locked entries are exempt
+        // (a lock is Nick's explicit keep).
+        int swept = MessageHistory.sweepStartedEntries();
+        log("cleanup: startup sweep deleted " + swept
+                + " already-played history entries");
         // Nick 2026-10-19 v1.16: outbound moved back here from MainActivity
         // — the service now works with the screen locked / app backgrounded.
         startPolling();
@@ -1808,24 +1820,31 @@ public class VoiceService extends Service
     }
 
     /**
-     * v1.82 (Nick, 2026-11-02): delete-after-full-play. Called from
-     * the two completion handlers at the exact points where the
-     * played report fires — a message that played through in full
-     * loses its local footprint: the MessageHistory entry and its
-     * cached audio file(s), including the replay cache. Matched by
-     * queue row id; history replays complete with no live row id, so
-     * they match by the played file's path instead. Partial plays,
-     * pauses, and stops never call this. Locked entries are exempt
-     * (MessageHistory enforces it — a lock is Nick's explicit keep).
+     * v1.82 (Nick, 2026-11-02): delete-after-full-play.
+     * v1.85 (Nick, 2026-11-03): delete-after-play — Nick: "I want
+     * everything deleted as soon as the message plays." Called at
+     * EVERY end of a playback that actually started: the two
+     * completion handlers (at the exact points where the played
+     * report fires), the stop path, and skip-to-newest. A message
+     * that played loses its local footprint: the MessageHistory
+     * entry and its cached audio file(s), including the replay
+     * cache. Matched by queue row id; history replays carry no live
+     * row id, so they match by the played file's path instead. A
+     * pause never calls this — a paused message is parked for
+     * resume, not ended; if it is later discarded by a stop or a
+     * skip, the deletion happens then. A playback end that kills
+     * the process itself is caught by the startup sweep in
+     * onCreate. Locked entries are exempt (MessageHistory enforces
+     * it — a lock is Nick's explicit keep).
      */
-    private void cleanupFullyPlayedMessage(String rowId, String audioPath) {
+    private void cleanupPlayedMessage(String rowId, String audioPath) {
         if ((rowId == null || rowId.isEmpty() || "priority".equals(rowId))
                 && audioPath == null) {
             return;
         }
-        String removed = MessageHistory.deleteIfFullyPlayed(rowId, audioPath);
+        String removed = MessageHistory.deletePlayedMessage(rowId, audioPath);
         if (removed != null) {
-            log("cleanup: deleted fully-played message row id=" + removed);
+            log("cleanup: deleted played message row id=" + removed);
         }
     }
 
@@ -1906,6 +1925,11 @@ public class VoiceService extends Service
         String armRowId = currentPlayServerId;
         if (armRowId != null && !armRowId.isEmpty()
                 && !"priority".equals(armRowId)) {
+            // v1.85: this watch arms exactly when a row's playback
+            // starts — record the start, so a playback end that
+            // never reaches a cleanup call (process death) is swept
+            // at the next service start.
+            MessageHistory.markStarted(armRowId);
             log("progress: almost-done watch armed for row "
                     + armRowId
                     + (priorityMode ? " (priority path)"
@@ -1957,6 +1981,9 @@ public class VoiceService extends Service
         final String rowId = currentPlayServerId;
         if (rowId == null || rowId.isEmpty()
                 || "priority".equals(rowId)) return;
+        // v1.85: this row's TTS playback is starting — record the
+        // start (same startup-sweep contract as the MP3 watch).
+        MessageHistory.markStarted(rowId);
         synchronized (almostDoneFiredRows) {
             if (almostDoneFiredRows.contains(rowId)) return;
         }
@@ -2013,11 +2040,13 @@ public class VoiceService extends Service
         // way in (the v1.17 boost restore and the v1.61 deep-duck
         // release that lived here are both deleted).
         releasePlayer();
-        // v1.82 (Nick, 2026-11-02): delete-after-full-play — this row
-        // played through in full, so its local footprint goes now
-        // (history entry + cached/replay audio). Partial plays,
-        // pauses and stops never reach this point.
-        cleanupFullyPlayedMessage(finishedRowId,
+        // v1.82 (Nick, 2026-11-02): delete-after-full-play;
+        // v1.85: delete-after-play — this row played through in
+        // full, so its local footprint goes now (history entry +
+        // cached/replay audio). Playback that ends early deletes
+        // through the same helper from the stop / skip paths;
+        // pauses never delete (they resume).
+        cleanupPlayedMessage(finishedRowId,
                 finishedFile != null ? finishedFile.getAbsolutePath() : null);
         playing = false;
         isPlayingAudio = false;
@@ -2030,7 +2059,7 @@ public class VoiceService extends Service
             // v1.82: the cleanup above already removed the finished
             // message's history entry (and its cached file with it) —
             // a file still referenced here belongs to a LOCKED entry
-            // (the lock exempts it from delete-after-full-play) and is
+            // (the lock exempts it from delete-after-play) and is
             // kept for replay. Unreferenced one-shot files are cleaned
             // up; expired entries' MP3s go via purgeExpired.
             String path = currentAudioFile.getAbsolutePath();
@@ -2623,10 +2652,9 @@ public class VoiceService extends Service
         // v1.82: same for the finished row id (delete-after-full-play).
         final String finishedRowId = currentPlayServerId;
         reportPlaybackProgress(); // v1.55: before any unwinding below
-        // v1.82 (Nick, 2026-11-02): delete-after-full-play — see
-        // onPlaybackDoneNow. TTS plays carry no file; the entry is
-        // matched by row id.
-        cleanupFullyPlayedMessage(finishedRowId, null);
+        // v1.85: delete-after-play — see onPlaybackDoneNow. TTS
+        // plays carry no file; the entry is matched by row id.
+        cleanupPlayedMessage(finishedRowId, null);
         abandonAudioFocus();
         // v1.63: no boost to undo — nothing wrote the media volume.
         ttsSpeaking = false;
@@ -3116,6 +3144,22 @@ public class VoiceService extends Service
      */
     private void stopCurrentPlayback() {
         log("stop: halting current playback");
+        // v1.85: capture what is playing/paused BEFORE teardown —
+        // the current row plus every stacked interrupted row all
+        // started playing, and a stop ends their playback for good,
+        // so delete-after-play applies to each of them (the
+        // deletion runs at the end of this method, once the player
+        // and TTS are down). Queued priority items never started
+        // playing and are not touched.
+        final String stopRowId = currentPlayServerId;
+        final File stopFile = currentAudioFile;
+        final java.util.List<String[]> stopStack =
+                new java.util.ArrayList<>();
+        for (InterruptedState st : interruptStack) {
+            stopStack.add(new String[]{st.serverId,
+                    st.audioFile != null
+                            ? st.audioFile.getAbsolutePath() : null});
+        }
         // Nick 2026-10-29 v1.58: a stop also cancels a pending
         // post-gap segment start and drops the group tracker.
         cancelPendingSegmentAdvance();
@@ -3160,6 +3204,13 @@ public class VoiceService extends Service
         // the idle hold-over is for queue flow, not for a stop.
         laneEnd();
         broadcastPlaybackState();
+        // v1.85: delete-after-play for everything the stop ended
+        // (the stopped row + every discarded stacked row).
+        cleanupPlayedMessage(stopRowId,
+                stopFile != null ? stopFile.getAbsolutePath() : null);
+        for (String[] pair : stopStack) {
+            cleanupPlayedMessage(pair[0], pair[1]);
+        }
     }
 
     // ------------------------------------------------------------ v1.40 priority interrupt
@@ -3676,6 +3727,21 @@ public class VoiceService extends Service
      */
     private void skipToNewest() {
         log("skip: abandoning current playback, clearing queues");
+        // v1.85: capture the abandoned playback BEFORE teardown —
+        // the current row and every stacked interrupted row started
+        // playing, and a skip ends them for good: delete-after-play
+        // applies (the deletion runs after teardown, below).
+        // Messages still queued behind them never started and keep
+        // their history entries.
+        final String skipRowId = currentPlayServerId;
+        final File skipFile = currentAudioFile;
+        final java.util.List<String[]> skipStack =
+                new java.util.ArrayList<>();
+        for (InterruptedState st : interruptStack) {
+            skipStack.add(new String[]{st.serverId,
+                    st.audioFile != null
+                            ? st.audioFile.getAbsolutePath() : null});
+        }
         // Nick 2026-10-29 v1.58: skip takes manual control — a pending
         // post-gap start dies here, and the group tracker resets: the
         // newest message never waits on a gap owed to the abandoned one.
@@ -3723,6 +3789,13 @@ public class VoiceService extends Service
         }
         pendingTtsServerId = null;
         pendingTtsSegmentGroup = null; // v1.58
+        // v1.85: delete-after-play for the abandoned playback (the
+        // skipped row + every discarded stacked row).
+        cleanupPlayedMessage(skipRowId,
+                skipFile != null ? skipFile.getAbsolutePath() : null);
+        for (String[] pair : skipStack) {
+            cleanupPlayedMessage(pair[0], pair[1]);
+        }
         broadcastPlaybackState();
         toast("Skipping to newest…");
         // Network on a worker thread (Android forbids it on main).

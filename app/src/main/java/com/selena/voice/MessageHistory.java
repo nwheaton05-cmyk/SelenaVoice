@@ -35,9 +35,16 @@ public class MessageHistory {
         /** Nick 2026-10-23 v1.46: true when this entry is Nick's own
          * dictation (not Selena's reply) — rendered distinctly. */
         public final boolean fromNick;
+        /** Nick 2026-11-03 v1.85: true once this message's playback has
+         * actually started. Nick's rule: a message that plays gets
+         * deleted. Playback-end handlers delete started entries as
+         * playback ends; any started entry still present at service
+         * start belongs to a playback that ended with the process
+         * (crash/kill/restart) and is swept there. */
+        public boolean started;
 
         Entry(String id, String text, String audioPath, long timestamp, boolean locked,
-                String serverId, boolean fromNick) {
+                String serverId, boolean fromNick, boolean started) {
             this.id = id;
             this.text = text;
             this.audioPath = audioPath;
@@ -45,6 +52,7 @@ public class MessageHistory {
             this.locked = locked;
             this.serverId = serverId;
             this.fromNick = fromNick;
+            this.started = started;
         }
     }
 
@@ -79,7 +87,7 @@ public class MessageHistory {
         String id = "msg-" + System.currentTimeMillis() + "-" + (int)(Math.random() * 10000);
         Entry e = new Entry(id, text,
             audioFile != null ? audioFile.getAbsolutePath() : null,
-            System.currentTimeMillis(), false, serverId, fromNick);
+            System.currentTimeMillis(), false, serverId, fromNick, false);
         // Nick 2026-10-22 v1.26: chat order — newest at the bottom.
         entries.add(e);
         while (entries.size() > MAX_ENTRIES) {
@@ -116,15 +124,55 @@ public class MessageHistory {
         }
     }
 
-    /** Nick 2026-11-02 v1.82: delete-after-full-play. Remove the entry
-     * for a message whose playback completed in full — matched by
-     * server row ID, or by audio path (history replays complete with
-     * no live row ID, so the played file's path is their identity) —
-     * and delete its cached audio file with it. LOCKED entries are
-     * exempt: a lock is Nick's explicit keep and outranks the default
-     * delete. Returns the removed entry's server ID (or its local ID
-     * when it has no server row), or null when nothing was removed. */
-    public static synchronized String deleteIfFullyPlayed(String serverId,
+    /** Nick 2026-11-03 v1.85: record that playback of the message with
+     * this server row ID has actually started. Called from the
+     * playback-start witnesses in VoiceService. No-op when the entry
+     * is already marked or unknown. */
+    public static synchronized void markStarted(String serverId) {
+        if (serverId == null || serverId.isEmpty()) return;
+        for (Entry e : entries) {
+            if (serverId.equals(e.serverId)) {
+                if (!e.started) {
+                    e.started = true;
+                    save();
+                }
+                return;
+            }
+        }
+    }
+
+    /** Nick 2026-11-03 v1.85: startup sweep — remove every entry whose
+     * playback had started but whose playback-end deletion never ran
+     * (process died mid-play, or the entry predates v1.85 and was
+     * left behind by the old completion-only delete). LOCKED entries
+     * are exempt: a lock is Nick's explicit keep. Also removes the
+     * cached audio files. Returns the count removed. */
+    public static synchronized int sweepStartedEntries() {
+        int removed = 0;
+        for (int i = entries.size() - 1; i >= 0; i--) {
+            Entry e = entries.get(i);
+            if (e.started && !e.locked) {
+                deleteAudioFile(e);
+                entries.remove(i);
+                removed++;
+            }
+        }
+        if (removed > 0) save();
+        return removed;
+    }
+
+    /** Nick 2026-11-02 v1.82: delete-after-full-play; generalized
+     * 2026-11-03 v1.85 to delete-after-play. Remove the entry for a
+     * message whose playback has ENDED after it actually started —
+     * matched by server row ID, or by audio path (history replays end
+     * with no live row ID, so the played file's path is their
+     * identity) — and delete its cached audio file with it. Called at
+     * every playback end: completion, stop, skip-to-newest. LOCKED
+     * entries are exempt: a lock is Nick's explicit keep and outranks
+     * the default delete. Returns the removed entry's server ID (or
+     * its local ID when it has no server row), or null when nothing
+     * was removed. */
+    public static synchronized String deletePlayedMessage(String serverId,
             String audioPath) {
         for (int i = 0; i < entries.size(); i++) {
             Entry e = entries.get(i);
@@ -264,16 +312,31 @@ public class MessageHistory {
             JSONArray arr = new JSONArray(json);
             for (int i = 0; i < arr.length(); i++) {
                 JSONObject o = arr.getJSONObject(i);
+                String legacyServerId = o.isNull("serverId")
+                        ? null : o.optString("serverId", null);
+                boolean legacyFromNick = o.optBoolean("fromNick", false);
                 entries.add(new Entry(
                     o.getString("id"),
                     o.getString("text"),
                     o.isNull("audioPath") ? null : o.getString("audioPath"),
                     o.getLong("timestamp"),
                     o.optBoolean("locked", false),
-                    o.isNull("serverId") ? null : o.optString("serverId", null),
+                    legacyServerId,
                     // Nick 2026-10-23 v1.46: pre-v1.46 entries have no
                     // fromNick key — they were all Selena's replies.
-                    o.optBoolean("fromNick", false)));
+                    legacyFromNick,
+                    // Nick 2026-11-03 v1.85: entries written before
+                    // v1.85 have no "started" key. A server-message
+                    // entry surviving from before v1.85 either
+                    // already played (the old delete could not have
+                    // removed it — that is the bug being fixed) or
+                    // was still pending when the process died, in
+                    // which case the brain re-feeds it as a fresh
+                    // entry. Either way it counts as started and is
+                    // swept at service start. Nick's own dictations
+                    // (no server row) are never inferred.
+                    o.has("started") ? o.optBoolean("started", false)
+                            : (legacyServerId != null && !legacyFromNick)));
             }
             // Nick 2026-10-22 v1.26: v1.24/v1.25 saved newest-first.
             // Detect by timestamp order; flip only when needed.
@@ -300,6 +363,8 @@ public class MessageHistory {
                 o.put("serverId", e.serverId != null ? e.serverId : JSONObject.NULL);
                 // Nick 2026-10-23 v1.46: sender flag for Nick's dictations.
                 o.put("fromNick", e.fromNick);
+                // Nick 2026-11-03 v1.85: playback-started flag.
+                o.put("started", e.started);
                 arr.put(o);
             }
             File f = new File(appContext.getFilesDir(), FILE_NAME);
