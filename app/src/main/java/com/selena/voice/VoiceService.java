@@ -2004,13 +2004,16 @@ public class VoiceService extends Service
     }
 
     /**
-     * v1.87 (Nick, 2026-11-04): wrap row text as SSML with a real 500 ms
-     * pause at each sentence boundary — at full speed Leda rams straight
+     * v1.87 (Nick, 2026-11-04): wrap row text as SSML with a real pause
+     * at each sentence boundary — at full speed Leda rams straight
      * through plain-text sentence breaks ("between 'Zakk wants to talk
      * trucks later' and 'coffee first' she just rams right through it").
-     * Mirror of to_ssml() in selena-render: flatten whitespace, split at
-     * [.!?] + whitespace + uppercase/digit/opening quote, escape each
-     * sentence (& < >), join with the break, wrap in <speak>.
+     * v1.88 (Nick, 2026-11-04): the pause is 250 ms, not 500 — he heard
+     * v1.87 live and the half-second breaks sounded way too long and
+     * unnatural; 250 ms at speaking rate 0.95 won his three-way fix
+     * audition. Mirror of to_ssml() in selena-render: flatten whitespace,
+     * split at [.!?] + whitespace + uppercase/digit/opening quote,
+     * escape each sentence (& < >), join with the break, wrap in <speak>.
      */
     private static String toSsml(String text) {
         String flat = text.trim().replaceAll("\\s+", " ");
@@ -2019,7 +2022,7 @@ public class VoiceService extends Service
         boolean first = true;
         for (String p : parts) {
             if (p.trim().isEmpty()) continue;
-            if (!first) sb.append("<break time=\"500ms\"/>");
+            if (!first) sb.append("<break time=\"250ms\"/>");
             sb.append(escapeXml(p));
             first = false;
         }
@@ -2051,8 +2054,9 @@ public class VoiceService extends Service
                 .put("name", GOOGLE_TTS_VOICE));
         JSONObject audioConfig = new JSONObject()
                 .put("audioEncoding", "MP3")
-                // Nick 2026-11-04 v1.87: full speed — 0.95 made Leda drag.
-                .put("speakingRate", 1.0);
+                // Nick 2026-11-04 v1.88: a hair under full speed, with
+                // quarter-second sentence breaks — his fix-audition pick.
+                .put("speakingRate", 0.95);
         req.put("audioConfig", audioConfig);
         byte[] body = req.toString().getBytes("UTF-8");
         OutputStream os = null;
