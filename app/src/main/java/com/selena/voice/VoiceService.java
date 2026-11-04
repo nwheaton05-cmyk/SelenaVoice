@@ -2056,7 +2056,9 @@ public class VoiceService extends Service
                 .put("audioEncoding", "MP3")
                 // Nick 2026-11-04 v1.88: a hair under full speed, with
                 // quarter-second sentence breaks — his fix-audition pick.
-                .put("speakingRate", 0.95);
+                // Nick 2026-11-04 v1.89: pace up a notch — 0.95 (v1.88 pick) to full
+                // speed 1.0 at his word ("just a little bit faster"); 250 ms pauses kept.
+                .put("speakingRate", 1.0);
         req.put("audioConfig", audioConfig);
         byte[] body = req.toString().getBytes("UTF-8");
         OutputStream os = null;
