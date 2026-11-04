@@ -62,8 +62,8 @@ import java.util.Queue;
  *  1. OUTBOUND (Selena -> Nick): Realtime push on selena_voice_queue
  *     INSERTs + 3s fallback poll of /api/selena-voice/queue?since=.
  *     Phone mode (default): speak text immediately with on-device TTS.
- *     Aria mode: synthesize text in-app via Google Cloud TTS (Achernar,
- *     v1.43+) and play the result. Server MP3s still play when a row
+ *     Aria mode: synthesize text in-app via Google Cloud TTS (Leda
+ *     since v1.87; Achernar v1.45–v1.86) and play the result. Server MP3s still play when a row
  *     arrives carrying one whose text was never spoken (transition).
  *  2. v1.82 (Nick, 2026-11-02): PLAYBACK-ONLY. The microphone is
  *     GONE — no RECORD_AUDIO permission, no recognizer, no dictation,
@@ -123,7 +123,7 @@ public class VoiceService extends Service
     // activity toggle and the service read the same value.
     public static final String KEY_VOICE_MODE = "voice_mode";
     public static final String VOICE_PHONE = "phone"; // fast, on-device TTS
-    public static final String VOICE_ARIA = "aria";   // quality, in-app Google Cloud TTS (Achernar).
+    public static final String VOICE_ARIA = "aria";   // quality, in-app Google Cloud TTS (Leda).
     // (Pref value "aria" kept for stored-prefs compat; the server-MP3 path it
     // once meant was replaced by in-app synthesis in v1.43.)
 
@@ -133,7 +133,8 @@ public class VoiceService extends Service
     // placeholder below so the key never lands in git. The key is
     // restricted to the Cloud Text-to-Speech API only.
     private static final String GOOGLE_TTS_API_KEY = "__GOOGLE_TTS_API_KEY__";
-    private static final String GOOGLE_TTS_VOICE = "en-US-Chirp3-HD-Achernar";
+    // Nick 2026-11-04 v1.87: her voice is Leda now — Achernar retired as drab.
+    private static final String GOOGLE_TTS_VOICE = "en-US-Chirp3-HD-Leda";
     private static final String GOOGLE_TTS_URL =
             "https://texttospeech.googleapis.com/v1/text:synthesize";
     // Nick 2026-10-19 v1.17: no-auto-readout + output-route toggles.
@@ -1086,7 +1087,7 @@ public class VoiceService extends Service
                         handler.post(() -> onPriorityArrivalTts(speakText, sid, sgroup, critical));
                     }
                 } else {
-                    // Nick 2026-10-23 v1.43: in-app synthesis (Achernar since v1.45; Callirrhoe v1.44).
+                    // Nick 2026-10-23 v1.43: in-app synthesis (Leda since v1.87; Achernar v1.45–v1.86; Callirrhoe v1.44).
                     // Text rows synthesize HERE via the Google Cloud TTS API
                     // on a worker thread, then feed the unchanged v1.40/v1.42
                     // priority machinery. Synthesis failure (after one
@@ -1171,7 +1172,7 @@ public class VoiceService extends Service
                 }
             } else {
                 // Nick 2026-10-23 v1.43: text-only row — synthesize IN THE
-                // APP via Google Cloud TTS (Achernar) and enqueue for
+                // APP via Google Cloud TTS (Leda) and enqueue for
                 // polite playback. The phase-2 server MP3 dedupes via
                 // spokenTexts. Synthesis failure falls back to the polite
                 // on-device TTS queue — never silent, never doubled.
@@ -1980,7 +1981,7 @@ public class VoiceService extends Service
 
     /**
      * Nick 2026-10-23 v1.43: synthesize text IN THE APP via Google Cloud
-     * Text-to-Speech (Achernar). Runs on a worker thread — never call on
+     * Text-to-Speech (Leda). Runs on a worker thread — never call on
      * the main thread. One retry, then throws; the caller falls back to
      * on-device TTS so the message is never dropped silently.
      *
@@ -2002,6 +2003,35 @@ public class VoiceService extends Service
         throw last;
     }
 
+    /**
+     * v1.87 (Nick, 2026-11-04): wrap row text as SSML with a real 500 ms
+     * pause at each sentence boundary — at full speed Leda rams straight
+     * through plain-text sentence breaks ("between 'Zakk wants to talk
+     * trucks later' and 'coffee first' she just rams right through it").
+     * Mirror of to_ssml() in selena-render: flatten whitespace, split at
+     * [.!?] + whitespace + uppercase/digit/opening quote, escape each
+     * sentence (& < >), join with the break, wrap in <speak>.
+     */
+    private static String toSsml(String text) {
+        String flat = text.trim().replaceAll("\\s+", " ");
+        String[] parts = flat.split("(?<=[.!?])\\s+(?=[A-Z0-9\"\\u201C])");
+        StringBuilder sb = new StringBuilder("<speak>");
+        boolean first = true;
+        for (String p : parts) {
+            if (p.trim().isEmpty()) continue;
+            if (!first) sb.append("<break time=\"500ms\"/>");
+            sb.append(escapeXml(p));
+            first = false;
+        }
+        if (first) sb.append(escapeXml(flat)); // split produced nothing usable
+        sb.append("</speak>");
+        return sb.toString();
+    }
+
+    private static String escapeXml(String s) {
+        return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;");
+    }
+
     /** Single Google Cloud TTS request. Runs on a worker thread. */
     private File synthesizeOnce(String text) throws Exception {
         long t0 = System.currentTimeMillis();
@@ -2014,14 +2044,15 @@ public class VoiceService extends Service
                 "application/json; charset=utf-8");
         conn.setDoOutput(true);
         JSONObject req = new JSONObject();
-        req.put("input", new JSONObject().put("text", text));
+        // v1.87: SSML (not plain text) so sentence breaks carry real pauses.
+        req.put("input", new JSONObject().put("ssml", toSsml(text)));
         req.put("voice", new JSONObject()
                 .put("languageCode", "en-US")
                 .put("name", GOOGLE_TTS_VOICE));
         JSONObject audioConfig = new JSONObject()
                 .put("audioEncoding", "MP3")
-                // Nick 2026-10-23: a hair slower than Google default 1.0.
-                .put("speakingRate", 0.95);
+                // Nick 2026-11-04 v1.87: full speed — 0.95 made Leda drag.
+                .put("speakingRate", 1.0);
         req.put("audioConfig", audioConfig);
         byte[] body = req.toString().getBytes("UTF-8");
         OutputStream os = null;
