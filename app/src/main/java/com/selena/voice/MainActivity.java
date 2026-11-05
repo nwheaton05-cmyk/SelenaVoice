@@ -13,10 +13,13 @@ import android.text.TextUtils;
 import android.util.Log;
 import android.view.View;
 import android.widget.Button;
+import android.widget.EditText;
 import android.widget.ScrollView;
 import android.widget.Switch;
 import android.widget.TextView;
 import android.widget.Toast;
+
+import org.json.JSONObject;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -35,6 +38,12 @@ import java.util.List;
  * dictation popup, the always-listening switch, the mic button, the
  * voiceprint/machine dialogs, and the dictation text box are gone.
  * Nick replies in the Muse app; this screen is a player.
+ *
+ * v1.90 (Nick, 2026-11-04): a TEXT compose box + Send — Nick can
+ * originate a typed line from the app (coach-mode emulation +
+ * latency test). It POSTs {text} to /api/selena-voice/input, the
+ * app's open write path. Still playback-only for audio: no mic,
+ * no RECORD_AUDIO, nothing about VoiceService playback changes.
  */
 public class MainActivity extends Activity {
     private static final String TAG = "SelenaVoice";
@@ -71,6 +80,12 @@ public class MainActivity extends Activity {
     // the delete-key dialog — never hardcoded.
     private Button signInButton;
     private Button deleteKeyButton;
+
+    // v1.90 (Nick, 2026-11-04): text compose row — typed lines Nick
+    // originates from the app, POSTed to /api/selena-voice/input.
+    private EditText composeInput;
+    private Button composeSendButton;
+    private TextView composeStatusText;
 
     // Nick 2026-10-22 v1.33: in-app auto-updater banner. Hidden until the
     // version check finds a newer APK; tap downloads + installs it.
@@ -228,6 +243,12 @@ public class MainActivity extends Activity {
         deleteKeyButton.setEnabled(true);
         deleteKeyButton.setOnClickListener(v -> showDeleteKeyDialog());
         refreshSignInButton();
+
+        // v1.90 (Nick, 2026-11-04): text compose row wiring.
+        composeInput = findViewById(R.id.composeInput);
+        composeSendButton = findViewById(R.id.composeSendButton);
+        composeStatusText = findViewById(R.id.composeStatusText);
+        composeSendButton.setOnClickListener(v -> sendComposedMessage());
 
         // Nick 2026-10-22 v1.33: in-app auto-updater. Hidden until the
         // version check finds a newer APK — v1.33 is the last manual
@@ -477,6 +498,67 @@ public class MainActivity extends Activity {
         } else {
             signInButton.setText("👤 Sign in");
         }
+    }
+
+    /**
+     * v1.90 (Nick, 2026-11-04): send the composed text line. POSTs
+     * {"text": ...} to /api/selena-voice/input on a background thread
+     * (same HttpURLConnection pattern as VoiceService.sendHeartbeat).
+     * No auth header — POST is the app's open write path by design.
+     * On success the field clears and the status line shows the local
+     * send time ("Sent ✓ HH:mm:ss" — Nick reads it aloud for the
+     * latency test, so it must be plainly visible). On failure the
+     * text STAYS in the field and the status says so. No retries,
+     * no queueing — one tap, one attempt.
+     */
+    private void sendComposedMessage() {
+        final String text = composeInput.getText().toString().trim();
+        if (text.isEmpty()) {
+            composeStatusText.setText("Nothing to send");
+            return;
+        }
+        composeSendButton.setEnabled(false);
+        composeStatusText.setText("Sending…");
+        new Thread(() -> {
+            java.net.HttpURLConnection conn = null;
+            boolean ok = false;
+            try {
+                java.net.URL url = new java.net.URL(
+                        VoiceService.BASE_URL + "/api/selena-voice/input");
+                conn = (java.net.HttpURLConnection) url.openConnection();
+                conn.setRequestMethod("POST");
+                conn.setRequestProperty("Content-Type", "application/json");
+                conn.setConnectTimeout(8000);
+                conn.setReadTimeout(8000);
+                conn.setDoOutput(true);
+                JSONObject payload = new JSONObject();
+                payload.put("text", text);
+                conn.getOutputStream().write(
+                        payload.toString().getBytes("UTF-8"));
+                int code = conn.getResponseCode();
+                ok = (code == 200);
+                VoiceService.log("compose: POST input HTTP " + code
+                        + " (" + text.length() + " chars)");
+            } catch (Exception e) {
+                VoiceService.log("compose: POST input failed: " + e);
+            } finally {
+                if (conn != null) conn.disconnect();
+            }
+            final boolean sent = ok;
+            runOnUiThread(() -> {
+                composeSendButton.setEnabled(true);
+                if (sent) {
+                    String when = new java.text.SimpleDateFormat(
+                            "HH:mm:ss", java.util.Locale.US)
+                            .format(new java.util.Date());
+                    composeInput.setText("");
+                    composeStatusText.setText("Sent ✓ " + when);
+                } else {
+                    composeStatusText.setText(
+                            "Send failed — will not retry");
+                }
+            });
+        }).start();
     }
 
     private void showSignInDialog() {

@@ -239,6 +239,46 @@
             android:checked="false" />
     </LinearLayout>
 
+    <!-- v1.90 (Nick, 2026-11-04): text compose — Nick can originate a
+         typed line from the app (coach-mode emulation + latency test).
+         POSTs {text} to /api/selena-voice/input; no mic involved. -->
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="horizontal"
+        android:gravity="center_vertical"
+        android:paddingBottom="4dp">
+
+        <EditText
+            android:id="@+id/composeInput"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:hint="Type a message to Selena"
+            android:inputType="textCapSentences|textMultiLine"
+            android:maxLines="3"
+            android:textSize="16sp" />
+
+        <Button
+            android:id="@+id/composeSendButton"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="8dp"
+            android:text="Send"
+            android:textSize="16sp" />
+    </LinearLayout>
+
+    <TextView
+        android:id="@+id/composeStatusText"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text=""
+        android:textSize="14sp"
+        android:textStyle="bold"
+        android:textColor="@color/selena_dark"
+        android:gravity="center"
+        android:paddingBottom="12dp" />
+
     <!-- Message log -->
     <TextView
         android:layout_width="match_parent"
