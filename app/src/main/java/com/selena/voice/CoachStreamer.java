@@ -1,9 +1,12 @@
 package com.selena.voice;
 
 import android.content.Context;
+import android.media.AudioDeviceInfo;
 import android.media.AudioFormat;
+import android.media.AudioManager;
 import android.media.AudioRecord;
 import android.media.MediaRecorder;
+import android.os.Build;
 import android.os.Handler;
 import android.os.Looper;
 import android.os.SystemClock;
@@ -70,6 +73,22 @@ import java.util.concurrent.Executors;
  * since v1.98 — 0.8 s of trailing silence ends an utterance (the
  * drone/wake set's 1.2 s cost every coach exchange latency; see
  * the endpoint config below).
+ *
+ * MIC ROUTE (v1.99, Nick, 2026-11-05 ~15:05 EST — ordered live,
+ * mid-call, when the table-mic ASR proved too garbled: "That's
+ * the problem. Use the earbud mic"): at session start, capture
+ * is routed to the connected Bluetooth headset mic —
+ * AudioManager.setCommunicationDevice() on the first
+ * TYPE_BLUETOOTH_SCO / TYPE_BLE_HEADSET communication device,
+ * plus setPreferredDevice() on the AudioRecord — and the
+ * communication device is cleared at session end. The SCO
+ * channel is full-duplex, so playback during capture is
+ * unaffected. If no Bluetooth communication device is connected
+ * (or routing fails, or the device predates API 31), capture
+ * falls back to the default input — exactly the pre-v1.99
+ * behavior — and the fallback is logged. The routed device
+ * rides the session_start frame meta as additive keys
+ * (mic_route / mic_device / mic_type).
  *
  * DUPLEX: the capture registers its AudioRecord audio-session id
  * with VoiceService (registerOwnMicSession) BEFORE recording
@@ -168,6 +187,17 @@ public class CoachStreamer {
     private OnlineRecognizer recognizer;
     private int ownAudioSessionId = -1;
 
+    // Earbud-mic routing (v1.99, Nick, 2026-11-05 — ordered live,
+    // mid-call: "That's the problem. Use the earbud mic"). Set in
+    // begin() before the session_start frame is enqueued, so the
+    // routed device can ride the seq-0 meta. routedMicDevice is
+    // null when no Bluetooth communication device is connected —
+    // capture then takes the default input, exactly the pre-v1.99
+    // behavior. commDeviceSet says WE hold the AudioManager
+    // communication-device slot and must clear it at session end.
+    private AudioDeviceInfo routedMicDevice;
+    private boolean commDeviceSet = false;
+
     private int nextSeq = 0;
     private int segIndex = 0;
     private List<String> prevPartialWords = new ArrayList<>();
@@ -255,6 +285,23 @@ public class CoachStreamer {
     private void begin(JSONObject meta) {
         if (live || ended) return;
         live = true;
+        // v1.99: route capture to the earbud (Bluetooth headset)
+        // mic BEFORE the session_start frame is enqueued, so the
+        // routed device rides the seq-0 meta as additive keys
+        // (same wire-format precedent as disclosure_confirmed_at).
+        // Never throws and never blocks the session: on any
+        // failure it leaves the default input in place.
+        routedMicDevice = routeCaptureToEarbud();
+        try {
+            if (routedMicDevice != null) {
+                meta.put("mic_route", "bluetooth");
+                meta.put("mic_device", String.valueOf(
+                        routedMicDevice.getProductName()));
+                meta.put("mic_type", routedMicDevice.getType());
+            } else {
+                meta.put("mic_route", "default");
+            }
+        } catch (Exception ignored) {}
         enqueueFrame(0L, "", false, meta);
         final String mode = meta.optString("mode", "?");
         sessionMode = mode;
@@ -284,6 +331,7 @@ public class CoachStreamer {
             VoiceService.unregisterOwnMicSession(ownAudioSessionId);
             ownAudioSessionId = -1;
         }
+        clearEarbudRouting();
         // Graceful: frames already queued still post; the executor
         // thread is a daemon-less single thread but the process
         // outlives the session, and shutdown() lets it drain.
@@ -395,6 +443,79 @@ public class CoachStreamer {
         }
     }
 
+    // ------------------------------------------------ earbud mic (v1.99)
+
+    private static String deviceLabel(AudioDeviceInfo d) {
+        return "'" + d.getProductName() + "' (type=" + d.getType() + ")";
+    }
+
+    /**
+     * Route this session's capture to the connected Bluetooth
+     * headset (earbud) mic via the AudioManager communication
+     * device slot (API 31+). Returns the chosen device, or null
+     * to keep the default input. NEVER throws: mic routing must
+     * not be able to fail a coach session (Nick's order is "use
+     * the earbud mic", not "no earbuds, no session").
+     */
+    private AudioDeviceInfo routeCaptureToEarbud() {
+        try {
+            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) {
+                VoiceService.log("stream: earbud mic routing needs "
+                        + "API 31+ (this device is " + Build.VERSION.SDK_INT
+                        + ") — capture on default input (fallback)");
+                return null;
+            }
+            AudioManager am = (AudioManager) appContext
+                    .getSystemService(Context.AUDIO_SERVICE);
+            if (am == null) {
+                VoiceService.log("stream: no AudioManager — capture "
+                        + "on default input (fallback)");
+                return null;
+            }
+            for (AudioDeviceInfo d : am.getAvailableCommunicationDevices()) {
+                int t = d.getType();
+                if (t == AudioDeviceInfo.TYPE_BLUETOOTH_SCO
+                        || t == AudioDeviceInfo.TYPE_BLE_HEADSET) {
+                    if (am.setCommunicationDevice(d)) {
+                        commDeviceSet = true;
+                        VoiceService.log("stream: capture routed to "
+                                + "earbud mic " + deviceLabel(d));
+                        return d;
+                    }
+                    VoiceService.log("stream: setCommunicationDevice "
+                            + "refused " + deviceLabel(d) + " — trying "
+                            + "next device");
+                }
+            }
+            VoiceService.log("stream: no Bluetooth communication "
+                    + "device connected — capture on default input "
+                    + "(fallback)");
+            return null;
+        } catch (Throwable t) {
+            VoiceService.log("stream: earbud mic routing failed (" + t
+                    + ") — capture on default input (fallback)");
+            return null;
+        }
+    }
+
+    /** Release the communication-device slot if we hold it.
+     *  Idempotent; called from both teardown paths. */
+    private void clearEarbudRouting() {
+        if (!commDeviceSet) return;
+        commDeviceSet = false;
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                AudioManager am = (AudioManager) appContext
+                        .getSystemService(Context.AUDIO_SERVICE);
+                if (am != null) am.clearCommunicationDevice();
+            }
+            VoiceService.log("stream: earbud mic routing cleared");
+        } catch (Throwable t) {
+            VoiceService.log("stream: clearCommunicationDevice "
+                    + "failed: " + t);
+        }
+    }
+
     /** Drone-proven open sequence (v1.61): VOICE_RECOGNITION
      *  first, plain MIC as fallback. The audio-session id is
      *  registered with VoiceService BEFORE recording starts, so
@@ -415,6 +536,23 @@ public class CoachStreamer {
                         AudioFormat.CHANNEL_IN_MONO,
                         AudioFormat.ENCODING_PCM_16BIT, bufBytes);
                 if (r.getState() == AudioRecord.STATE_INITIALIZED) {
+                    // v1.99: pin this record to the earbud mic chosen
+                    // in begin() (belt to setCommunicationDevice's
+                    // suspenders). Failure is logged, never fatal.
+                    if (routedMicDevice != null) {
+                        try {
+                            boolean pinned =
+                                    r.setPreferredDevice(routedMicDevice);
+                            VoiceService.log("stream: capture "
+                                    + "preferred device "
+                                    + deviceLabel(routedMicDevice)
+                                    + " -> " + pinned);
+                        } catch (Throwable t) {
+                            VoiceService.log("stream: setPreferredDevice "
+                                    + "failed (" + t + ") — comm-device "
+                                    + "routing still applies");
+                        }
+                    }
                     ownAudioSessionId = r.getAudioSessionId();
                     VoiceService.registerOwnMicSession(ownAudioSessionId);
                     r.startRecording();
@@ -505,6 +643,7 @@ public class CoachStreamer {
             VoiceService.unregisterOwnMicSession(ownAudioSessionId);
             ownAudioSessionId = -1;
         }
+        clearEarbudRouting();
         if (recognizer != null) {
             try { recognizer.release(); } catch (Exception ignored) {}
             recognizer = null;
