@@ -176,6 +176,39 @@ public class VoiceService extends Service
         isPlayingAudio = playing;
     }
 
+    /** Static read for other components (CoachStreamer flags
+     *  frames that overlapped her playback — v1.93 duplex). */
+    public static boolean isPlayingAudioNow() {
+        return isPlayingAudio;
+    }
+
+    // v1.93 (Nick, 2026-11-05): FULL DUPLEX — a live coach session
+    // captures with this app's OWN AudioRecord, so the mic-hold
+    // filter (v1.84) must tell our own capture apart from a
+    // foreign app. The public API exposes no client package/uid
+    // on a recording configuration, but it DOES expose the client
+    // audio session id — and CoachStreamer knows its own
+    // AudioRecord's id exactly. CoachStreamer registers the id
+    // BEFORE recording starts and unregisters at teardown;
+    // applyMicConfigs ignores configurations carrying a
+    // registered id ("own-coach"). Nick dictating in any OTHER
+    // app still holds playback exactly as in v1.83.
+    private static final java.util.Set<Integer> OWN_MIC_SESSIONS =
+            java.util.concurrent.ConcurrentHashMap.newKeySet();
+
+    public static void registerOwnMicSession(int audioSessionId) {
+        if (audioSessionId >= 0) OWN_MIC_SESSIONS.add(audioSessionId);
+    }
+
+    public static void unregisterOwnMicSession(int audioSessionId) {
+        OWN_MIC_SESSIONS.remove(audioSessionId);
+    }
+
+    private static boolean isOwnMicSession(int audioSessionId) {
+        return audioSessionId >= 0
+                && OWN_MIC_SESSIONS.contains(audioSessionId);
+    }
+
     // Nick 2026-10-18 v1.6: remote-visible log buffer. The service is
     // Selena's "ears and mouth" — she needs to see poll/download/playback
     // internals without Nick sending screenshots. Entries are uploaded
@@ -2545,17 +2578,25 @@ public class VoiceService extends Service
             for (AudioRecordingConfiguration c : configs) {
                 int src = -1;
                 int csrc = -1;
+                int sessId = -1;
                 try {
                     src = c.getAudioSource();
                 } catch (Exception ignored) {}
                 try {
                     csrc = c.getClientAudioSource();
                 } catch (Exception ignored) {}
+                try {
+                    sessId = c.getClientAudioSessionId();
+                } catch (Exception ignored) {}
                 String why = micIgnoreReason(src, csrc);
+                if (why == null && isOwnMicSession(sessId)) {
+                    why = "own-coach";
+                }
                 if (why == null) relevant++;
                 if (detail.length() > 0) detail.append(", ");
                 detail.append("src=").append(src)
-                        .append(" csrc=").append(csrc);
+                        .append(" csrc=").append(csrc)
+                        .append(" sess=").append(sessId);
                 if (why != null) {
                     detail.append(" ignored(").append(why).append(")");
                 }
