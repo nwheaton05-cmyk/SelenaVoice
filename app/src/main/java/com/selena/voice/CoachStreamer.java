@@ -2,6 +2,7 @@ package com.selena.voice;
 
 import android.content.Context;
 import android.content.Intent;
+import android.media.AudioManager;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
@@ -23,6 +24,10 @@ import java.util.concurrent.Executors;
 /**
  * Coach-session word streamer (v1.91, Nick 2026-11-05 — Slice A of
  * the streaming addition; spec streaming-spec-2026-11-05.md §3/§8).
+ * v1.92 (Nick, 2026-11-05): beep suppression restored (see the beep
+ * section below — the v1.48 hard-mute died with the mic in v1.82)
+ * + recognizer destroy/recreate on restart (v1.91 session wedged
+ * after 3 segments in its first live test).
  *
  * While a coach session is live, this runs continuous on-device
  * speech recognition and POSTs word frames to
@@ -81,6 +86,103 @@ public class CoachStreamer implements RecognitionListener {
     private SpeechRecognizer recognizer;
     private boolean live = false;
     private boolean ended = false;
+
+    // ------------------------------------------------------------ beep suppression (v1.92)
+    // Nick 2026-11-05: the recognizer beeps every time it turns off/on,
+    // and Slice A's restart-per-segment cycle made that constant (the
+    // beeps were even transcribed as "do do do"). ROOT CAUSE: the old
+    // app's hard-mute (v1.48, commit ba5c763) was deleted with all mic
+    // code in v1.82 and this class never got an equivalent.
+    // THE FIX, adapted to a session that must stay able to play a
+    // critical cue: SYSTEM / NOTIFICATION / ALARM / VOICE_CALL are
+    // hard-muted for the WHOLE session (save volume, zero, AND
+    // setStreamMute — Samsung ignores volume-zero alone on some
+    // streams) and restored at shutdown. MUSIC — the stream Selena's
+    // own playback rides — is muted only in WINDOWS around each
+    // recognizer start/stop edge: muted before startListening,
+    // unmuted 700 ms after onReadyForSpeech, re-muted at
+    // onEndOfSpeech / onResults / onError. Playback between edges is
+    // never silenced. Restores follow the v1.10 rule: a stream is
+    // only restored if it is still at the zero we set (never clobber
+    // a volume Nick changed himself mid-session).
+    private AudioManager audioManager;
+    private static final int[] SESSION_STREAMS = {
+            AudioManager.STREAM_SYSTEM,
+            AudioManager.STREAM_NOTIFICATION,
+            AudioManager.STREAM_ALARM,
+            AudioManager.STREAM_VOICE_CALL,
+    };
+    private final int[] savedSessionVolumes = new int[SESSION_STREAMS.length];
+    private boolean sessionStreamsMuted = false;
+    private int savedMusicVolume = -1;
+    private boolean musicMuted = false;
+    private final Runnable musicUnmuteRunnable = () -> unmuteMusicBeep();
+
+    private void initAudioManager() {
+        if (audioManager == null) {
+            audioManager = (AudioManager) appContext.getSystemService(Context.AUDIO_SERVICE);
+        }
+    }
+
+    private void muteSessionStreams() {
+        initAudioManager();
+        if (audioManager == null || sessionStreamsMuted) return;
+        try {
+            for (int i = 0; i < SESSION_STREAMS.length; i++) {
+                savedSessionVolumes[i] = audioManager.getStreamVolume(SESSION_STREAMS[i]);
+                try { audioManager.setStreamMute(SESSION_STREAMS[i], true); } catch (Exception ignored) {}
+                audioManager.setStreamVolume(SESSION_STREAMS[i], 0, 0);
+            }
+            sessionStreamsMuted = true;
+            VoiceService.log("stream: beep streams hard-muted for session");
+        } catch (Exception e) {
+            VoiceService.log("stream: muteSessionStreams failed: " + e);
+        }
+    }
+
+    private void unmuteSessionStreams() {
+        if (audioManager == null || !sessionStreamsMuted) return;
+        try {
+            for (int i = 0; i < SESSION_STREAMS.length; i++) {
+                try { audioManager.setStreamMute(SESSION_STREAMS[i], false); } catch (Exception ignored) {}
+                if (audioManager.getStreamVolume(SESSION_STREAMS[i]) == 0) {
+                    audioManager.setStreamVolume(SESSION_STREAMS[i], savedSessionVolumes[i], 0);
+                }
+            }
+            sessionStreamsMuted = false;
+            VoiceService.log("stream: beep streams restored");
+        } catch (Exception e) {
+            VoiceService.log("stream: unmuteSessionStreams failed: " + e);
+        }
+    }
+
+    private void muteMusicBeep() {
+        initAudioManager();
+        if (audioManager == null || musicMuted) return;
+        mainHandler.removeCallbacks(musicUnmuteRunnable);
+        try {
+            savedMusicVolume = audioManager.getStreamVolume(AudioManager.STREAM_MUSIC);
+            try { audioManager.setStreamMute(AudioManager.STREAM_MUSIC, true); } catch (Exception ignored) {}
+            audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, 0, 0);
+            musicMuted = true;
+        } catch (Exception e) {
+            VoiceService.log("stream: muteMusicBeep failed: " + e);
+        }
+    }
+
+    private void unmuteMusicBeep() {
+        if (audioManager == null || !musicMuted) return;
+        try {
+            try { audioManager.setStreamMute(AudioManager.STREAM_MUSIC, false); } catch (Exception ignored) {}
+            if (savedMusicVolume >= 0
+                    && audioManager.getStreamVolume(AudioManager.STREAM_MUSIC) == 0) {
+                audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, savedMusicVolume, 0);
+            }
+            musicMuted = false;
+        } catch (Exception e) {
+            VoiceService.log("stream: unmuteMusicBeep failed: " + e);
+        }
+    }
 
     private int nextSeq = 0;
     private int segIndex = 0;
@@ -142,9 +244,9 @@ public class CoachStreamer implements RecognitionListener {
     private void begin(JSONObject meta) {
         if (live || ended) return;
         live = true;
+        muteSessionStreams();
         enqueueFrame(0L, "", false, meta);
-        recognizer = SpeechRecognizer.createSpeechRecognizer(appContext);
-        recognizer.setRecognitionListener(this);
+        createRecognizer();
         startListeningCycle();
         VoiceService.log("stream: session " + sessionId + " live (mode "
                 + meta.optString("mode", "?") + ")");
@@ -162,12 +264,28 @@ public class CoachStreamer implements RecognitionListener {
             try { recognizer.destroy(); } catch (Exception ignored) {}
             recognizer = null;
         }
+        unmuteMusicBeep();
+        unmuteSessionStreams();
         poster.shutdownNow();
         VoiceService.log("stream: session " + sessionId + " ended"
                 + " (droppedFrames=" + droppedFrames + ")");
     }
 
     // ------------------------------------------------------------ recognizer driving
+
+    private void createRecognizer() {
+        destroyRecognizer();
+        recognizer = SpeechRecognizer.createSpeechRecognizer(appContext);
+        recognizer.setRecognitionListener(this);
+    }
+
+    private void destroyRecognizer() {
+        if (recognizer != null) {
+            try { recognizer.cancel(); } catch (Exception ignored) {}
+            try { recognizer.destroy(); } catch (Exception ignored) {}
+            recognizer = null;
+        }
+    }
 
     private void startListeningCycle() {
         if (!live || recognizer == null) return;
@@ -179,7 +297,15 @@ public class CoachStreamer implements RecognitionListener {
         intent.putExtra(RecognizerIntent.EXTRA_LANGUAGE, "en-US");
         intent.putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true);
         intent.putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 1);
+        // v1.92: ask for longer silence tolerance so a mid-thought
+        // pause (Nick's thinking pause) doesn't end the segment and
+        // cycle the recognizer — fewer cycles, fewer beep edges.
+        // (Samsung's recognizer honors these only partially; partial
+        // results still stream at word grain regardless.)
+        intent.putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 3000L);
+        intent.putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, 2500L);
         try {
+            muteMusicBeep();
             recognizer.startListening(intent);
         } catch (Exception e) {
             VoiceService.log("stream: startListening failed: " + e);
@@ -192,6 +318,16 @@ public class CoachStreamer implements RecognitionListener {
         restartPending = true;
         mainHandler.postDelayed(() -> {
             restartPending = false;
+            if (!live) return;
+            // v1.92 wedge fix: the v1.91 code reused the SAME
+            // SpeechRecognizer object across restarts. In the first
+            // live session (2026-11-05 09:46) it produced three
+            // segments, then kept cycling (mic configs flipping in
+            // the app logs) while turning speech into NO frames —
+            // Nick's "I sent more" never landed. The old dictation
+            // code always destroyed + recreated the recognizer on
+            // restart; do the same here.
+            createRecognizer();
             startListeningCycle();
         }, delayMs);
     }
@@ -315,15 +451,26 @@ public class CoachStreamer implements RecognitionListener {
 
     // ------------------------------------------------------------ RecognitionListener
 
-    @Override public void onReadyForSpeech(Bundle params) {}
+    @Override
+    public void onReadyForSpeech(Bundle params) {
+        // v1.92: the start beep has sounded (muted) by now; restore
+        // MUSIC shortly after so playback between edges is normal.
+        mainHandler.removeCallbacks(musicUnmuteRunnable);
+        mainHandler.postDelayed(musicUnmuteRunnable, 700);
+    }
     @Override public void onBeginningOfSpeech() {}
     @Override public void onRmsChanged(float rmsdB) {}
     @Override public void onBufferReceived(byte[] buffer) {}
-    @Override public void onEndOfSpeech() {}
+    @Override
+    public void onEndOfSpeech() {
+        // v1.92: re-mute MUSIC before the stop edge / restart.
+        muteMusicBeep();
+    }
 
     @Override
     public void onError(int error) {
         if (!live) return;
+        muteMusicBeep();
         switch (error) {
             case SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS:
                 VoiceService.log("stream: recognizer lost mic permission — ending session");
@@ -348,6 +495,7 @@ public class CoachStreamer implements RecognitionListener {
     @Override
     public void onResults(Bundle results) {
         if (!live) return;
+        muteMusicBeep();
         ArrayList<String> texts =
                 results.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION);
         onFinalText(texts != null && !texts.isEmpty() ? texts.get(0) : "");
