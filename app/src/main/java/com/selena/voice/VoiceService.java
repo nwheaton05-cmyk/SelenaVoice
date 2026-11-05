@@ -122,10 +122,16 @@ public class VoiceService extends Service
     public static final String ACTION_COACH_START_OTHERS = "com.selena.voice.COACH_START_OTHERS";
     public static final String ACTION_COACH_STOP = "com.selena.voice.COACH_STOP";
     public static final String ACTION_COACH_STATE = "com.selena.voice.COACH_STATE";
+    // Nick 2026-11-05 v1.96: Phase 0 voice test toggle (automatic
+    // voice learning + numbered labels, log-only). The activity's
+    // toggle sends this; the streamer owns the actual state.
+    public static final String ACTION_COACH_VOICE_TEST = "com.selena.voice.COACH_VOICE_TEST";
     public static final String EXTRA_SESSION_ID = "session_id";
     public static final String EXTRA_DISCLOSURE_ISO = "disclosure_iso";
     public static final String EXTRA_COACH_LIVE = "coach_live";
     public static final String EXTRA_COACH_STATUS = "coach_status";
+    public static final String EXTRA_COACH_MODE = "coach_mode";
+    public static final String EXTRA_VOICE_TEST_ON = "voice_test_on";
     public static final String EXTRA_FILE_PATH = "file_path";
     public static final String EXTRA_POLL_STATUS = "poll_status";
     public static final String EXTRA_TEXT = "text";
@@ -674,6 +680,16 @@ public class VoiceService extends Service
             } else if (ACTION_COACH_STOP.equals(intent.getAction())) {
                 log("intent: COACH_STOP received");
                 stopCoachSession("Session stopped");
+            } else if (ACTION_COACH_VOICE_TEST.equals(intent.getAction())) {
+                // v1.96: the activity's voice-test toggle. Only a
+                // live session can run it; the streamer reports
+                // back through the status mirror.
+                log("intent: COACH_VOICE_TEST received");
+                if (coachStreamer != null) {
+                    coachStreamer.setVoiceTest(
+                            intent.getBooleanExtra(EXTRA_VOICE_TEST_ON, false));
+                }
+                broadcastCoachState();
             } else if (ACTION_STOP_ALL.equals(intent.getAction())) {
                 // Nick 2026-10-22 v1.35: hard stop — kill whatever is
                 // playing/speaking right now and drop unlocked queued
@@ -3823,6 +3839,12 @@ public class VoiceService extends Service
         Intent i = new Intent(ACTION_COACH_STATE);
         i.putExtra(EXTRA_COACH_LIVE, coachStreamer != null);
         i.putExtra(EXTRA_COACH_STATUS, coachStatus);
+        // v1.96: mode + voice-test state ride the same mirror so
+        // the activity's voice panel can reflect them.
+        i.putExtra(EXTRA_COACH_MODE,
+                coachStreamer != null ? coachStreamer.mode() : "");
+        i.putExtra(EXTRA_VOICE_TEST_ON,
+                coachStreamer != null && coachStreamer.voiceTestOn());
         sendAppBroadcast(i);
     }
 

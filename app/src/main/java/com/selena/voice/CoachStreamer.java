@@ -115,6 +115,27 @@ import java.util.concurrent.Executors;
  * then dropped and counted — a drop is logged, never silently
  * absorbed, and never stalls recognition. Listener callbacks are
  * delivered on the main thread.
+ *
+ * v1.96 (Nick, 2026-11-05) — PHASE 0 VOICE TEST: automatic,
+ * continuous voice learning + numbered speaker labels, in
+ * measurement/logging form only. There is NO enrollment ceremony
+ * (Nick, 13:23 EST: "all enrollment is automatic — it learns as
+ * it goes"): while the voice test is on, every quality-accepted
+ * segment is embedded on-device (WeSpeaker ResNet34-LM via
+ * SpeakerEmbedder) and processed against the ONE app-global
+ * VoiceprintStore —
+ *   solo: the speaker is Nick by construction; the segment's
+ *     self-score is logged and it teaches Voice 1 (slowly).
+ *   with-others: the segment is matched against every stored
+ *     voice; Voice 1 matches are Nick (his print refines only on
+ *     high-confidence matches); a segment matching nothing founds
+ *     the next guest voice (Voice 2, 3, … in first-heard order).
+ * No confirmation, no prompt, no asking who anyone is — ever, in
+ * either mode. Learning is slow (VoiceprintStore.TEACH_ALPHA)
+ * and gated: segments that overlapped Selena's playback, are too
+ * quiet, or are too short NEVER teach. The frame stream is
+ * untouched — labels and scores go to the app log only, nothing
+ * is gated, no speaker tag is sent upstream.
  */
 public class CoachStreamer {
 
@@ -150,6 +171,30 @@ public class CoachStreamer {
     private volatile int droppedFrames = 0;
     private String lastPartialText = "";
     private boolean segPlaybackOverlap = false;
+
+    // Voice test (v1.96, Phase 0) — see the class doc. The PCM tap
+    // is written by the capture thread and snapshotted at each
+    // endpoint; all embedding/matching/teaching runs on vpExec so
+    // capture and recognition never wait on it.
+    private String sessionMode = "";
+    private volatile boolean voiceTestOn = false;
+    private SpeakerEmbedder embedder;
+    private final ExecutorService vpExec = Executors.newSingleThreadExecutor();
+    private float[] segTap = new float[SAMPLE_RATE * 4];
+    private int segTapLen = 0;
+    private boolean vpWarnedNoNick = false;
+
+    // PROVISIONAL Phase 0 thresholds — the table test calibrates
+    // the real pair from the logged score distributions. 0.50 is
+    // the sherpa demo match default the reference plugin shipped.
+    private static final float VP_MATCH_THRESHOLD = 0.50f;
+    private static final float VP_TEACH_NICK_MIN = 0.65f;
+    private static final float VP_TEACH_GUEST_MIN = 0.60f;
+    private static final float VP_ANCHOR_MIN = 0.70f;
+    private static final double VP_SCORE_MIN_DUR_S = 0.8;
+    private static final double VP_TEACH_MIN_DUR_S = 2.0;
+    private static final double VP_CREATE_MIN_DUR_S = 3.0;
+    private static final double VP_RMS_FLOOR = 0.01; // -40 dB
 
     public CoachStreamer(Context context, String sessionId, Listener listener) {
         this.appContext = context.getApplicationContext();
@@ -207,6 +252,7 @@ public class CoachStreamer {
         live = true;
         enqueueFrame(0L, "", false, meta);
         final String mode = meta.optString("mode", "?");
+        sessionMode = mode;
         if (!DroneModelStore.isReady(appContext)) {
             postStatus("Downloading speech engine (one-time, 44 MB)…");
         } else {
@@ -236,6 +282,12 @@ public class CoachStreamer {
         // thread is a daemon-less single thread but the process
         // outlives the session, and shutdown() lets it drain.
         poster.shutdown();
+        voiceTestOn = false;
+        vpExec.shutdown();
+        if (embedder != null) {
+            embedder.release();
+            embedder = null;
+        }
         VoiceService.log("stream: session " + sessionId + " ended"
                 + " (droppedFrames=" + droppedFrames + ")");
     }
@@ -392,6 +444,7 @@ public class CoachStreamer {
                 }
                 float[] f = new float[n];
                 for (int i = 0; i < n; i++) f[i] = buf[i] / 32768.0f;
+                if (voiceTestOn) tapSegment(f, n);
                 stream.acceptWaveform(f, SAMPLE_RATE);
                 while (recognizer.isReady(stream)) {
                     recognizer.decode(stream);
@@ -405,7 +458,16 @@ public class CoachStreamer {
                 }
                 if (recognizer.isEndpoint(stream)) {
                     if (!text.isEmpty()) {
+                        // Snapshot BEFORE onFinalText resets the
+                        // segment state (tap included).
+                        String endedSeg = segId();
+                        float[] snap = voiceTestOn ? snapshotSegment() : null;
+                        boolean overlap = segPlaybackOverlap
+                                || VoiceService.isPlayingAudioNow();
                         onFinalText(text);
+                        if (snap != null) {
+                            dispatchVoiceSegment(endedSeg, snap, overlap);
+                        }
                     } else {
                         resetSegmentState();
                     }
@@ -459,6 +521,227 @@ public class CoachStreamer {
         prevPartialWords = new ArrayList<>();
         emittedWords = 0;
         segPlaybackOverlap = false;
+        segTapLen = 0;
+    }
+
+    // ------------------------------------------------------------ voice test (v1.96)
+
+    /** The session's door ("solo" / "with_others"), for the UI mirror. */
+    public String mode() {
+        return sessionMode;
+    }
+
+    public boolean voiceTestOn() {
+        return voiceTestOn;
+    }
+
+    /**
+     * Toggle the Phase 0 voice test. Called by VoiceService from
+     * the activity's toggle intent. Affects ONLY the voice
+     * machinery (learning + log lines) — the frame stream, the
+     * coaching behavior, and the disclosure gate are untouched.
+     */
+    public void setVoiceTest(boolean on) {
+        if (on == voiceTestOn) return;
+        if (on && !SpeakerEmbedder.modelAvailable(appContext)) {
+            postStatus("Voice test unavailable — speaker model missing in this build.");
+            return;
+        }
+        voiceTestOn = on;
+        VoiceService.log("vp: voice test " + (on ? "ON" : "OFF")
+                + " (mode " + sessionMode + ", session " + sessionId + ")");
+        postStatus(on ? "Voice test ON — voices are being learned and logged."
+                      : "Voice test off.");
+    }
+
+    private void tapSegment(float[] f, int n) {
+        if (segTapLen + n > segTap.length) {
+            float[] bigger = new float[Math.max(segTap.length * 2,
+                    segTapLen + n)];
+            System.arraycopy(segTap, 0, bigger, 0, segTapLen);
+            segTap = bigger;
+        }
+        System.arraycopy(f, 0, segTap, segTapLen, n);
+        segTapLen += n;
+    }
+
+    private float[] snapshotSegment() {
+        float[] out = new float[segTapLen];
+        System.arraycopy(segTap, 0, out, 0, segTapLen);
+        return out;
+    }
+
+    private void dispatchVoiceSegment(final String seg, final float[] pcm,
+                                      final boolean overlap) {
+        vpExec.execute(() -> processVoiceSegment(seg, pcm, overlap));
+    }
+
+    /**
+     * Runs on vpExec. The acceptance gates come FIRST and are the
+     * learning safeguards: a segment that overlapped Selena's own
+     * playback, is too quiet to be speech, or is too short to
+     * score reliably is logged and dropped — it never teaches and
+     * never founds a voice.
+     */
+    private void processVoiceSegment(String seg, float[] pcm,
+                                     boolean overlap) {
+        try {
+            double durS = pcm.length / (double) SAMPLE_RATE;
+            if (overlap) {
+                VoiceService.log("vp " + seg + " dur=" + fmt1(durS)
+                        + "s skipped — overlapped Selena's playback"
+                        + " (never learned)");
+                return;
+            }
+            double rms = rms(pcm);
+            if (rms < VP_RMS_FLOOR) {
+                VoiceService.log("vp " + seg + " dur=" + fmt1(durS)
+                        + "s skipped — too quiet (rms " + fmt3(rms) + ")");
+                return;
+            }
+            if (durS < VP_SCORE_MIN_DUR_S) {
+                VoiceService.log("vp " + seg + " dur=" + fmt1(durS)
+                        + "s skipped — too short to score");
+                return;
+            }
+            if (embedder == null) embedder = new SpeakerEmbedder(appContext);
+            float[] vec = embedder.embed(pcm);
+            long ms = embedder.lastComputeMs();
+            if (vec == null) {
+                VoiceService.log("vp " + seg + " embed failed");
+                return;
+            }
+            boolean teachable = durS >= VP_TEACH_MIN_DUR_S;
+            if ("solo".equals(sessionMode)) {
+                processSoloSegment(seg, vec, durS, ms, teachable);
+            } else {
+                processOthersSegment(seg, vec, durS, ms, teachable);
+            }
+        } catch (Throwable t) {
+            VoiceService.log("vp " + seg + " processing failed: " + t);
+        }
+    }
+
+    /**
+     * Solo: the speaker is Nick by construction — Voice 1 is the
+     * only enrollment subject in solo, and solo never creates
+     * guests. His self-score (against the print as it stood BEFORE
+     * this segment) is the measurement; then the segment teaches,
+     * slowly. Short segments are scored and logged but don't teach.
+     */
+    private void processSoloSegment(String seg, float[] vec, double durS,
+                                    long ms, boolean teachable) {
+        String self = "n/a";
+        if (VoiceprintStore.hasPrint(appContext, 1)) {
+            self = fmt2(VoiceprintStore.scoreAgainst(appContext, 1, vec));
+        }
+        String taughtNote = " (too short to teach)";
+        if (teachable) {
+            boolean bank = VoiceprintStore.anchors(appContext, 1).size()
+                    < VoiceprintStore.ANCHOR_CAP;
+            VoiceprintStore.teach(appContext, 1, vec, bank);
+            VoiceprintStore.noteHeard(appContext, 1);
+            taughtNote = " taught v1 (n="
+                    + VoiceprintStore.taughtCount(appContext, 1) + ")";
+        }
+        VoiceService.log("vp " + seg + " mode=solo dur=" + fmt1(durS)
+                + "s emb=" + ms + "ms self=" + self + taughtNote
+                + " -> Voice 1" + provSuffix(1));
+    }
+
+    /**
+     * With-others: match against every stored voice. Voice 1 is
+     * Nick — his print refines ONLY on high-confidence matches, so
+     * a borderline guest segment can't drag it. A segment matching
+     * nothing founds the next guest voice when it is long enough
+     * to carry a reliable embedding; a shorter stranger segment is
+     * logged as unlabeled and teaches nothing.
+     */
+    private void processOthersSegment(String seg, float[] vec, double durS,
+                                      long ms, boolean teachable) {
+        if (!vpWarnedNoNick && !VoiceprintStore.hasPrint(appContext, 1)) {
+            vpWarnedNoNick = true;
+            VoiceService.log("vp: note — Voice 1 has no print yet; "
+                    + "seed it in a SOLO session with the voice test "
+                    + "on. Until then every voice here founds a guest.");
+        }
+        int count = VoiceprintStore.voiceCount(appContext);
+        StringBuilder scores = new StringBuilder();
+        int bestVoice = -1;
+        float best = -1f;
+        for (int v = 1; v <= count; v++) {
+            if (!VoiceprintStore.hasPrint(appContext, v)) continue;
+            float s = VoiceprintStore.scoreAgainst(appContext, v, vec);
+            scores.append(" v").append(v).append("=").append(fmt2(s));
+            if (s > best) {
+                best = s;
+                bestVoice = v;
+            }
+        }
+        int attr = 0;
+        boolean taught = false;
+        String verdict;
+        if (bestVoice == 1 && best >= VP_MATCH_THRESHOLD) {
+            attr = 1;
+            verdict = "Voice 1";
+            VoiceprintStore.noteHeard(appContext, 1);
+            if (teachable && best >= VP_TEACH_NICK_MIN) {
+                VoiceprintStore.teach(appContext, 1, vec,
+                        best >= VP_ANCHOR_MIN
+                                && VoiceprintStore.anchors(appContext, 1).size()
+                                        < VoiceprintStore.ANCHOR_CAP);
+                taught = true;
+            }
+        } else if (bestVoice > 1 && best >= VP_MATCH_THRESHOLD) {
+            attr = bestVoice;
+            verdict = "Voice " + bestVoice;
+            VoiceprintStore.noteHeard(appContext, bestVoice);
+            if (teachable && best >= VP_TEACH_GUEST_MIN) {
+                VoiceprintStore.teach(appContext, bestVoice, vec,
+                        best >= VP_ANCHOR_MIN
+                                && VoiceprintStore.anchors(appContext, bestVoice).size()
+                                        < VoiceprintStore.ANCHOR_CAP);
+                taught = true;
+            }
+        } else if (teachable && durS >= VP_CREATE_MIN_DUR_S) {
+            attr = VoiceprintStore.createGuest(appContext, vec);
+            verdict = "NEW Voice " + attr;
+            taught = true;
+            postStatus("New voice heard — logged as Voice " + attr
+                    + " (voice test).");
+        } else {
+            verdict = "unlabeled";
+        }
+        VoiceService.log("vp " + seg + " mode=with_others dur=" + fmt1(durS)
+                + "s emb=" + ms + "ms scores:"
+                + (scores.length() == 0 ? " (none stored)"
+                        : scores.toString())
+                + " -> " + verdict + (taught ? " (taught)" : "")
+                + (attr > 0 ? provSuffix(attr) : ""));
+    }
+
+    private String provSuffix(int voice) {
+        return VoiceprintStore.isProvisional(appContext, voice)
+                ? " (provisional)" : "";
+    }
+
+    private static double rms(float[] pcm) {
+        if (pcm.length == 0) return 0;
+        double sumSq = 0;
+        for (float f : pcm) sumSq += (double) f * f;
+        return Math.sqrt(sumSq / pcm.length);
+    }
+
+    private static String fmt1(double v) {
+        return String.format(java.util.Locale.US, "%.1f", v);
+    }
+
+    private static String fmt2(float v) {
+        return String.format(java.util.Locale.US, "%.2f", v);
+    }
+
+    private static String fmt3(double v) {
+        return String.format(java.util.Locale.US, "%.3f", v);
     }
 
     // ------------------------------------------------------------ frame emission
