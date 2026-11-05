@@ -545,6 +545,44 @@ public class VoiceService extends Service
     private CoachStreamer coachStreamer = null;
     private String coachStatus = "";
 
+    // ------------------------------------------------------------ v1.98 correction kill
+    // Nick, 2026-11-05: when Selena corrects a wrong COACH cue, the
+    // corrected message must STOP mid-play and NEVER resume, and
+    // its unreleased segments must never release. Scope gate, his
+    // words: the kill is armed ONLY while a coach session is live
+    // on this device — the kill channel below starts with the
+    // session and dies with it, the killed-send sets live and die
+    // with the session, and every kill received while no session
+    // is live is ignored. Outside coach sessions this build's
+    // playback behavior is v1.97's, byte for byte: a high-priority
+    // message still breaks in and the interrupted message still
+    // resumes from its pause (his 2026-10-23 design).
+    //
+    // Channel: selena-kill (server side) retires the send in the
+    // database (tracking item -> 'stopped', unplayed queue rows
+    // deleted — the brain's own stop semantics) and inserts one
+    // row into public.selena_voice_kills carrying the send's ids
+    // (send_id / item id / segment group / released row ids). The
+    // row reaches this service two ways: a Realtime subscription
+    // (instant; the same push pipeline as the voice queue) and a
+    // REST backstop riding the 3 s poll cycle. Either way the stop
+    // lands within the kill's design bound of ~2-3 s.
+    private RealtimeClient killRealtimeClient = null;
+    // Ids of sends killed during the CURRENT coach session. All
+    // accesses synchronize on the set itself: intake runs on poll /
+    // realtime reader threads, application on the main thread.
+    // Bounded like almostDoneFiredRows — a session's kills are few.
+    private final java.util.LinkedHashSet<String> killedRowIds =
+            new java.util.LinkedHashSet<>();
+    private final java.util.LinkedHashSet<String> killedGroups =
+            new java.util.LinkedHashSet<>();
+    private final java.util.LinkedHashSet<String> killedSendIds =
+            new java.util.LinkedHashSet<>();
+    private static final int KILLED_SET_CAP = 50;
+    // REST-backstop cursor (epoch ms): kills created before the
+    // current session armed are never even fetched.
+    private long killCursorMs = 0;
+
     // ------------------------------------------------------------ lifecycle
 
     @Override
@@ -720,6 +758,7 @@ public class VoiceService extends Service
             coachStreamer.shutdown();
             coachStreamer = null;
         }
+        disarmCorrectionKill(); // v1.98: no kill channel outlives the service
         stopRealtime();
         stopPolling();
         heartbeating = false;
@@ -876,6 +915,12 @@ public class VoiceService extends Service
             }
             if (!record.isNull("segment_index")) {
                 m.put("segmentIndex", record.optInt("segment_index", -1));
+            }
+            // v1.98: carry the send's idempotency key (selena-say
+            // rule 12 — every queue row is stamped with it) so the
+            // correction kill can match an arriving row to its send.
+            if (!record.isNull("send_id")) {
+                m.put("sendId", record.optString("send_id", ""));
             }
             long beforeTs = getLastTs();
             // v1.30: advance the cursor only past CONSUMED messages.
@@ -1041,6 +1086,9 @@ public class VoiceService extends Service
                     playNextWaitingPriority();
                 }
             });
+            // v1.98: correction-kill REST backstop (see the kill
+            // section) — no-op unless a coach session has armed it.
+            checkKillsBackstop();
             // Nick 2026-10-18 v1.7: ALWAYS advance last_ts PAST the newest
             // message processed (+1). The API returned a message whose
             // timestamp exactly equaled `since`, so a strict greater-than
@@ -1083,6 +1131,30 @@ public class VoiceService extends Service
         String segmentGroup = m.optString("segmentGroup", "");
         if (segmentGroup.isEmpty()) segmentGroup = null;
         final String sgroup = segmentGroup;
+        // v1.98: the send's idempotency key when the carrying path
+        // provides it (Realtime does; the poll API shape does not —
+        // row-id and group matching below cover that path).
+        String sendId = m.optString("sendId", "");
+        if (sendId.isEmpty()) sendId = null;
+        final String ssend = sendId;
+        // v1.98 correction kill, arrival leg: a row belonging to a
+        // send killed during THIS coach session is consumed and
+        // dropped — never synthesized, never queued, never played.
+        // (The killed sets are populated only by kills applied
+        // while a session is live and are cleared when it ends, so
+        // outside coach sessions this check can never fire.) The
+        // stopped report retires the send server-side exactly like
+        // a user stop does.
+        if (isKilledSend(sid, sgroup, ssend)) {
+            log("kill: dropping killed send's row id=" + sid
+                    + " group=" + sgroup + " send=" + ssend);
+            if (sid != null) {
+                new Thread(new PlaybackProgressTask(sid,
+                        "playback_stopped")).start();
+            }
+            if (ts > maxTs) maxTs = ts;
+            return maxTs;
+        }
         // Nick 2026-10-18 v1.12: explicit JSON-null check. The server
         // sends "audioUrl": null for text-only speed-mode replies;
         // optString on a JSON null returns the literal string "null"
@@ -1316,6 +1388,14 @@ public class VoiceService extends Service
      *  successor (see playFileNow / advanceAfterSegmentGap). */
     private void enqueueAudio(File f, String serverId,
             String segmentGroup) {
+        // v1.98 correction kill: a row whose send was killed during
+        // the live coach session (it was still downloading /
+        // synthesizing when the kill landed) is never queued.
+        if (isKilledSend(serverId, segmentGroup, null)) {
+            log("kill: queued MP3 dropped id=" + serverId
+                    + " group=" + segmentGroup);
+            return;
+        }
         if (serverId != null) {
             audioFileServerIds.put(f.getAbsolutePath(), serverId);
         }
@@ -2306,6 +2386,12 @@ public class VoiceService extends Service
      *  parallel queues (same lock; pumpTtsQueue polls all together). */
     private void enqueueTts(String text, String serverId,
             String segmentGroup) {
+        // v1.98 correction kill: same drop as enqueueAudio.
+        if (isKilledSend(serverId, segmentGroup, null)) {
+            log("kill: queued TTS dropped id=" + serverId
+                    + " group=" + segmentGroup);
+            return;
+        }
         synchronized (ttsQueue) {
             ttsQueue.add(text);
             ttsServerIdQueue.add(serverId);
@@ -3164,6 +3250,14 @@ public class VoiceService extends Service
     private void onPriorityArrivalMp3(final File f, final String text,
             final String serverId, final String segmentGroup,
             final boolean critical) {
+        // v1.98 correction kill: this row's send was killed during
+        // the live coach session (it was still synthesizing when
+        // the kill landed) — it never starts.
+        if (isKilledSend(serverId, segmentGroup, null)) {
+            log("kill: priority MP3 arrival dropped id=" + serverId
+                    + " group=" + segmentGroup);
+            return;
+        }
         refreshMicHold("arrival"); // v1.83: fresh count before a start
         // v1.58: a priority arrival preempts any pending post-gap
         // start — whether it plays now or parks, it outranks the gap.
@@ -3200,6 +3294,12 @@ public class VoiceService extends Service
      */
     private void onPriorityArrivalTts(final String text, final String serverId,
             final String segmentGroup, final boolean critical) {
+        // v1.98 correction kill: same drop as the MP3 twin.
+        if (isKilledSend(serverId, segmentGroup, null)) {
+            log("kill: priority TTS arrival dropped id=" + serverId
+                    + " group=" + segmentGroup);
+            return;
+        }
         refreshMicHold("arrival"); // v1.83: fresh count before a start
         // v1.58: priority preempts a pending post-gap start (see
         // onPriorityArrivalMp3).
@@ -3777,6 +3877,9 @@ public class VoiceService extends Service
         }
         startForegroundAs("Coach session live — listening", type);
         coachStreamer = new CoachStreamer(this, sessionId, this);
+        // v1.98: the correction kill arms with the session and
+        // only with the session (see the kill section below).
+        armCorrectionKill();
         coachStatus = "Starting microphone…";
         broadcastCoachState();
         if (disclosureIso != null) {
@@ -3792,6 +3895,7 @@ public class VoiceService extends Service
     private void stopCoachSession(String status) {
         CoachStreamer cs = coachStreamer;
         coachStreamer = null;
+        disarmCorrectionKill(); // v1.98: the kill dies with the session
         if (cs != null) cs.shutdown();
         coachStatus = status;
         // The microphone claim drops with the session.
@@ -3814,6 +3918,7 @@ public class VoiceService extends Service
         // The streamer ended itself (its failure path). Mirror
         // the stop bookkeeping without a second shutdown.
         coachStreamer = null;
+        disarmCorrectionKill(); // v1.98: the kill dies with the session
         coachStatus = reason;
         startForegroundAs("Selena Voice ready",
                 ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK);
@@ -3831,6 +3936,376 @@ public class VoiceService extends Service
         i.putExtra(EXTRA_COACH_MODE,
                 coachStreamer != null ? coachStreamer.mode() : "");
         sendAppBroadcast(i);
+    }
+
+    // ------------------------------------------------------------ v1.98 correction kill (machinery)
+    // Armed/disarmed with the coach session (see the field block).
+    // Every method below is inert unless a kill has actually been
+    // applied during the live session: the killed sets stay empty,
+    // every check falls through, and playback is v1.97's.
+
+    private void armCorrectionKill() {
+        // The backstop cursor starts NOW: kills from before this
+        // session are never fetched, let alone applied.
+        killCursorMs = System.currentTimeMillis();
+        if (killRealtimeClient != null) return;
+        killRealtimeClient = new RealtimeClient(
+                SUPABASE_HOST, SUPABASE_ANON_KEY,
+                "realtime:public:selena_voice_kills",
+                "selena_voice_kills",
+                new KillRealtimeListener(this),
+                new VoiceAuthTokenProvider(this));
+        killRealtimeClient.start();
+        log("kill: correction kill ARMED (coach session live)");
+    }
+
+    private void disarmCorrectionKill() {
+        if (killRealtimeClient != null) {
+            killRealtimeClient.stop();
+            killRealtimeClient = null;
+        }
+        synchronized (killedRowIds) { killedRowIds.clear(); }
+        synchronized (killedGroups) { killedGroups.clear(); }
+        synchronized (killedSendIds) { killedSendIds.clear(); }
+    }
+
+    /** Realtime entry point (KillRealtimeListener, reader thread)
+     *  and REST-backstop entry point (poll worker thread). Parses
+     *  the kill row and marshals application to the main thread. */
+    public void onKillSignal(JSONObject record) {
+        try {
+            final String sendId = record.optString("send_id", "");
+            final String itemId = record.optString("item_id", "");
+            final String group = record.optString("segment_group", "");
+            final java.util.ArrayList<String> rows =
+                    new java.util.ArrayList<>();
+            JSONArray arr = record.optJSONArray("row_ids");
+            if (arr != null) {
+                for (int i = 0; i < arr.length(); i++) {
+                    String r = arr.optString(i, "");
+                    if (!r.isEmpty()) rows.add(r);
+                }
+            }
+            handler.post(() -> applyCorrectionKill(
+                    sendId.isEmpty() ? null : sendId,
+                    itemId.isEmpty() ? null : itemId,
+                    group.isEmpty() ? null : group, rows));
+        } catch (Exception e) {
+            log("kill: signal parse failed: " + e);
+        }
+    }
+
+    /** Main thread. The scope gate is here, in one place: no live
+     *  coach session -> the kill is ignored outright, however it
+     *  arrived. */
+    private void applyCorrectionKill(String sendId, String itemId,
+            String group, java.util.List<String> rowIds) {
+        if (coachStreamer == null) {
+            log("kill: IGNORED — no coach session live (send="
+                    + sendId + ")");
+            return;
+        }
+        rememberKilled(killedSendIds, sendId);
+        // The tracking-item id doubles as the segment group of a
+        // grouped send (selena-say's convention), so both ride the
+        // group set: grouped rows match on it, whole sends simply
+        // never carry it and match on row id / send id instead.
+        rememberKilled(killedGroups, itemId);
+        rememberKilled(killedGroups, group);
+        if (rowIds != null) {
+            for (String r : rowIds) rememberKilled(killedRowIds, r);
+        }
+        log("kill: applying — send=" + sendId + " item=" + itemId
+                + " rows=" + (rowIds != null ? rowIds.size() : 0));
+        int purged = purgeKilledEntries();
+        boolean stoppedPlay = false;
+        if (currentPlayIsKilled()) {
+            killCurrentPlayback();
+            stoppedPlay = true;
+        }
+        if (!stoppedPlay && purged > 0 && rowIds != null
+                && !rowIds.isEmpty()) {
+            // Something of the send was still queued: one stopped
+            // report retires the whole item server-side (the brain
+            // deletes every row of the item), same as a user stop.
+            new Thread(new PlaybackProgressTask(rowIds.get(0),
+                    "playback_stopped")).start();
+        }
+        // Race closer: the targeted row may still be synthesizing
+        // or downloading when the kill lands and only reach a queue
+        // (or the player) a moment later. One recheck at +2 s
+        // re-runs the purge and the current-play check against the
+        // same killed sets. The play-gate guards in the arrival and
+        // enqueue paths cover everything after that.
+        handler.postDelayed(() -> {
+            if (coachStreamer == null) return;
+            purgeKilledEntries();
+            if (currentPlayIsKilled()) killCurrentPlayback();
+        }, 2000);
+    }
+
+    private void rememberKilled(java.util.LinkedHashSet<String> set,
+            String value) {
+        if (value == null || value.isEmpty()) return;
+        synchronized (set) {
+            set.add(value);
+            while (set.size() > KILLED_SET_CAP) {
+                java.util.Iterator<String> it = set.iterator();
+                it.next();
+                it.remove();
+            }
+        }
+    }
+
+    /** True when any identity of a send/row was killed during this
+     *  session. Null identities never match. */
+    private boolean isKilledSend(String rowId, String group,
+            String sendId) {
+        if (rowId != null) {
+            synchronized (killedRowIds) {
+                if (killedRowIds.contains(rowId)) return true;
+            }
+        }
+        if (group != null) {
+            synchronized (killedGroups) {
+                if (killedGroups.contains(group)) return true;
+            }
+        }
+        if (sendId != null) {
+            synchronized (killedSendIds) {
+                if (killedSendIds.contains(sendId)) return true;
+            }
+        }
+        return false;
+    }
+
+    private boolean currentPlayIsKilled() {
+        return isKilledSend(currentPlayServerId,
+                currentPlaySegmentGroup, null);
+    }
+
+    /** Remove every queued/stacked entry belonging to a killed
+     *  send: the waiting-priority FIFO, the interrupt stack (a
+     *  killed entry there would otherwise RESUME later — the exact
+     *  outcome the kill exists to prevent), the on-device TTS
+     *  queues, and the downloaded-MP3 queue. Returns how many
+     *  entries were removed. Main thread. */
+    private int purgeKilledEntries() {
+        int n = 0;
+        java.util.Iterator<WaitingPriority> wit =
+                waitingPriority.iterator();
+        while (wit.hasNext()) {
+            WaitingPriority wp = wit.next();
+            if (isKilledSend(wp.serverId, wp.segmentGroup, null)) {
+                wit.remove();
+                n++;
+                log("kill: purged waiting priority id=" + wp.serverId);
+            }
+        }
+        java.util.Iterator<InterruptedState> sit =
+                interruptStack.iterator();
+        while (sit.hasNext()) {
+            InterruptedState st = sit.next();
+            if (isKilledSend(st.serverId, st.segmentGroup, null)) {
+                sit.remove();
+                n++;
+                log("kill: purged interrupted entry id=" + st.serverId
+                        + " (would have resumed)");
+            }
+        }
+        synchronized (ttsQueue) {
+            int total = ttsQueue.size();
+            if (total > 0) {
+                java.util.ArrayList<String> texts =
+                        new java.util.ArrayList<>(ttsQueue);
+                java.util.ArrayList<String> ids =
+                        new java.util.ArrayList<>(ttsServerIdQueue);
+                java.util.ArrayList<String> groups =
+                        new java.util.ArrayList<>(ttsSegmentGroupQueue);
+                ttsQueue.clear();
+                ttsServerIdQueue.clear();
+                ttsSegmentGroupQueue.clear();
+                for (int i = 0; i < texts.size(); i++) {
+                    String id = i < ids.size() ? ids.get(i) : null;
+                    String gr = i < groups.size() ? groups.get(i) : null;
+                    if (isKilledSend(id, gr, null)) {
+                        n++;
+                        log("kill: purged queued TTS id=" + id);
+                    } else {
+                        ttsQueue.add(texts.get(i));
+                        ttsServerIdQueue.add(id);
+                        ttsSegmentGroupQueue.add(gr);
+                    }
+                }
+            }
+        }
+        synchronized (audioQueue) {
+            java.util.Iterator<File> fit = audioQueue.iterator();
+            while (fit.hasNext()) {
+                File f = fit.next();
+                String path = f.getAbsolutePath();
+                if (isKilledSend(audioFileServerIds.get(path),
+                        audioFileSegmentGroups.get(path), null)) {
+                    fit.remove();
+                    audioFileServerIds.remove(path);
+                    audioFileSegmentGroups.remove(path);
+                    if (!MessageHistory.isAudioReferenced(path)) {
+                        //noinspection ResultOfMethodCallIgnored
+                        f.delete();
+                    }
+                    n++;
+                    log("kill: purged queued MP3 " + f.getName());
+                }
+            }
+        }
+        return n;
+    }
+
+    /** Stop the currently-playing killed send — surgically. This
+     *  mirrors onPlaybackDoneNow's teardown and advance with two
+     *  deliberate differences: the row is reported STOPPED, never
+     *  played; and the advance that follows is the ordinary
+     *  completion advance, so a correction waiting in the priority
+     *  FIFO plays next and an interrupted UNRELATED message resumes
+     *  exactly as v1.97 would resume it. Only the killed send never
+     *  resumes: its stack entries were purged above and its trackers
+     *  are cleared before any completion handler can run. */
+    private void killCurrentPlayback() {
+        final String rowId = currentPlayServerId;
+        final String group = currentPlaySegmentGroup;
+        final File file = currentAudioFile;
+        final boolean wasTts = ttsSpeaking || ttsPaused;
+        log("kill: stopping current playback row=" + rowId
+                + " group=" + group + " tts=" + wasTts);
+        if (rowId != null && !rowId.isEmpty()
+                && !"priority".equals(rowId)) {
+            new Thread(new PlaybackProgressTask(rowId,
+                    "playback_stopped")).start();
+        }
+        cancelAlmostDoneWatch();
+        cancelAlmostDoneTts();
+        cancelPendingSegmentAdvance();
+        cancelPendingResume();
+        currentPlayServerId = null;
+        currentPlaySegmentGroup = null;
+        currentPlayCritical = false;
+        currentPriorityPlayText = null;
+        if (wasTts) {
+            // Swallow the engine's async stop callback (the
+            // interrupt path's own discipline): the advance below
+            // replaces onTtsDone's, exactly once.
+            suppressNextTtsDone = true;
+            ttsPauseRequested = false;
+            try {
+                if (tts != null) tts.stop();
+            } catch (Exception ignored) {}
+        }
+        ttsSpeaking = false;
+        ttsPaused = false;
+        ttsCurrentText = null;
+        ttsResumeAtChar = 0;
+        releasePlayer();
+        playing = false;
+        isPlayingAudio = false;
+        setPlayingAudio(false);
+        abandonAudioFocus();
+        restoreAudioRouting();
+        cleanupPlayedMessage(rowId,
+                file != null ? file.getAbsolutePath() : null);
+        if (file != null) {
+            String path = file.getAbsolutePath();
+            if (!MessageHistory.isAudioReferenced(path)) {
+                //noinspection ResultOfMethodCallIgnored
+                file.delete();
+            }
+            currentAudioFile = null;
+        }
+        broadcastPlaybackState();
+        advanceAfterSegmentGap(group,
+                wasTts ? nextGroupTtsFirst() : nextGroupAudioFirst(),
+                () -> {
+            if (!playing && !ttsSpeaking) {
+                if (!waitingPriority.isEmpty()) {
+                    playNextWaitingPriority();
+                    return;
+                }
+                if (!interruptStack.isEmpty()) {
+                    log("kill: unwinding interrupt stack ("
+                            + interruptStack.size() + " left)");
+                    priorityMode = false;
+                    priorityInterruptDepth = 0;
+                    resumeNextInterrupted();
+                    return;
+                }
+                if (priorityMode) {
+                    priorityMode = false;
+                    priorityInterruptDepth = 0;
+                    log("kill: priority flow done, resuming queues");
+                }
+                if (wasTts) {
+                    pumpTtsQueue();
+                    pumpAudioQueue();
+                } else {
+                    pumpAudioQueue();
+                    pumpTtsQueue();
+                }
+            }
+        });
+    }
+
+    /** REST backstop for the kill channel, ridden on the poll
+     *  cycle (poll worker thread — network is legal here). No-op
+     *  unless a coach session has armed the kill. Realtime is the
+     *  primary path; this bounds a dropped socket to one poll. */
+    private void checkKillsBackstop() {
+        if (killRealtimeClient == null || coachStreamer == null) {
+            return;
+        }
+        HttpURLConnection conn = null;
+        try {
+            String urlStr = "https://" + SUPABASE_HOST
+                    + "/rest/v1/selena_voice_kills"
+                    + "?select=id,send_id,item_id,segment_group,"
+                    + "row_ids,created_at"
+                    + "&created_at=gt."
+                    + URLEncoder.encode(killIso(killCursorMs), "UTF-8")
+                    + "&order=created_at.asc&limit=20";
+            conn = (HttpURLConnection) new URL(urlStr).openConnection();
+            conn.setConnectTimeout(8000);
+            conn.setReadTimeout(8000);
+            conn.setRequestProperty("apikey", SUPABASE_ANON_KEY);
+            String tok = null;
+            try {
+                tok = SupabaseAuth.validAccessToken(this);
+            } catch (Exception ignored) {}
+            conn.setRequestProperty("Authorization", "Bearer "
+                    + (tok != null ? tok : SUPABASE_ANON_KEY));
+            int code = conn.getResponseCode();
+            if (code != 200) {
+                log("kill: backstop HTTP " + code);
+                return;
+            }
+            String body = readAll(conn.getInputStream());
+            JSONArray arr = new JSONArray(body.trim());
+            for (int i = 0; i < arr.length(); i++) {
+                JSONObject row = arr.getJSONObject(i);
+                long ts = parseRowTimestamp(
+                        row.optString("created_at", ""));
+                if (ts > killCursorMs) killCursorMs = ts;
+                onKillSignal(row);
+            }
+        } catch (Exception e) {
+            log("kill: backstop check failed: " + e);
+        } finally {
+            if (conn != null) conn.disconnect();
+        }
+    }
+
+    private static String killIso(long epochMs) {
+        java.text.SimpleDateFormat df = new java.text.SimpleDateFormat(
+                "yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", java.util.Locale.US);
+        df.setTimeZone(java.util.TimeZone.getTimeZone("UTC"));
+        return df.format(new java.util.Date(epochMs));
     }
 
     private void broadcastPlaybackState() {

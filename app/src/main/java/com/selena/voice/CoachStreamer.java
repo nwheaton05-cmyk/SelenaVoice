@@ -64,10 +64,12 @@ import java.util.concurrent.Executors;
  *       before. The wire format did not change; the server only
  *       stores frames (carry-only).
  *
- * Segmentation comes from the recognizer's endpoint rules (the
- * drone/wake-proven set: 2.4 s of silence ends a no-speech
- * stream, 1.2 s of trailing silence ends an utterance, 20 s hard
- * cap per utterance).
+ * Segmentation comes from the recognizer's endpoint rules:
+ * 2.4 s of silence ends a no-speech stream, 20 s hard cap per
+ * utterance (both the drone/wake-proven values), and — coach-only
+ * since v1.98 — 0.8 s of trailing silence ends an utterance (the
+ * drone/wake set's 1.2 s cost every coach exchange latency; see
+ * the endpoint config below).
  *
  * DUPLEX: the capture registers its AudioRecord audio-session id
  * with VoiceService (registerOwnMicSession) BEFORE recording
@@ -365,12 +367,20 @@ public class CoachStreamer {
             config.setDecodingMethod("greedy_search");
             config.setMaxActivePaths(4);
             config.setEnableEndpoint(true);
-            // The drone/wake-proven endpoint rules (v1.62/v1.68):
-            // 2.4 s silence ends a no-speech stream, 1.2 s trailing
-            // silence ends an utterance, 20 s hard cap per utterance.
+            // Endpoint rules: 2.4 s silence ends a no-speech stream
+            // and the 20 s hard cap are the drone/wake-proven values
+            // (v1.62/v1.68). The trailing-silence rule is COACH-ONLY
+            // from v1.98 (Nick, 2026-11-05): 0.8 s instead of the
+            // drone/wake 1.2 s — every coach exchange paid the full
+            // trailing wait before its final posted, and the seat's
+            // continuous-correction + commit-at-natural-pause
+            // machinery already absorbs Nick's thinking-pause chops.
+            // This config exists only in CoachStreamer (the coach
+            // path); drone/wake endpointing lives elsewhere and is
+            // untouched.
             config.setEndpointConfig(new EndpointConfig(
                     new EndpointRule(false, 2.4f, 0f),
-                    new EndpointRule(true, 1.2f, 0f),
+                    new EndpointRule(true, 0.8f, 0f),
                     new EndpointRule(false, 0f, 20f)));
             try {
                 return new OnlineRecognizer(null, config);
