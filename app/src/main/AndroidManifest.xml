@@ -16,6 +16,18 @@
          this permission; the system prompts the user for the per-app
          "install unknown apps" grant on first use. -->
     <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+    <!-- Nick 2026-11-05 v1.91: RECORD_AUDIO returns, GATED TO COACH
+         SESSIONS ONLY — his explicit reversal of the v1.82 removal
+         above, for the streaming addition (Slice A). The v1.82 order
+         otherwise stands: no microphone ability as a general app
+         feature. Capture exists only inside a coach session started
+         from the in-app session control, and only after the
+         disclosure confirmation (CT all-party consent: the
+         disclosure is said BEFORE recording starts). The recognizer
+         is created and started solely by CoachStreamer.begin(),
+         which MainActivity calls solely from the disclosure
+         confirmation handler; session Stop destroys it. -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
 
     <application
         android:label="Selena Voice"

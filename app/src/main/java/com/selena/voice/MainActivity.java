@@ -44,8 +44,22 @@ import java.util.List;
  * latency test). It POSTs {text} to /api/selena-voice/input, the
  * app's open write path. Still playback-only for audio: no mic,
  * no RECORD_AUDIO, nothing about VoiceService playback changes.
+ *
+ * v1.91 (Nick, 2026-11-05): coach-session STREAMING (Slice A) — and
+ * the microphone's gated return. Nick explicitly reversed his
+ * v1.82 no-microphone order for coach sessions only (2026-11-05
+ * 00:17 EST): RECORD_AUDIO is back, but capture exists ONLY inside
+ * a session started from the on-screen session control, and ONLY
+ * after the disclosure step (his legal gate, 2026-11-05 00:19 EST
+ * — CT all-party consent: the disclosure is said BEFORE recording
+ * starts). Start does not record: it opens the disclosure panel,
+ * and the recognizer is created solely in the disclosure
+ * confirmation handler, via CoachStreamer. While the session is
+ * live, word frames (1–2 word deltas + segment finals) POST to
+ * /api/selena-voice/stream; Stop destroys the recognizer.
+ * Playback, queue, heartbeat, and the compose box are untouched.
  */
-public class MainActivity extends Activity {
+public class MainActivity extends Activity implements CoachStreamer.Listener {
     private static final String TAG = "SelenaVoice";
 
     private TextView statusText;
@@ -86,6 +100,18 @@ public class MainActivity extends Activity {
     private EditText composeInput;
     private Button composeSendButton;
     private TextView composeStatusText;
+
+    // v1.91 (Nick, 2026-11-05): coach-session streaming controls.
+    // coachStreamer is non-null ONLY while a session is live, and
+    // it is created ONLY in onDisclosureConfirm() — the gate.
+    private Button coachSessionButton;
+    private TextView coachSessionStatus;
+    private android.widget.LinearLayout disclosurePanel;
+    private Button disclosureConfirmButton;
+    private Button disclosureCancelButton;
+    private CoachStreamer coachStreamer;
+    private boolean sessionStartPendingPermission;
+    private static final int REQ_RECORD_AUDIO = 9101;
 
     // Nick 2026-10-22 v1.33: in-app auto-updater banner. Hidden until the
     // version check finds a newer APK; tap downloads + installs it.
@@ -249,6 +275,16 @@ public class MainActivity extends Activity {
         composeSendButton = findViewById(R.id.composeSendButton);
         composeStatusText = findViewById(R.id.composeStatusText);
         composeSendButton.setOnClickListener(v -> sendComposedMessage());
+
+        // v1.91 (Nick, 2026-11-05): coach-session streaming wiring.
+        coachSessionButton = findViewById(R.id.coachSessionButton);
+        coachSessionStatus = findViewById(R.id.coachSessionStatus);
+        disclosurePanel = findViewById(R.id.disclosurePanel);
+        disclosureConfirmButton = findViewById(R.id.disclosureConfirmButton);
+        disclosureCancelButton = findViewById(R.id.disclosureCancelButton);
+        coachSessionButton.setOnClickListener(v -> onCoachSessionButton());
+        disclosureConfirmButton.setOnClickListener(v -> onDisclosureConfirm());
+        disclosureCancelButton.setOnClickListener(v -> onDisclosureCancel());
 
         // Nick 2026-10-22 v1.33: in-app auto-updater. Hidden until the
         // version check finds a newer APK — v1.33 is the last manual
@@ -561,6 +597,123 @@ public class MainActivity extends Activity {
         }).start();
     }
 
+    // ------------------------------------------------------------ v1.91 coach-session streaming
+
+    /**
+     * Session control (v1.91, Nick 2026-11-05). When idle, the tap
+     * begins the START FLOW — it does NOT start recording. When a
+     * session is live, the tap stops it: the recognizer is
+     * destroyed and capture is dead until the next Start passes
+     * the disclosure gate again.
+     */
+    private void onCoachSessionButton() {
+        if (coachStreamer != null) {
+            stopCoachSession("Session stopped");
+            return;
+        }
+        // Start flow, step 0: the recognizer must exist on this
+        // device before we ask Nick to say a disclosure for it.
+        if (!android.speech.SpeechRecognizer.isRecognitionAvailable(this)) {
+            coachSessionStatus.setText(
+                    "Speech recognition isn't available on this device"
+                            + " — session can't start.");
+            VoiceService.log("stream: recognition unavailable on device");
+            return;
+        }
+        // Start flow, step 1: mic permission (requesting it is not
+        // recording). The disclosure step opens on grant.
+        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO)
+                != PackageManager.PERMISSION_GRANTED) {
+            sessionStartPendingPermission = true;
+            requestPermissions(
+                    new String[]{Manifest.permission.RECORD_AUDIO},
+                    REQ_RECORD_AUDIO);
+            return;
+        }
+        showDisclosureStep();
+    }
+
+    @Override
+    public void onRequestPermissionsResult(int requestCode,
+                                           String[] permissions,
+                                           int[] grantResults) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+        if (requestCode != REQ_RECORD_AUDIO) return;
+        boolean granted = grantResults.length > 0
+                && grantResults[0] == PackageManager.PERMISSION_GRANTED;
+        if (granted && sessionStartPendingPermission) {
+            sessionStartPendingPermission = false;
+            showDisclosureStep();
+        } else if (!granted) {
+            sessionStartPendingPermission = false;
+            coachSessionStatus.setText(
+                    "Microphone permission denied — session can't start.");
+        }
+    }
+
+    /**
+     * The disclosure step (Nick's legal gate, 2026-11-05 00:19 EST):
+     * the disclosure line is on screen and the room has heard it
+     * BEFORE any capture exists. Nothing in this step touches a
+     * recognizer — it only shows the panel.
+     */
+    private void showDisclosureStep() {
+        disclosurePanel.setVisibility(View.VISIBLE);
+        coachSessionButton.setEnabled(false);
+        coachSessionStatus.setText("Say the disclosure line, then confirm.");
+    }
+
+    private void onDisclosureCancel() {
+        disclosurePanel.setVisibility(View.GONE);
+        coachSessionButton.setEnabled(true);
+        coachSessionStatus.setText("Session not started — nothing was recorded.");
+    }
+
+    /**
+     * THE GATE. This confirmation tap is the only place a session —
+     * and with it, capture — is created: the session id and the
+     * disclosure timestamp are generated here, CoachStreamer is
+     * constructed here, and its begin() (the only recognizer start
+     * in the app) runs only from here. There is no other code path
+     * to a live microphone.
+     */
+    private void onDisclosureConfirm() {
+        String sessionId = "cs-" + System.currentTimeMillis();
+        String disclosureIso = java.time.Instant.now().toString();
+        disclosurePanel.setVisibility(View.GONE);
+        coachStreamer = new CoachStreamer(this, sessionId, this);
+        coachSessionButton.setText("Stop session");
+        coachSessionButton.setEnabled(true);
+        coachStreamer.begin(disclosureIso);
+    }
+
+    // CoachStreamer.Listener (v1.91) — implemented on the activity
+    // itself rather than an anonymous class: the manual build's d8
+    // (R8 8.2.2-dev) dies with an internal NPE on an anonymous class
+    // implementing another class's nested interface.
+    @Override
+    public void onStreamStatus(String msg) {
+        coachSessionStatus.setText(msg);
+    }
+
+    @Override
+    public void onStreamEnded(String reason) {
+        coachStreamer = null;
+        coachSessionButton.setText("Start session");
+        coachSessionButton.setEnabled(true);
+        coachSessionStatus.setText(reason);
+    }
+
+    private void stopCoachSession(String statusMsg) {
+        if (coachStreamer != null) {
+            coachStreamer.shutdown();
+            coachStreamer = null;
+        }
+        coachSessionButton.setText("Start session");
+        coachSessionButton.setEnabled(true);
+        coachSessionStatus.setText(statusMsg);
+    }
+
     private void showSignInDialog() {
         android.widget.LinearLayout box =
                 new android.widget.LinearLayout(this);
@@ -777,6 +930,17 @@ public class MainActivity extends Activity {
     protected void onPause() {
         super.onPause();
         try { unregisterReceiver(receiver); } catch (Exception ignored) {}
+    }
+
+    @Override
+    protected void onDestroy() {
+        // v1.91: capture must not outlive the screen that gated it —
+        // a live session's recognizer dies with the activity.
+        if (coachStreamer != null) {
+            coachStreamer.shutdown();
+            coachStreamer = null;
+        }
+        super.onDestroy();
     }
 
     // ------------------------------------------------------------ UI helpers

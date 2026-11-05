@@ -279,6 +279,96 @@
         android:gravity="center"
         android:paddingBottom="12dp" />
 
+    <!-- v1.91 (Nick, 2026-11-05): coach session streaming (Slice A).
+         The Start button does NOT start recording: it opens the
+         DISCLOSURE step below (CT all-party consent — the disclosure
+         is said BEFORE recording starts, Nick 2026-11-05 00:19 EST).
+         Capture can only begin from the disclosure step's explicit
+         confirmation button; there is no other path to it. -->
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="horizontal"
+        android:gravity="center_vertical"
+        android:paddingBottom="4dp">
+
+        <TextView
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:text="Coach session"
+            android:textSize="16sp"
+            android:textColor="@color/selena_dark" />
+
+        <Button
+            android:id="@+id/coachSessionButton"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="Start session"
+            android:textSize="16sp" />
+    </LinearLayout>
+
+    <LinearLayout
+        android:id="@+id/disclosurePanel"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical"
+        android:visibility="gone"
+        android:paddingTop="4dp"
+        android:paddingBottom="4dp">
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Say this first, out loud:"
+            android:textSize="14sp"
+            android:textStyle="bold"
+            android:textColor="@color/selena_dark"
+            android:paddingBottom="4dp" />
+
+        <TextView
+            android:id="@+id/disclosureText"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="“My assistant is listening and taking notes for me, so I don’t miss anything.”"
+            android:textSize="17sp"
+            android:paddingBottom="8dp" />
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:gravity="center_vertical">
+
+            <Button
+                android:id="@+id/disclosureConfirmButton"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:text="Disclosure said — start recording"
+                android:textSize="15sp" />
+
+            <Button
+                android:id="@+id/disclosureCancelButton"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginStart="8dp"
+                android:text="Cancel"
+                android:textSize="15sp" />
+        </LinearLayout>
+    </LinearLayout>
+
+    <TextView
+        android:id="@+id/coachSessionStatus"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text=""
+        android:textSize="14sp"
+        android:textStyle="bold"
+        android:textColor="@color/selena_dark"
+        android:gravity="center"
+        android:paddingBottom="12dp" />
+
     <!-- Message log -->
     <TextView
         android:layout_width="match_parent"
