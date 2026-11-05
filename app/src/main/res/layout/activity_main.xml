@@ -280,11 +280,14 @@
         android:paddingBottom="12dp" />
 
     <!-- v1.91 (Nick, 2026-11-05): coach session streaming (Slice A).
-         The Start button does NOT start recording: it opens the
+         Start opens a TWO-DOOR step (Nick, 2026-11-05 00:23 EST):
+         the disclosure duty is owed to OTHER people, not to Nick.
+         "Just me" (solo rehearsal/emulation) starts recording
+         immediately, no disclosure step. "With others" opens the
          DISCLOSURE step below (CT all-party consent — the disclosure
-         is said BEFORE recording starts, Nick 2026-11-05 00:19 EST).
-         Capture can only begin from the disclosure step's explicit
-         confirmation button; there is no other path to it. -->
+         is said BEFORE recording starts, Nick 2026-11-05 00:19 EST),
+         and in that mode capture can only begin from the disclosure
+         step's explicit confirmation button; no path around it. -->
     <LinearLayout
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
@@ -306,6 +309,57 @@
             android:layout_height="wrap_content"
             android:text="Start session"
             android:textSize="16sp" />
+    </LinearLayout>
+
+    <LinearLayout
+        android:id="@+id/sessionModePanel"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical"
+        android:visibility="gone"
+        android:paddingTop="4dp"
+        android:paddingBottom="4dp">
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Who's in this conversation?"
+            android:textSize="14sp"
+            android:textStyle="bold"
+            android:textColor="@color/selena_dark"
+            android:paddingBottom="4dp" />
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:gravity="center_vertical">
+
+            <Button
+                android:id="@+id/sessionSoloButton"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:text="Just me"
+                android:textSize="15sp" />
+
+            <Button
+                android:id="@+id/sessionOthersButton"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:layout_marginStart="8dp"
+                android:text="With others"
+                android:textSize="15sp" />
+
+            <Button
+                android:id="@+id/sessionModeCancelButton"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginStart="8dp"
+                android:text="Cancel"
+                android:textSize="15sp" />
+        </LinearLayout>
     </LinearLayout>
 
     <LinearLayout

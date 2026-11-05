@@ -33,19 +33,28 @@ import java.util.concurrent.Executors;
  *
  * THE GATE IS THE FEATURE (Nick's mic ruling, 2026-11-05 00:17 EST,
  * reversing his v1.82 no-microphone order for coach sessions only):
- * this class is instantiated ONLY by MainActivity's disclosure
- * confirmation handler, and begin() is its only entry point. There
- * is no code path that creates or starts the recognizer without
- * passing through that confirmation. Outside a session, capture
- * never runs: Stop (or activity destroy) calls shutdown(), which
- * destroys the recognizer.
+ * this class is instantiated ONLY by MainActivity's two session
+ * door handlers, and the private begin() below is reachable ONLY
+ * through beginSolo() / beginWithOthers(). Outside a session,
+ * capture never runs: Stop (or activity destroy) calls shutdown(),
+ * which destroys the recognizer.
  *
- * DISCLOSURE PROOF (Nick, 2026-11-05 00:19 EST — CT all-party
- * consent): the first frame of every session is a control frame
- * (seq 0, seg_id "__session__") whose meta carries
- * {type: "session_start", disclosure_confirmed_at: <ISO time of
- * the confirmation tap>}. It is enqueued before the recognizer
- * starts, so no word frame can precede it in the record.
+ * TWO DOORS (Nick, 2026-11-05 00:19 + 00:23 EST): the disclosure
+ * duty is owed to OTHER people in the conversation, not to Nick.
+ * - Solo ("Just me" — rehearsal/emulation): no disclosure step;
+ *   beginSolo() starts capture immediately.
+ * - With others: the disclosure is said BEFORE recording starts
+ *   (recording first would violate CT all-party consent);
+ *   beginWithOthers() is called ONLY from the disclosure step's
+ *   confirmation handler, after the disclosure has been said.
+ *   There is no path around that confirmation in this mode.
+ *
+ * PROOF IN THE RECORD: the first frame of every session is a
+ * control frame (seq 0, seg_id "__session__") whose meta carries
+ * {type: "session_start", mode: "solo"} or {type: "session_start",
+ * mode: "with_others", disclosure_confirmed_at: <ISO tap time>}.
+ * It is enqueued before the recognizer starts, so no word frame
+ * can precede it in the record.
  *
  * Threading: the recognizer lives on the main thread (created and
  * driven there, as SpeechRecognizer requires); frame POSTs run on
@@ -92,26 +101,53 @@ public class CoachStreamer implements RecognitionListener {
     }
 
     /**
-     * The ONLY start path. Enqueues the disclosure-proof control
-     * frame first, then creates and starts the recognizer. Called
-     * exactly once, from the disclosure confirmation handler.
+     * Solo door ("Just me"): no disclosure is owed to anyone, so
+     * capture starts immediately. Called ONLY from MainActivity's
+     * "Just me" handler.
      */
-    public void begin(String disclosureConfirmedIso) {
-        if (live || ended) return;
-        live = true;
+    public void beginSolo() {
         try {
             JSONObject meta = new JSONObject();
             meta.put("type", "session_start");
-            meta.put("disclosure_confirmed_at", disclosureConfirmedIso);
-            enqueueFrame(0L, "", false, meta);
+            meta.put("mode", "solo");
+            begin(meta);
         } catch (Exception e) {
             VoiceService.log("stream: session_start frame build failed: " + e);
         }
+    }
+
+    /**
+     * With-others door: called ONLY from MainActivity's disclosure
+     * confirmation handler — i.e., only after the disclosure has
+     * been said out loud and confirmed on screen. The confirmation
+     * timestamp rides the control frame as the compliance proof.
+     */
+    public void beginWithOthers(String disclosureConfirmedIso) {
+        try {
+            JSONObject meta = new JSONObject();
+            meta.put("type", "session_start");
+            meta.put("mode", "with_others");
+            meta.put("disclosure_confirmed_at", disclosureConfirmedIso);
+            begin(meta);
+        } catch (Exception e) {
+            VoiceService.log("stream: session_start frame build failed: " + e);
+        }
+    }
+
+    /**
+     * The single start path both doors funnel into: enqueue the
+     * session_start control frame FIRST, then create and start the
+     * recognizer. Private — reachable only via the two doors above.
+     */
+    private void begin(JSONObject meta) {
+        if (live || ended) return;
+        live = true;
+        enqueueFrame(0L, "", false, meta);
         recognizer = SpeechRecognizer.createSpeechRecognizer(appContext);
         recognizer.setRecognitionListener(this);
         startListeningCycle();
-        VoiceService.log("stream: session " + sessionId + " live"
-                + " (disclosure confirmed " + disclosureConfirmedIso + ")");
+        VoiceService.log("stream: session " + sessionId + " live (mode "
+                + meta.optString("mode", "?") + ")");
         listener.onStreamStatus("Session live — streaming");
     }
 

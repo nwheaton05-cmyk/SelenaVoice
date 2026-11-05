@@ -49,12 +49,15 @@ import java.util.List;
  * the microphone's gated return. Nick explicitly reversed his
  * v1.82 no-microphone order for coach sessions only (2026-11-05
  * 00:17 EST): RECORD_AUDIO is back, but capture exists ONLY inside
- * a session started from the on-screen session control, and ONLY
- * after the disclosure step (his legal gate, 2026-11-05 00:19 EST
- * — CT all-party consent: the disclosure is said BEFORE recording
- * starts). Start does not record: it opens the disclosure panel,
- * and the recognizer is created solely in the disclosure
- * confirmation handler, via CoachStreamer. While the session is
+ * a session started from the on-screen session control. Start has
+ * TWO DOORS (his corrected legal gate, 2026-11-05 00:19 + 00:23
+ * EST): the disclosure duty is owed to other people, not to Nick.
+ * "Just me" (solo rehearsal/emulation) starts recording
+ * immediately — no disclosure step. "With others" opens the
+ * disclosure step (CT all-party consent: the disclosure is said
+ * BEFORE recording starts), and capture begins only from that
+ * step's confirmation tap, via CoachStreamer.beginWithOthers();
+ * the solo door runs through beginSolo(). While the session is
  * live, word frames (1–2 word deltas + segment finals) POST to
  * /api/selena-voice/stream; Stop destroys the recognizer.
  * Playback, queue, heartbeat, and the compose box are untouched.
@@ -103,9 +106,14 @@ public class MainActivity extends Activity implements CoachStreamer.Listener {
 
     // v1.91 (Nick, 2026-11-05): coach-session streaming controls.
     // coachStreamer is non-null ONLY while a session is live, and
-    // it is created ONLY in onDisclosureConfirm() — the gate.
+    // it is created ONLY in the two door handlers: onSessionSolo()
+    // and onDisclosureConfirm() — the gates.
     private Button coachSessionButton;
     private TextView coachSessionStatus;
+    private android.widget.LinearLayout sessionModePanel;
+    private Button sessionSoloButton;
+    private Button sessionOthersButton;
+    private Button sessionModeCancelButton;
     private android.widget.LinearLayout disclosurePanel;
     private Button disclosureConfirmButton;
     private Button disclosureCancelButton;
@@ -279,10 +287,17 @@ public class MainActivity extends Activity implements CoachStreamer.Listener {
         // v1.91 (Nick, 2026-11-05): coach-session streaming wiring.
         coachSessionButton = findViewById(R.id.coachSessionButton);
         coachSessionStatus = findViewById(R.id.coachSessionStatus);
+        sessionModePanel = findViewById(R.id.sessionModePanel);
+        sessionSoloButton = findViewById(R.id.sessionSoloButton);
+        sessionOthersButton = findViewById(R.id.sessionOthersButton);
+        sessionModeCancelButton = findViewById(R.id.sessionModeCancelButton);
         disclosurePanel = findViewById(R.id.disclosurePanel);
         disclosureConfirmButton = findViewById(R.id.disclosureConfirmButton);
         disclosureCancelButton = findViewById(R.id.disclosureCancelButton);
         coachSessionButton.setOnClickListener(v -> onCoachSessionButton());
+        sessionSoloButton.setOnClickListener(v -> onSessionSolo());
+        sessionOthersButton.setOnClickListener(v -> onSessionOthers());
+        sessionModeCancelButton.setOnClickListener(v -> onSessionModeCancel());
         disclosureConfirmButton.setOnClickListener(v -> onDisclosureConfirm());
         disclosureCancelButton.setOnClickListener(v -> onDisclosureCancel());
 
@@ -621,7 +636,7 @@ public class MainActivity extends Activity implements CoachStreamer.Listener {
             return;
         }
         // Start flow, step 1: mic permission (requesting it is not
-        // recording). The disclosure step opens on grant.
+        // recording). The two-door step opens on grant.
         if (checkSelfPermission(Manifest.permission.RECORD_AUDIO)
                 != PackageManager.PERMISSION_GRANTED) {
             sessionStartPendingPermission = true;
@@ -630,7 +645,7 @@ public class MainActivity extends Activity implements CoachStreamer.Listener {
                     REQ_RECORD_AUDIO);
             return;
         }
-        showDisclosureStep();
+        showSessionModeStep();
     }
 
     @Override
@@ -643,12 +658,51 @@ public class MainActivity extends Activity implements CoachStreamer.Listener {
                 && grantResults[0] == PackageManager.PERMISSION_GRANTED;
         if (granted && sessionStartPendingPermission) {
             sessionStartPendingPermission = false;
-            showDisclosureStep();
+            showSessionModeStep();
         } else if (!granted) {
             sessionStartPendingPermission = false;
             coachSessionStatus.setText(
                     "Microphone permission denied — session can't start.");
         }
+    }
+
+    /**
+     * The two-door step (Nick, 2026-11-05 00:23 EST): who is in the
+     * conversation decides whether a disclosure is owed at all.
+     * Nothing in this step touches a recognizer — it only shows
+     * the panel.
+     */
+    private void showSessionModeStep() {
+        sessionModePanel.setVisibility(View.VISIBLE);
+        coachSessionButton.setEnabled(false);
+        coachSessionStatus.setText("");
+    }
+
+    private void onSessionModeCancel() {
+        sessionModePanel.setVisibility(View.GONE);
+        coachSessionButton.setEnabled(true);
+        coachSessionStatus.setText("Session not started — nothing was recorded.");
+    }
+
+    /**
+     * SOLO DOOR — "Just me" (rehearsal/emulation). The disclosure
+     * duty is owed to other people; alone, there is nobody to owe
+     * it to, so recording starts immediately with no disclosure
+     * step. One of only two CoachStreamer constructions in the app.
+     */
+    private void onSessionSolo() {
+        sessionModePanel.setVisibility(View.GONE);
+        String sessionId = "cs-" + System.currentTimeMillis();
+        coachStreamer = new CoachStreamer(this, sessionId, this);
+        coachSessionButton.setText("Stop session");
+        coachSessionButton.setEnabled(true);
+        coachStreamer.beginSolo();
+    }
+
+    /** "With others" — proceed to the disclosure step. */
+    private void onSessionOthers() {
+        sessionModePanel.setVisibility(View.GONE);
+        showDisclosureStep();
     }
 
     /**
@@ -664,18 +718,21 @@ public class MainActivity extends Activity implements CoachStreamer.Listener {
     }
 
     private void onDisclosureCancel() {
+        // Back to the two-door step; still nothing recorded.
         disclosurePanel.setVisibility(View.GONE);
-        coachSessionButton.setEnabled(true);
-        coachSessionStatus.setText("Session not started — nothing was recorded.");
+        sessionModePanel.setVisibility(View.VISIBLE);
+        coachSessionStatus.setText("Disclosure not confirmed — nothing was recorded.");
     }
 
     /**
-     * THE GATE. This confirmation tap is the only place a session —
-     * and with it, capture — is created: the session id and the
-     * disclosure timestamp are generated here, CoachStreamer is
-     * constructed here, and its begin() (the only recognizer start
-     * in the app) runs only from here. There is no other code path
-     * to a live microphone.
+     * THE WITH-OTHERS GATE. This confirmation tap is the only place
+     * a with-others session — and with it, capture — is created:
+     * the session id and the disclosure timestamp are generated
+     * here, CoachStreamer is constructed here, and beginWithOthers()
+     * runs only from here. In this mode there is no code path to a
+     * live microphone that bypasses the confirmation. (The solo
+     * door, onSessionSolo(), is the only other construction — it
+     * carries no disclosure because none is owed.)
      */
     private void onDisclosureConfirm() {
         String sessionId = "cs-" + System.currentTimeMillis();
@@ -684,7 +741,7 @@ public class MainActivity extends Activity implements CoachStreamer.Listener {
         coachStreamer = new CoachStreamer(this, sessionId, this);
         coachSessionButton.setText("Stop session");
         coachSessionButton.setEnabled(true);
-        coachStreamer.begin(disclosureIso);
+        coachStreamer.beginWithOthers(disclosureIso);
     }
 
     // CoachStreamer.Listener (v1.91) — implemented on the activity
@@ -699,6 +756,8 @@ public class MainActivity extends Activity implements CoachStreamer.Listener {
     @Override
     public void onStreamEnded(String reason) {
         coachStreamer = null;
+        sessionModePanel.setVisibility(View.GONE);
+        disclosurePanel.setVisibility(View.GONE);
         coachSessionButton.setText("Start session");
         coachSessionButton.setEnabled(true);
         coachSessionStatus.setText(reason);
