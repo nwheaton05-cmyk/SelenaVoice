@@ -198,6 +198,30 @@ public class CoachStreamer {
     private AudioDeviceInfo routedMicDevice;
     private boolean commDeviceSet = false;
 
+    // Playback gate (v1.100, Nick, 2026-11-05): while WE hold the
+    // communication-device slot for the earbud mic, the earbuds'
+    // A2DP/media route is suspended, so media-stream playback
+    // addressed to Bluetooth lands in dead air (field-proven
+    // 2026-11-05 15:18 EST: a high-priority correction "played"
+    // via USAGE_MEDIA TTS while SCO was held and Nick heard
+    // nothing). VoiceService reads this static on EVERY playback
+    // start and, while it is true, speaks with
+    // USAGE_VOICE_COMMUNICATION instead — true duplex over the
+    // same channel the mic is on, like a phone call. Set true
+    // only where commDeviceSet becomes true; cleared in
+    // clearEarbudRouting() (both teardown paths funnel through
+    // it) and defensively at the top of routeCaptureToEarbud(),
+    // so post-session playback is plain media again.
+    private static volatile boolean commRouteActive = false;
+
+    /** True while a coach session holds the Bluetooth
+     *  communication device for the earbud mic. Playback must
+     *  ride the communication channel exactly then, and only
+     *  then (v1.100). */
+    public static boolean isCommRouteActive() {
+        return commRouteActive;
+    }
+
     private int nextSeq = 0;
     private int segIndex = 0;
     private List<String> prevPartialWords = new ArrayList<>();
@@ -458,6 +482,7 @@ public class CoachStreamer {
      * the earbud mic", not "no earbuds, no session").
      */
     private AudioDeviceInfo routeCaptureToEarbud() {
+        commRouteActive = false; // v1.100: re-earned only on success below
         try {
             if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) {
                 VoiceService.log("stream: earbud mic routing needs "
@@ -478,6 +503,7 @@ public class CoachStreamer {
                         || t == AudioDeviceInfo.TYPE_BLE_HEADSET) {
                     if (am.setCommunicationDevice(d)) {
                         commDeviceSet = true;
+                        commRouteActive = true; // v1.100: playback gate opens
                         VoiceService.log("stream: capture routed to "
                                 + "earbud mic " + deviceLabel(d));
                         return d;
@@ -501,6 +527,7 @@ public class CoachStreamer {
     /** Release the communication-device slot if we hold it.
      *  Idempotent; called from both teardown paths. */
     private void clearEarbudRouting() {
+        commRouteActive = false; // v1.100: playback returns to media at once
         if (!commDeviceSet) return;
         commDeviceSet = false;
         try {

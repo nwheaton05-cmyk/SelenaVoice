@@ -1582,7 +1582,13 @@ public class VoiceService extends Service
             // Nick 2026-10-18 v1.11: Bluetooth-aware — earbuds win
             // over the speakerphone when connected.
             routeAudioForPlayback();
-            log("audio: stream=MUSIC (USAGE_MEDIA)");
+            // v1.100: while a coach session holds the earbud-mic
+            // communication channel, media playback is dead air
+            // in the ear (A2DP suspended under SCO) — ride the
+            // communication channel instead (see playbackUsage()).
+            log(CoachStreamer.isCommRouteActive()
+                    ? "audio: stream=VOICE_COMMUNICATION (coach comm route)"
+                    : "audio: stream=MUSIC (USAGE_MEDIA)");
             requestAudioFocus();
             // v1.81 ORPHAN GUARD (field, 2026-11-02): this start is
             // about to release the current player below. If that
@@ -1625,7 +1631,7 @@ public class VoiceService extends Service
             releasePlayer();
             player = new MediaPlayer();
             player.setAudioAttributes(new AudioAttributes.Builder()
-                    .setUsage(AudioAttributes.USAGE_MEDIA)
+                    .setUsage(playbackUsage())
                     .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
                     .build());
             // Nick 2026-10-19 v1.16: keep the CPU awake through playback
@@ -2482,7 +2488,23 @@ public class VoiceService extends Service
         // Nick 2026-10-18 v1.11: Bluetooth-aware — earbuds win
         // over the speakerphone when connected, same as MP3.
         routeAudioForPlayback();
-        log("tts: stream=MUSIC");
+        // v1.100: same coach-comm gate as playFileNow — set the
+        // TTS engine's attributes on EVERY utterance from the
+        // CURRENT gate state, so the first post-session utterance
+        // is plain media again (setAudioAttributes is sticky on
+        // the engine; never let a coach-comm setting leak out of
+        // the session).
+        boolean commTts = CoachStreamer.isCommRouteActive();
+        try {
+            tts.setAudioAttributes(new AudioAttributes.Builder()
+                    .setUsage(playbackUsage())
+                    .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                    .build());
+        } catch (Exception e) {
+            log("tts: setAudioAttributes failed: " + e);
+        }
+        log(commTts ? "tts: stream=VOICE_COMMUNICATION (coach comm route)"
+                : "tts: stream=MUSIC");
         requestAudioFocus();
         isPlayingAudio = true;
         log("tts: echo guard on");
@@ -4588,10 +4610,34 @@ public class VoiceService extends Service
         pumpTtsQueue();
     }
 
+    /**
+     * v1.100 (Nick, 2026-11-05): the ONE playback-usage decision.
+     * While a coach session holds the Bluetooth communication
+     * device for the earbud mic (v1.99), SCO suspends the
+     * earbuds' media route — USAGE_MEDIA playback reported
+     * "played" while Nick heard nothing (2026-11-05 15:18 EST).
+     * So while CoachStreamer.isCommRouteActive() is true, every
+     * playback lane (MediaPlayer files, on-device TTS, and the
+     * focus request below) uses USAGE_VOICE_COMMUNICATION and
+     * rides the same channel as the mic — duplex, like a call.
+     * Read fresh at every playback start: v1.99 clears the
+     * communication device at session teardown, and the very
+     * next message after a session must be plain media again.
+     * No coach session -> USAGE_MEDIA, exactly as before.
+     */
+    private int playbackUsage() {
+        return CoachStreamer.isCommRouteActive()
+                ? AudioAttributes.USAGE_VOICE_COMMUNICATION
+                : AudioAttributes.USAGE_MEDIA;
+    }
+
     private void requestAudioFocus() {
         try {
             // Nick 2026-10-18 v1.7: match the playback usage (USAGE_MEDIA)
             // so focus is requested for the music stream, not voice-call.
+            // v1.100: "the playback usage" is playbackUsage() now —
+            // USAGE_VOICE_COMMUNICATION while a coach session holds
+            // the earbud-mic communication channel.
             // Nick 2026-10-29 v1.59 (ducking rule): the type is now
             // AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK — the old
             // GAIN_TRANSIENT made well-behaved media apps PAUSE
@@ -4601,7 +4647,7 @@ public class VoiceService extends Service
             // matches.) The STREAM_MUSIC boost stays disabled (v1.48) —
             // she plays at Nick's set volume over the ducked music.
             AudioAttributes attrs = new AudioAttributes.Builder()
-                    .setUsage(AudioAttributes.USAGE_MEDIA)
+                    .setUsage(playbackUsage())
                     .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
                     .build();
             focusRequest = new AudioFocusRequest.Builder(
