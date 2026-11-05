@@ -95,7 +95,8 @@ import java.util.Queue;
  * (proven by v1.11+ builds).
  */
 public class VoiceService extends Service
-        implements TtsProgressListener.Callback, RealtimeClient.Listener {
+        implements TtsProgressListener.Callback, RealtimeClient.Listener,
+        CoachStreamer.Listener {
     private static final String TAG = "SelenaVoice";
     private static final String CHANNEL_ID = "selena_voice_channel";
     private static final int NOTIF_ID = 1;
@@ -113,6 +114,18 @@ public class VoiceService extends Service
     // Nick 2026-10-22 v1.35: hard-stop all playback from the UI.
     public static final String ACTION_STOP_ALL = "com.selena.voice.STOP_ALL";
     public static final String ACTION_REQUEST_STATUS = "com.selena.voice.REQUEST_STATUS";
+    // Nick 2026-11-05 v1.95: coach sessions are OWNED BY THE
+    // SERVICE (see the coach section below) — the activity's two
+    // doors send these intents; session state comes back through
+    // ACTION_COACH_STATE broadcasts.
+    public static final String ACTION_COACH_START_SOLO = "com.selena.voice.COACH_START_SOLO";
+    public static final String ACTION_COACH_START_OTHERS = "com.selena.voice.COACH_START_OTHERS";
+    public static final String ACTION_COACH_STOP = "com.selena.voice.COACH_STOP";
+    public static final String ACTION_COACH_STATE = "com.selena.voice.COACH_STATE";
+    public static final String EXTRA_SESSION_ID = "session_id";
+    public static final String EXTRA_DISCLOSURE_ISO = "disclosure_iso";
+    public static final String EXTRA_COACH_LIVE = "coach_live";
+    public static final String EXTRA_COACH_STATUS = "coach_status";
     public static final String EXTRA_FILE_PATH = "file_path";
     public static final String EXTRA_POLL_STATUS = "poll_status";
     public static final String EXTRA_TEXT = "text";
@@ -511,6 +524,26 @@ public class VoiceService extends Service
     // Bluetooth (speakerphone left untouched). Set by routeAudioForPlayback.
     private boolean btRouted = false;
 
+    // ------------------------------------------------------------ coach sessions (v1.95)
+    // Nick, 2026-11-05: "I want this to be able to work in the
+    // background… the microphone indicator goes away when I
+    // navigate away from Selena Voice." He was right: through
+    // v1.94 the CoachStreamer was owned by MainActivity, and the
+    // activity's onDestroy shut the session down — leaving the
+    // app could kill the mic. From v1.95 the SERVICE owns the
+    // session: the activity's two doors (solo / disclosure-
+    // confirmed) send start intents, and the session then lives
+    // here — immune to navigation, activity death, and screen
+    // state — until Stop (an intent) or service destroy. While a
+    // session is live the service also claims the MICROPHONE
+    // foreground-service type (raised only at a door tap, which
+    // happens in the foreground as Android requires; dropped
+    // again when the session ends). The disclosure gate is
+    // unchanged: the with-others start intent is sent ONLY from
+    // the disclosure confirmation handler in MainActivity.
+    private CoachStreamer coachStreamer = null;
+    private String coachStatus = "";
+
     // ------------------------------------------------------------ lifecycle
 
     @Override
@@ -526,8 +559,9 @@ public class VoiceService extends Service
         notificationManager = getSystemService(NotificationManager.class);
         createChannel();
         // Nick 2026-10-23 v1.41: start as MEDIA_PLAYBACK only (explicit
-        // type). v1.82: this is now the ONLY type, permanently — the
-        // app holds no microphone permission and never claims one.
+        // type). v1.95: still the starting type — the MICROPHONE
+        // type is claimed only while a coach session is live (see
+        // the coach section above), never at rest.
         startForegroundAs("Selena Voice ready",
                 ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK);
         // Nick 2026-10-23 v1.36: global crash reporter (service process).
@@ -621,6 +655,25 @@ public class VoiceService extends Service
                 // current state instead of leaving stale layout defaults.
                 broadcastPollStatus(lastPollStatus);
                 broadcastPlaybackState();
+                broadcastCoachState();
+            } else if (ACTION_COACH_START_SOLO.equals(intent.getAction())) {
+                // v1.95: the SOLO door in MainActivity sent this —
+                // no disclosure is owed (nobody else is in the
+                // conversation). The service owns the session from
+                // here; the activity may die without touching it.
+                log("intent: COACH_START_SOLO received");
+                startCoachSession(intent.getStringExtra(EXTRA_SESSION_ID), null);
+            } else if (ACTION_COACH_START_OTHERS.equals(intent.getAction())) {
+                // v1.95: the WITH-OTHERS door — this intent exists
+                // only because MainActivity's disclosure
+                // confirmation handler sent it, after the
+                // disclosure was said. There is no other sender.
+                log("intent: COACH_START_OTHERS received");
+                startCoachSession(intent.getStringExtra(EXTRA_SESSION_ID),
+                        intent.getStringExtra(EXTRA_DISCLOSURE_ISO));
+            } else if (ACTION_COACH_STOP.equals(intent.getAction())) {
+                log("intent: COACH_STOP received");
+                stopCoachSession("Session stopped");
             } else if (ACTION_STOP_ALL.equals(intent.getAction())) {
                 // Nick 2026-10-22 v1.35: hard stop — kill whatever is
                 // playing/speaking right now and drop unlocked queued
@@ -660,6 +713,12 @@ public class VoiceService extends Service
     @Override
     public void onDestroy() {
         destroyed = true;
+        // v1.95: a live coach session dies with the service —
+        // the only teardown besides the Stop intent.
+        if (coachStreamer != null) {
+            coachStreamer.shutdown();
+            coachStreamer = null;
+        }
         stopRealtime();
         stopPolling();
         heartbeating = false;
@@ -3694,6 +3753,77 @@ public class VoiceService extends Service
     private void sendAppBroadcast(Intent i) {
         i.setPackage(getPackageName());
         sendBroadcast(i);
+    }
+
+    // ------------------------------------------------------------ coach session control (v1.95)
+
+    /** Start a coach session owned by this service. Called from
+     *  the two door intents in onStartCommand: disclosureIso is
+     *  non-null only on the with-others door (the disclosure
+     *  confirmation in MainActivity is its only source). */
+    private void startCoachSession(String sessionId, String disclosureIso) {
+        if (coachStreamer != null || sessionId == null) {
+            broadcastCoachState();
+            return;
+        }
+        // Claim the microphone foreground type BEFORE capture can
+        // start. The door intent was sent from a foreground tap,
+        // so the claim happens while the app is in the foreground,
+        // as Android 14 requires of microphone-type services.
+        int type = ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK;
+        if (Build.VERSION.SDK_INT >= 30) {
+            type |= ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE;
+        }
+        startForegroundAs("Coach session live — listening", type);
+        coachStreamer = new CoachStreamer(this, sessionId, this);
+        coachStatus = "Starting microphone…";
+        broadcastCoachState();
+        if (disclosureIso != null) {
+            coachStreamer.beginWithOthers(disclosureIso);
+        } else {
+            coachStreamer.beginSolo();
+        }
+    }
+
+    /** Stop the live session (Stop intent from the activity, or
+     *  service teardown). Capture dies here and nowhere else —
+     *  navigating away from the app cannot reach this. */
+    private void stopCoachSession(String status) {
+        CoachStreamer cs = coachStreamer;
+        coachStreamer = null;
+        if (cs != null) cs.shutdown();
+        coachStatus = status;
+        // The microphone claim drops with the session.
+        startForegroundAs("Selena Voice ready",
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK);
+        broadcastCoachState();
+    }
+
+    // CoachStreamer.Listener — the service is the listener now
+    // (the activity was, through v1.94). Callbacks arrive on the
+    // main thread (CoachStreamer posts them there).
+    @Override
+    public void onStreamStatus(String msg) {
+        coachStatus = msg;
+        broadcastCoachState();
+    }
+
+    @Override
+    public void onStreamEnded(String reason) {
+        // The streamer ended itself (its failure path). Mirror
+        // the stop bookkeeping without a second shutdown.
+        coachStreamer = null;
+        coachStatus = reason;
+        startForegroundAs("Selena Voice ready",
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK);
+        broadcastCoachState();
+    }
+
+    private void broadcastCoachState() {
+        Intent i = new Intent(ACTION_COACH_STATE);
+        i.putExtra(EXTRA_COACH_LIVE, coachStreamer != null);
+        i.putExtra(EXTRA_COACH_STATUS, coachStatus);
+        sendAppBroadcast(i);
     }
 
     private void broadcastPlaybackState() {

@@ -37,6 +37,13 @@ public class MessageReceiver extends BroadcastReceiver {
             // Nick 2026-10-22 v1.28: pause/resume feedback.
             String msg = intent.getStringExtra(VoiceService.EXTRA_TOAST);
             if (msg != null) activity.onToast(msg);
+        } else if (action.equals(VoiceService.ACTION_COACH_STATE)) {
+            // Nick 2026-11-05 v1.95: coach-session state mirror —
+            // the session lives in the service; the activity just
+            // reflects live/status from these broadcasts.
+            activity.onCoachState(
+                intent.getBooleanExtra(VoiceService.EXTRA_COACH_LIVE, false),
+                intent.getStringExtra(VoiceService.EXTRA_COACH_STATUS));
         }
     }
 }

@@ -5,6 +5,12 @@
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
+    <!-- Nick 2026-11-05 v1.95: coach sessions run inside the
+         foreground service (so they survive leaving the app);
+         Android 14 requires this permission for the microphone
+         foreground-service type the service claims while a
+         session is live. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <!-- Nick 2026-10-19 v1.16: background operation — the service holds a
          partial wake lock so polling, Realtime, and playback keep running
@@ -47,13 +53,17 @@
 
         <!-- The service plays Selena's replies with the screen locked
              (Android 14 requires the declared type to match the work).
-             v1.82: mediaPlayback ONLY — the microphone type is gone
-             with the microphone itself; the app holds no RECORD_AUDIO
-             permission and cannot capture audio. -->
+             v1.82: mediaPlayback ONLY. v1.95 (Nick, 2026-11-05):
+             coach sessions live IN this service so they survive
+             leaving the app — the microphone type is declared here
+             and claimed at runtime ONLY while a session is live
+             (the service starts as mediaPlayback-only and raises
+             the microphone type at the session doors, which are
+             tapped in the foreground, as Android requires). -->
         <service
             android:name=".VoiceService"
             android:exported="false"
-            android:foregroundServiceType="mediaPlayback" />
+            android:foregroundServiceType="mediaPlayback|microphone" />
 
         <!-- Nick 2026-10-28 v1.51: earbud/headset media-button taps.
              Before v1.51 the app registered NOTHING for media buttons,

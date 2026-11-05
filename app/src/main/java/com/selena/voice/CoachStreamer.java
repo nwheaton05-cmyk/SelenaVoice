@@ -82,10 +82,14 @@ import java.util.concurrent.Executors;
  * THE GATE IS STILL THE FEATURE (Nick's mic ruling, 2026-11-05
  * 00:17 EST, reversing his v1.82 no-microphone order for coach
  * sessions only): this class is instantiated ONLY by
- * MainActivity's two session door handlers, and the private
- * begin() below is reachable ONLY through beginSolo() /
- * beginWithOthers(). Outside a session, capture never runs:
- * Stop (or activity destroy) calls shutdown().
+ * VoiceService's coach-session control, which starts it ONLY on
+ * the two door intents sent from MainActivity's door handlers,
+ * and the private begin() below is reachable ONLY through
+ * beginSolo() / beginWithOthers(). Outside a session, capture
+ * never runs: the Stop intent (or service destroy) calls
+ * shutdown(). (v1.95 moved ownership from the activity to the
+ * service so a session survives Nick leaving the app — through
+ * v1.94 the activity's onDestroy killed live sessions.)
  *
  * TWO DOORS (Nick, 2026-11-05 00:19 + 00:23 EST): the disclosure
  * duty is owed to OTHER people in the conversation, not to Nick.

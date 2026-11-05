@@ -56,13 +56,15 @@ import java.util.List;
  * immediately — no disclosure step. "With others" opens the
  * disclosure step (CT all-party consent: the disclosure is said
  * BEFORE recording starts), and capture begins only from that
- * step's confirmation tap, via CoachStreamer.beginWithOthers();
- * the solo door runs through beginSolo(). While the session is
- * live, word frames (1–2 word deltas + segment finals) POST to
- * /api/selena-voice/stream; Stop destroys the recognizer.
+ * step's confirmation tap. v1.95: the doors send start intents
+ * to VoiceService, which owns the CoachStreamer — the session
+ * survives this activity entirely. While the session is live,
+ * word frames (1–2 word deltas + segment finals) POST to
+ * /api/selena-voice/stream; Stop (an intent to the service)
+ * ends capture.
  * Playback, queue, heartbeat, and the compose box are untouched.
  */
-public class MainActivity extends Activity implements CoachStreamer.Listener {
+public class MainActivity extends Activity {
     private static final String TAG = "SelenaVoice";
 
     private TextView statusText;
@@ -105,9 +107,12 @@ public class MainActivity extends Activity implements CoachStreamer.Listener {
     private TextView composeStatusText;
 
     // v1.91 (Nick, 2026-11-05): coach-session streaming controls.
-    // coachStreamer is non-null ONLY while a session is live, and
-    // it is created ONLY in the two door handlers: onSessionSolo()
-    // and onDisclosureConfirm() — the gates.
+    // v1.95: the session itself lives in VoiceService — this
+    // activity only holds the DOORS (the two start handlers below
+    // send the service a start intent) and a MIRROR of the
+    // session state, fed by ACTION_COACH_STATE broadcasts and
+    // re-synced on every resume. coachLive is that mirror; it is
+    // never the source of truth.
     private Button coachSessionButton;
     private TextView coachSessionStatus;
     private android.widget.LinearLayout sessionModePanel;
@@ -117,7 +122,7 @@ public class MainActivity extends Activity implements CoachStreamer.Listener {
     private android.widget.LinearLayout disclosurePanel;
     private Button disclosureConfirmButton;
     private Button disclosureCancelButton;
-    private CoachStreamer coachStreamer;
+    private boolean coachLive = false;
     private boolean sessionStartPendingPermission;
     private static final int REQ_RECORD_AUDIO = 9101;
 
@@ -617,22 +622,16 @@ public class MainActivity extends Activity implements CoachStreamer.Listener {
     /**
      * Session control (v1.91, Nick 2026-11-05). When idle, the tap
      * begins the START FLOW — it does NOT start recording. When a
-     * session is live, the tap stops it: the recognizer is
-     * destroyed and capture is dead until the next Start passes
-     * the disclosure gate again.
+     * session is live, the tap stops it (a stop intent to the
+     * service, which owns the session from v1.95) and capture is
+     * dead until the next Start passes the disclosure gate again.
+     * (The v1.91 step-0 check for the platform SpeechRecognizer
+     * is gone: recognition is the app's own engine since v1.93,
+     * and its availability is proven by the session itself.)
      */
     private void onCoachSessionButton() {
-        if (coachStreamer != null) {
+        if (coachLive) {
             stopCoachSession("Session stopped");
-            return;
-        }
-        // Start flow, step 0: the recognizer must exist on this
-        // device before we ask Nick to say a disclosure for it.
-        if (!android.speech.SpeechRecognizer.isRecognitionAvailable(this)) {
-            coachSessionStatus.setText(
-                    "Speech recognition isn't available on this device"
-                            + " — session can't start.");
-            VoiceService.log("stream: recognition unavailable on device");
             return;
         }
         // Start flow, step 1: mic permission (requesting it is not
@@ -688,15 +687,21 @@ public class MainActivity extends Activity implements CoachStreamer.Listener {
      * SOLO DOOR — "Just me" (rehearsal/emulation). The disclosure
      * duty is owed to other people; alone, there is nobody to owe
      * it to, so recording starts immediately with no disclosure
-     * step. One of only two CoachStreamer constructions in the app.
+     * step. One of only two senders of a coach start intent in
+     * the app (v1.95: the service owns the session; this door
+     * just hands it the session id).
      */
     private void onSessionSolo() {
         sessionModePanel.setVisibility(View.GONE);
         String sessionId = "cs-" + System.currentTimeMillis();
-        coachStreamer = new CoachStreamer(this, sessionId, this);
+        Intent i = new Intent(this, VoiceService.class);
+        i.setAction(VoiceService.ACTION_COACH_START_SOLO);
+        i.putExtra(VoiceService.EXTRA_SESSION_ID, sessionId);
+        startService(i);
+        coachLive = true;
         coachSessionButton.setText("Stop session");
         coachSessionButton.setEnabled(true);
-        coachStreamer.beginSolo();
+        coachSessionStatus.setText("Starting microphone…");
     }
 
     /** "With others" — proceed to the disclosure step. */
@@ -728,46 +733,50 @@ public class MainActivity extends Activity implements CoachStreamer.Listener {
      * THE WITH-OTHERS GATE. This confirmation tap is the only place
      * a with-others session — and with it, capture — is created:
      * the session id and the disclosure timestamp are generated
-     * here, CoachStreamer is constructed here, and beginWithOthers()
-     * runs only from here. In this mode there is no code path to a
-     * live microphone that bypasses the confirmation. (The solo
-     * door, onSessionSolo(), is the only other construction — it
+     * here, and the start intent to VoiceService is sent ONLY
+     * from here. In this mode there is no code path to a live
+     * microphone that bypasses the confirmation. (The solo door,
+     * onSessionSolo(), is the only other start sender — it
      * carries no disclosure because none is owed.)
      */
     private void onDisclosureConfirm() {
         String sessionId = "cs-" + System.currentTimeMillis();
         String disclosureIso = java.time.Instant.now().toString();
         disclosurePanel.setVisibility(View.GONE);
-        coachStreamer = new CoachStreamer(this, sessionId, this);
+        Intent i = new Intent(this, VoiceService.class);
+        i.setAction(VoiceService.ACTION_COACH_START_OTHERS);
+        i.putExtra(VoiceService.EXTRA_SESSION_ID, sessionId);
+        i.putExtra(VoiceService.EXTRA_DISCLOSURE_ISO, disclosureIso);
+        startService(i);
+        coachLive = true;
         coachSessionButton.setText("Stop session");
         coachSessionButton.setEnabled(true);
-        coachStreamer.beginWithOthers(disclosureIso);
+        coachSessionStatus.setText("Starting microphone…");
     }
 
-    // CoachStreamer.Listener (v1.91) — implemented on the activity
-    // itself rather than an anonymous class: the manual build's d8
-    // (R8 8.2.2-dev) dies with an internal NPE on an anonymous class
-    // implementing another class's nested interface.
-    @Override
-    public void onStreamStatus(String msg) {
-        coachSessionStatus.setText(msg);
-    }
-
-    @Override
-    public void onStreamEnded(String reason) {
-        coachStreamer = null;
-        sessionModePanel.setVisibility(View.GONE);
-        disclosurePanel.setVisibility(View.GONE);
-        coachSessionButton.setText("Start session");
+    // Coach state mirror (v1.95) — called by MessageReceiver with
+    // VoiceService's ACTION_COACH_STATE broadcasts; with the door
+    // handlers' optimistic updates, the only writer of the
+    // session UI. The service is the source of truth; this just
+    // reflects it.
+    public void onCoachState(boolean live, String status) {
+        coachLive = live;
+        if (!live) {
+            sessionModePanel.setVisibility(View.GONE);
+            disclosurePanel.setVisibility(View.GONE);
+        }
+        coachSessionButton.setText(live ? "Stop session" : "Start session");
         coachSessionButton.setEnabled(true);
-        coachSessionStatus.setText(reason);
+        if (status != null && !status.isEmpty()) {
+            coachSessionStatus.setText(status);
+        }
     }
 
     private void stopCoachSession(String statusMsg) {
-        if (coachStreamer != null) {
-            coachStreamer.shutdown();
-            coachStreamer = null;
-        }
+        Intent i = new Intent(this, VoiceService.class);
+        i.setAction(VoiceService.ACTION_COACH_STOP);
+        startService(i);
+        coachLive = false;
         coachSessionButton.setText("Start session");
         coachSessionButton.setEnabled(true);
         coachSessionStatus.setText(statusMsg);
@@ -965,6 +974,7 @@ public class MainActivity extends Activity implements CoachStreamer.Listener {
         f.addAction(VoiceService.ACTION_POLL_STATUS);
         f.addAction(VoiceService.ACTION_PLAYBACK_STATE);
         f.addAction(VoiceService.ACTION_TOAST);
+        f.addAction(VoiceService.ACTION_COACH_STATE);
         if (Build.VERSION.SDK_INT >= 33) {
             registerReceiver(receiver, f, Context.RECEIVER_NOT_EXPORTED);
         } else {
@@ -993,12 +1003,12 @@ public class MainActivity extends Activity implements CoachStreamer.Listener {
 
     @Override
     protected void onDestroy() {
-        // v1.91: capture must not outlive the screen that gated it —
-        // a live session's recognizer dies with the activity.
-        if (coachStreamer != null) {
-            coachStreamer.shutdown();
-            coachStreamer = null;
-        }
+        // v1.95: NOTHING session-related happens here, on purpose.
+        // Through v1.94 this method shut the live session down —
+        // which is exactly why leaving the app killed Nick's mic
+        // mid-conversation (his report, 2026-11-05). The session
+        // lives in VoiceService now; it ends only on his Stop or
+        // on the service's own teardown.
         super.onDestroy();
     }
 
