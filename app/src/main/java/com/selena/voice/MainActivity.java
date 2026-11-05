@@ -126,16 +126,14 @@ public class MainActivity extends Activity {
 
     // v1.96 (Nick, 2026-11-05): Phase 0 voice panel — NOT an
     // enrollment surface (enrollment is automatic; there is no
-    // ceremony and no enroll control). What lives here: the
-    // voice-test toggle (learning + numbered labels, log-only,
-    // per live session), a status line read straight from the
-    // app-global VoiceprintStore — the same store both session
-    // modes read and extend — and the housekeeping wipe.
+    // ceremony and no enroll control). What lives here: a status
+    // line read straight from the app-global VoiceprintStore —
+    // the same store both session modes read and extend — and
+    // the housekeeping wipe. (v1.97: voice learning is ALWAYS ON
+    // inside coach sessions; the v1.96 toggle is gone.)
     private TextView vpStatusText;
-    private Button voiceTestButton;
     private Button deleteVoicesButton;
     private String coachMode = "";
-    private boolean voiceTestOn = false;
     private boolean sessionStartPendingPermission;
     private static final int REQ_RECORD_AUDIO = 9101;
 
@@ -320,11 +318,10 @@ public class MainActivity extends Activity {
         disclosureCancelButton.setOnClickListener(v -> onDisclosureCancel());
 
         // v1.96: Phase 0 voice panel wiring (see the field doc —
-        // a test toggle + store status + wipe, no enrollment UI).
+        // store status + wipe, no enrollment UI; v1.97 removed
+        // the toggle — learning is always on in sessions).
         vpStatusText = findViewById(R.id.vpStatusText);
-        voiceTestButton = findViewById(R.id.voiceTestButton);
         deleteVoicesButton = findViewById(R.id.deleteVoicesButton);
-        voiceTestButton.setOnClickListener(v -> onVoiceTestToggle());
         deleteVoicesButton.setOnClickListener(v -> onDeleteVoices());
         refreshVoicePanel();
 
@@ -780,12 +777,10 @@ public class MainActivity extends Activity {
     // VoiceService's ACTION_COACH_STATE broadcasts; with the door
     // handlers' optimistic updates, the only writer of the
     // session UI. The service is the source of truth; this just
-    // reflects it. (v1.96: mode + voice-test state ride along.)
-    public void onCoachState(boolean live, String status, String mode,
-                             boolean testOn) {
+    // reflects it. (v1.96: the session mode rides along.)
+    public void onCoachState(boolean live, String status, String mode) {
         coachLive = live;
         coachMode = mode != null ? mode : "";
-        voiceTestOn = testOn;
         if (!live) {
             sessionModePanel.setVisibility(View.GONE);
             disclosurePanel.setVisibility(View.GONE);
@@ -799,18 +794,6 @@ public class MainActivity extends Activity {
     }
 
     // ------------------------------------------------------------ v1.96 voice panel
-
-    /** Voice-test toggle: flips the streamer's Phase 0 machinery
-     *  for the live session (automatic learning + labels in the
-     *  log). The service/streamer own the real state; this sends
-     *  the intent and the state broadcast corrects the label. */
-    private void onVoiceTestToggle() {
-        if (!coachLive) return;
-        Intent i = new Intent(this, VoiceService.class);
-        i.setAction(VoiceService.ACTION_COACH_VOICE_TEST);
-        i.putExtra(VoiceService.EXTRA_VOICE_TEST_ON, !voiceTestOn);
-        startService(i);
-    }
 
     /** Housekeeping wipe of the whole voice store (Nick + every
      *  guest), behind an explicit confirm — this is Nick's own
@@ -834,17 +817,13 @@ public class MainActivity extends Activity {
      * status line is read from VoiceprintStore in THIS activity,
      * while sessions write it from the service — one store, both
      * sides, which is the Phase 0 sharing requirement made
-     * visible. The toggle shows only during a live session (the
-     * machinery lives in the session's streamer).
+     * visible. (v1.97: the learning machinery runs in every
+     * session automatically — nothing here switches it.)
      */
     private void refreshVoicePanel() {
         if (vpStatusText == null) return;
         vpStatusText.setText("Voices — "
                 + VoiceprintStore.statusLine(this));
-        voiceTestButton.setVisibility(
-                coachLive ? View.VISIBLE : View.GONE);
-        voiceTestButton.setText(voiceTestOn
-                ? "Voice test: ON" : "Voice test: off");
         deleteVoicesButton.setVisibility(
                 VoiceprintStore.voiceCount(this) > 0
                         ? View.VISIBLE : View.GONE);

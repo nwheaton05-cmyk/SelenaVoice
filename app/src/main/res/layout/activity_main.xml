@@ -451,15 +451,6 @@
             android:gravity="center_vertical">
 
             <Button
-                android:id="@+id/voiceTestButton"
-                android:layout_width="0dp"
-                android:layout_height="wrap_content"
-                android:layout_weight="1"
-                android:text="Voice test: off"
-                android:textSize="14sp"
-                android:visibility="gone" />
-
-            <Button
                 android:id="@+id/deleteVoicesButton"
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"

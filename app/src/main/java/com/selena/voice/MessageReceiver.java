@@ -41,12 +41,11 @@ public class MessageReceiver extends BroadcastReceiver {
             // Nick 2026-11-05 v1.95: coach-session state mirror —
             // the session lives in the service; the activity just
             // reflects live/status from these broadcasts.
-            // v1.96: mode + voice-test state ride along.
+            // v1.96: the session mode rides along.
             activity.onCoachState(
                 intent.getBooleanExtra(VoiceService.EXTRA_COACH_LIVE, false),
                 intent.getStringExtra(VoiceService.EXTRA_COACH_STATUS),
-                intent.getStringExtra(VoiceService.EXTRA_COACH_MODE),
-                intent.getBooleanExtra(VoiceService.EXTRA_VOICE_TEST_ON, false));
+                intent.getStringExtra(VoiceService.EXTRA_COACH_MODE));
         }
     }
 }

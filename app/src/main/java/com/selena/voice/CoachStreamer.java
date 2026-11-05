@@ -120,7 +120,9 @@ import java.util.concurrent.Executors;
  * continuous voice learning + numbered speaker labels, in
  * measurement/logging form only. There is NO enrollment ceremony
  * (Nick, 13:23 EST: "all enrollment is automatic — it learns as
- * it goes"): while the voice test is on, every quality-accepted
+ * it goes"): in every coach session (v1.97, Nick 13:52 EST:
+ * auto-learn is ALWAYS ON — the v1.96 in-session toggle is
+ * gone), every quality-accepted
  * segment is embedded on-device (WeSpeaker ResNet34-LM via
  * SpeakerEmbedder) and processed against the ONE app-global
  * VoiceprintStore —
@@ -172,12 +174,13 @@ public class CoachStreamer {
     private String lastPartialText = "";
     private boolean segPlaybackOverlap = false;
 
-    // Voice test (v1.96, Phase 0) — see the class doc. The PCM tap
-    // is written by the capture thread and snapshotted at each
-    // endpoint; all embedding/matching/teaching runs on vpExec so
-    // capture and recognition never wait on it.
+    // Voice learning (v1.96, Phase 0; always on since v1.97) —
+    // see the class doc. The PCM tap is written by the capture
+    // thread and snapshotted at each endpoint; all
+    // embedding/matching/teaching runs on vpExec so capture and
+    // recognition never wait on it.
     private String sessionMode = "";
-    private volatile boolean voiceTestOn = false;
+    private volatile boolean autoLearnOn = false;
     private SpeakerEmbedder embedder;
     private final ExecutorService vpExec = Executors.newSingleThreadExecutor();
     private float[] segTap = new float[SAMPLE_RATE * 4];
@@ -253,6 +256,7 @@ public class CoachStreamer {
         enqueueFrame(0L, "", false, meta);
         final String mode = meta.optString("mode", "?");
         sessionMode = mode;
+        enableAutoLearn();
         if (!DroneModelStore.isReady(appContext)) {
             postStatus("Downloading speech engine (one-time, 44 MB)…");
         } else {
@@ -282,7 +286,7 @@ public class CoachStreamer {
         // thread is a daemon-less single thread but the process
         // outlives the session, and shutdown() lets it drain.
         poster.shutdown();
-        voiceTestOn = false;
+        autoLearnOn = false;
         vpExec.shutdown();
         if (embedder != null) {
             embedder.release();
@@ -444,7 +448,7 @@ public class CoachStreamer {
                 }
                 float[] f = new float[n];
                 for (int i = 0; i < n; i++) f[i] = buf[i] / 32768.0f;
-                if (voiceTestOn) tapSegment(f, n);
+                if (autoLearnOn) tapSegment(f, n);
                 stream.acceptWaveform(f, SAMPLE_RATE);
                 while (recognizer.isReady(stream)) {
                     recognizer.decode(stream);
@@ -461,7 +465,7 @@ public class CoachStreamer {
                         // Snapshot BEFORE onFinalText resets the
                         // segment state (tap included).
                         String endedSeg = segId();
-                        float[] snap = voiceTestOn ? snapshotSegment() : null;
+                        float[] snap = autoLearnOn ? snapshotSegment() : null;
                         boolean overlap = segPlaybackOverlap
                                 || VoiceService.isPlayingAudioNow();
                         onFinalText(text);
@@ -524,34 +528,35 @@ public class CoachStreamer {
         segTapLen = 0;
     }
 
-    // ------------------------------------------------------------ voice test (v1.96)
+    // ------------------------------------------------- voice learning (v1.96+)
 
     /** The session's door ("solo" / "with_others"), for the UI mirror. */
     public String mode() {
         return sessionMode;
     }
 
-    public boolean voiceTestOn() {
-        return voiceTestOn;
-    }
-
     /**
-     * Toggle the Phase 0 voice test. Called by VoiceService from
-     * the activity's toggle intent. Affects ONLY the voice
-     * machinery (learning + log lines) — the frame stream, the
-     * coaching behavior, and the disclosure gate are untouched.
+     * v1.97 (Nick, 2026-11-05 13:52 EST): auto-learn is ALWAYS ON
+     * inside coach sessions — the v1.96 voice-test toggle is
+     * gone. Called once from begin(), before capture starts.
+     * Affects ONLY the voice machinery (learning + log lines) —
+     * the frame stream, the coaching behavior, and the disclosure
+     * gate are untouched. If the speaker model were ever missing
+     * from a build, the session still runs; learning just stays
+     * off and the log says so.
      */
-    public void setVoiceTest(boolean on) {
-        if (on == voiceTestOn) return;
-        if (on && !SpeakerEmbedder.modelAvailable(appContext)) {
-            postStatus("Voice test unavailable — speaker model missing in this build.");
+    private void enableAutoLearn() {
+        if (!SpeakerEmbedder.modelAvailable(appContext)) {
+            VoiceService.log("vp: auto-learn unavailable — speaker"
+                    + " model missing in this build (mode "
+                    + sessionMode + ", session " + sessionId + ")");
+            postStatus("Voice learning unavailable — speaker model"
+                    + " missing in this build.");
             return;
         }
-        voiceTestOn = on;
-        VoiceService.log("vp: voice test " + (on ? "ON" : "OFF")
-                + " (mode " + sessionMode + ", session " + sessionId + ")");
-        postStatus(on ? "Voice test ON — voices are being learned and logged."
-                      : "Voice test off.");
+        autoLearnOn = true;
+        VoiceService.log("vp: auto-learn ON (always on, mode "
+                + sessionMode + ", session " + sessionId + ")");
     }
 
     private void tapSegment(float[] f, int n) {
@@ -662,8 +667,9 @@ public class CoachStreamer {
         if (!vpWarnedNoNick && !VoiceprintStore.hasPrint(appContext, 1)) {
             vpWarnedNoNick = true;
             VoiceService.log("vp: note — Voice 1 has no print yet; "
-                    + "seed it in a SOLO session with the voice test "
-                    + "on. Until then every voice here founds a guest.");
+                    + "seed it in a SOLO session (auto-learn is "
+                    + "always on). Until then every voice here "
+                    + "founds a guest.");
         }
         int count = VoiceprintStore.voiceCount(appContext);
         StringBuilder scores = new StringBuilder();
@@ -708,7 +714,7 @@ public class CoachStreamer {
             verdict = "NEW Voice " + attr;
             taught = true;
             postStatus("New voice heard — logged as Voice " + attr
-                    + " (voice test).");
+                    + ".");
         } else {
             verdict = "unlabeled";
         }
